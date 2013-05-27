@@ -41,7 +41,8 @@ enum THdfsFileFormat {
   RC_FILE,
   SEQUENCE_FILE,
   AVRO,
-  PARQUET
+  PARQUET,
+  HFile
 }
 
 enum THdfsCompression {
@@ -91,6 +92,7 @@ struct THdfsTable {
 
   // map from partition id to partition metadata
   4: required map<i64, THdfsPartition> partitions
+  5: optional list<Types.TPrimitiveType> colTypes
 }
 
 struct THBaseTable {
