@@ -29,7 +29,8 @@ public enum HdfsFileFormat {
   LZO_TEXT,
   SEQUENCE_FILE,
   AVRO,
-  PARQUET;
+  PARQUET,
+  HFILE;
 
   // Input format class for RCFile tables read by Hive.
   private static final String RCFILE_INPUT_FORMAT =
@@ -54,7 +55,11 @@ public enum HdfsFileFormat {
   // Input format class for Avro tables read by hive.
   private static final String AVRO_INPUT_FORMAT =
       "org.apache.hadoop.hive.ql.io.avro.AvroContainerInputFormat";
-
+  
+  // Input format class for HFile tables read by hive
+  private static final String HFILE_INPUT_FORMAT=
+            "com.hugetable.hive.io.HugetableInputFormatProxy"
+            
   private static final Map<String, HdfsFileFormat> VALID_FORMATS =
       ImmutableMap.<String, HdfsFileFormat>builder()
           .put(RCFILE_INPUT_FORMAT, RC_FILE)
@@ -63,6 +68,7 @@ public enum HdfsFileFormat {
           .put(SEQUENCE_INPUT_FORMAT, SEQUENCE_FILE)
           .put(AVRO_INPUT_FORMAT, AVRO)
           .put(PARQUET_INPUT_FORMAT, PARQUET)
+          .put(HFILE_INPUT_FORMAT,HFILE)
           .build();
 
   /**
@@ -98,6 +104,8 @@ public enum HdfsFileFormat {
       return THdfsFileFormat.AVRO;
     case PARQUET:
       return THdfsFileFormat.PARQUET;
+    case HFILE:
+	return THdfsFileFormat.HFILE;
     default:
       throw new RuntimeException("Unknown HdfsFormat: "
           + this + " - should never happen!");
