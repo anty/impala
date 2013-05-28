@@ -138,6 +138,11 @@ HdfsTableDescriptor::HdfsTableDescriptor(const TTableDescriptor& tdesc,
     object_pool_->Add(partition);
     partition_descriptors_[it->first] =  partition;
   }
+  list<PrimitiveType>::const_iterator it;
+  for(it = tdesc.hdfsTable.colTypes.begin();it != tdesc.hdfsTable.colTypes.end();++it)
+  {
+  	col_types_.push_back(ThriftToType(*it));
+  }
 }
 
 string HdfsTableDescriptor::DebugString() const {
