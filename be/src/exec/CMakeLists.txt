@@ -41,6 +41,7 @@ add_library(Exec STATIC
   hdfs-table-sink.cc
   hdfs-table-writer.cc
   hdfs-rcfile-scanner.cc
+  hdfs-hfile-scanner.cc
   hdfs-sequence-scanner.cc
   hdfs-avro-scanner.cc
   hdfs-text-scanner.cc
