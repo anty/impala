@@ -316,6 +316,9 @@ HdfsScanner* HdfsScanNode::CreateScanner(HdfsPartitionDescriptor* partition) {
     case THdfsFileFormat::PARQUET:
       scanner = new HdfsParquetScanner(this, runtime_state_);
       break;
+    case THdfsFileFormat::HFile:
+	scanner = new HdfsHFileScanner(this,runtime_state_);
+	break;
     default:
       DCHECK(false) << "Unknown Hdfs file format type:" << partition->file_format();
       return NULL;
@@ -538,6 +541,7 @@ Status HdfsScanNode::Open(RuntimeState* state) {
   BaseSequenceScanner::IssueInitialRanges(this,
       per_type_files[THdfsFileFormat::AVRO]);
   HdfsParquetScanner::IssueInitialRanges(this, per_type_files[THdfsFileFormat::PARQUET]);
+  HdfsHFileScanner::IssueInitialRanges(this, per_type_files[THdfsFileFormat::HFile]);
   if (!per_type_files[THdfsFileFormat::LZO_TEXT].empty()) {
     // This will dlopen the lzo binary and can fail if it is not present
     RETURN_IF_ERROR(HdfsLzoTextScanner::IssueInitialRanges(state,
