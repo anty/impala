@@ -717,7 +717,7 @@ Status HdfsHFileScanner::ReadDataBlock()
         if(!stream_->GetBytes(trailer_->header_size_, &buffer, &num_bytes, &eos, &status))
             return status;
 
-        DCHECK_EQ(trailer_.header_size_, num_bytes);
+        DCHECK_EQ(trailer_->header_size_, num_bytes);
 
         if(stream_->file_offset() - num_bytes >  trailer_.last_data_block_offset_)
         {
