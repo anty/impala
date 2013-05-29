@@ -42,7 +42,7 @@ enum THdfsFileFormat {
   SEQUENCE_FILE,
   AVRO,
   PARQUET,
-  HFile
+  HFILE
 }
 
 enum THdfsCompression {

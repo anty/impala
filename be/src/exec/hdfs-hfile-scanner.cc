@@ -405,7 +405,7 @@ bool BinarySortableDeserializer::Write_Field(MemPool * pool, Tuple * tuple, uint
                     }
                     str_real[i] = b;
                 }
-                sv->ptr = reinterpret_cast<char*> str_real;
+                sv->ptr = reinterpret_cast<char*>(str_real);
             }
         }
         break;
@@ -700,8 +700,8 @@ bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple)
         kv_parser->Set_Value_State(value_types,value_slot_desc,stream_->compact_data());
     }
 
-
-    return kv_parser->Write_Tuple(pool,Tuple,&byte_buffer_ptr_);
+	bool ret = kv_parser->Write_Tuple(pool,Tuple,&byte_buffer_ptr_);
+    return ret;
 
 }
 
@@ -741,7 +741,7 @@ Status HdfsHFileScanner::ReadDataBlock()
         uint32_t bytes_per_checksum;
         uint32_t on_disk_size_with_header;
 
-        if(trailer_.minor_version_  >=  FixedFileTrailer::MINOR_VERSION_WITH_CHECKSUM)
+        if(trailer_->minor_version_  >=  FixedFileTrailer::MINOR_VERSION_WITH_CHECKSUM)
 
         {
             checksum_type = *buffer;
