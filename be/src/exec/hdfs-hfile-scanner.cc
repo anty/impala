@@ -457,13 +457,13 @@ public:
     KeyValue():key_deserializer_(),value_deserializer_(),key_start_ptr_(NULL),key_len_(-1),value_start_ptr_(NULL),value_len_(-1)
     {
     }
-    void Set_Key_State(std::vector<PrimitiveType>& types,std::vector<SlotDescriptor*> & slot_desc)
+    void Set_Key_State(std::vector<PrimitiveType>& types,std::vector<SlotDescriptor*> & slot_desc,bool compact_data)
     {
-        key_deserializer_.Set_State(types,slot_desc);
+        key_deserializer_.Set_State(types,slot_desc,compact_data);
     }
-    void Set_Value_State(std::vector<PrimitiveType>& types,std::vector<SlotDescriptor*>& slot_desc)
+    void Set_Value_State(std::vector<PrimitiveType>& types,std::vector<SlotDescriptor*>& slot_desc,bool compact_data)
     {
-        value_deserializer_.Set_State(types,slot_desc);
+        value_deserializer_.Set_State(types,slot_desc,compact_data);
     }
     bool Write_Tuple(MemPool* pool,Tuple* tuple,uint8_t** byte_buffer_ptr);
     int Get_Key_Col_Num(uint8_t* data,PrimitiveType* types)
@@ -721,7 +721,7 @@ Status HdfsHFileScanner::ReadDataBlock()
 
         DCHECK_EQ(trailer_->header_size_, num_bytes);
 
-        if(stream_->file_offset() - num_bytes >  trailer_.last_data_block_offset_)
+        if(stream_->file_offset() - num_bytes >  trailer_->last_data_block_offset_)
         {
             //has already read all data blocks
             break;
