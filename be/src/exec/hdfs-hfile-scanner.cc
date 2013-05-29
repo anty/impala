@@ -180,7 +180,7 @@ bool LazyBinaryDeserializer::Write_Field(MemPool* pool,Tuple*tuple,uint8_t** dat
         *data+=ReadWriteUtil::GetVInt(*data, reinterpret_cast<int32_t*>(&sv->len));
 
 
-        if (stream_->compact_data() && sv->len > 0)
+        if (HdfsScanner::stream_->compact_data() && sv->len > 0)
         {
             sv->ptr = reinterpret_cast<char*>(pool->Allocate(sv->len));
             memcpy(sv->ptr, *data, sv->len);
@@ -274,11 +274,11 @@ bool BinarySortableDeserializer::Write_Field(MemPool * pool, Tuple * tuple, uint
             DCHECK(*b==1 || *b ==2);
             if(*b == 1)
             {
-                *reinterpret_cast<bool*>slot = false;
+                *reinterpret_cast<bool*>(slot) = false;
             }
             else
             {
-                *reinterpret_cast<bool*>slot = true;
+                *reinterpret_cast<bool*>(slot) = true;
             }
 
         }
@@ -378,7 +378,7 @@ bool BinarySortableDeserializer::Write_Field(MemPool * pool, Tuple * tuple, uint
             sv->len = len_str;
             if(len_str == ((*data) - str_start_ptr))
             {
-                if (stream_->compact_data() && sv->len > 0)
+                if (HdfsScanner::stream_->compact_data() && sv->len > 0)
                 {
                     sv->ptr = reinterpret_cast<char*>(pool->Allocate(len_str));
                     memcpy(sv->ptr, str_start_ptr, sv->len);
@@ -403,7 +403,7 @@ bool BinarySortableDeserializer::Write_Field(MemPool * pool, Tuple * tuple, uint
                     }
                     str_real[i] = b;
                 }
-                sv->ptr = str_real;
+                sv->ptr = reinterpret_cast<char*> str_real;
             }
         }
         break;
@@ -492,7 +492,7 @@ void KeyValue::Parse_Key_Value(uint8_t** byte_buffer_ptr)
     value_start_ptr_ = *byte_buffer_ptr;
     *byte_buffer_ptr += value_len_;
     //skip memstore timestamp
-    int8_t vlong_len = *static_cast<int8_t*>(*byte_buffer_ptr);
+    int8_t vlong_len = **byte_buffer_ptr;
     *byte_buffer_ptr+=ReadWriteUtil::DecodeVIntSize(vlong_len);
     //adjust key_start_ptr_ to point to row key start position.
     key_len_ =   ReadWriteUtil::GetSmallInt(key_start_ptr_);
@@ -633,7 +633,7 @@ Status HdfsHFileScanner::Prepare()
     const HdfsTableDescriptor* hdfs_table = static_cast<const HdfsTableDescriptor*>(tuple_desc->table_desc());
     col_types_ = hdfs_table->col_types();
     num_clustering_cols_ = hdfs_table->num_clustering_cols();
-    return Status::0K;
+    return Status::OK;
 }
 
 bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple)
