@@ -34,11 +34,10 @@ public:
 
 	// Implementation of HdfsScanner interface.
 	virtual Status Prepare();
-	virtual Status GetNext(RowBatch* row_batch, bool* eosr);
 	virtual Status ProcessSplit(ScannerContext* context);
 	virtual Status Close();
 
-	static Status Init();
+//	static Status Init();
 
 private:
 
