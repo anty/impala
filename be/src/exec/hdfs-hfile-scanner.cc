@@ -23,6 +23,7 @@
 #include "exec/hfile-types.h"
 #include "algorithm"
 #include "exec/hdfs-scan-node.h"
+#include "exec/hdfs-scanner.h"
 
 #include <boost/scoped_ptr.hpp>
 
@@ -48,9 +49,9 @@ public:
 protected:
     std::vector<PrimitiveType> types_;
     std::vector<SlotDescriptor*> slot_desc_;
-private:
-    Deserializer(const Deserializer&);
-    Deserializer& operator=(const Deserializer&);
+//private:
+//    Deserializer(const Deserializer&);
+//    Deserializer& operator=(const Deserializer&);
 };
 
 
@@ -121,7 +122,7 @@ bool LazyBinaryDeserializer::Write_Field(MemPool* pool,Tuple*tuple,uint8_t** dat
         if(slot)
 
         {
-            int len = ReadWriteUtil::GetVInt(** data, reinterpret_cast<int32_t*>(slot));
+            int len = ReadWriteUtil::GetVInt(* data, reinterpret_cast<int32_t*>(slot));
             *data+=len;
         }
         else
@@ -206,12 +207,12 @@ bool LazyBinaryDeserializer::Write_Tuple(MemPool* pool,Tuple*tuple,uint8_t* data
     for(int i =0; i < types_.size(); i ++)
     {
         //this field is null
-        if(null_byte&(1<<(i % 8)) == 0)
+        if((null_byte&(1<<(i % 8))) == 0)
         {
             //this field need materialized
             if(slot_desc_[i])
             {
-                tuple->SetNull((slot_desc_[i]->null_indicator_offset());
+                tuple->SetNull(slot_desc_[i]->null_indicator_offset());
             }
         }
         else//there is data exist for this field, materialized it or skip it based on whether slot_desc == NULL or not.
@@ -270,14 +271,14 @@ bool BinarySortableDeserializer::Write_Field(MemPool * pool, Tuple * tuple, uint
         if(slot)
         {
             uint8_t* b = *data;
-            DCHECK(b==1 || b ==2);
-            if(b == 1)
+            DCHECK(*b==1 || *b ==2);
+            if(*b == 1)
             {
-                *reinterpret_cast<bool*>slot = 0;
+                *reinterpret_cast<bool*>slot = false;
             }
             else
             {
-                *reinterpret_cast<bool*>slot = 1;
+                *reinterpret_cast<bool*>slot = true;
             }
 
         }
@@ -288,7 +289,7 @@ bool BinarySortableDeserializer::Write_Field(MemPool * pool, Tuple * tuple, uint
     case TYPE_TINYINT:
         if(slot)
         {
-            *reinterpret_cast<int8_t*>(slot) = *data ^ 0x80;
+            *reinterpret_cast<int8_t*>(slot) = (**data) ^ 0x80;
 
         }
 
@@ -323,7 +324,7 @@ bool BinarySortableDeserializer::Write_Field(MemPool * pool, Tuple * tuple, uint
         if(slot)
         {
             int32_t value = ReadWriteUtil::GetInt(*data);
-            if(value & (1<<31) == 0)
+            if((value & (1<<31)) == 0)
             {
                 value = ~value;
             }
@@ -341,7 +342,7 @@ bool BinarySortableDeserializer::Write_Field(MemPool * pool, Tuple * tuple, uint
         {
 
             int64_t value = ReadWriteUtil::GetLongInt(*data);
-            if(value &(static_cast<int64_t>(1)<<63) ==0 )
+            if((value &(static_cast<int64_t>(1)<<63)) ==0 )
             {
                 value = ~value;
             }
@@ -357,7 +358,7 @@ bool BinarySortableDeserializer::Write_Field(MemPool * pool, Tuple * tuple, uint
     case TYPE_STRING:
     {
         int len_str = 0;
-        uint8_t*const str_start_ptr = *data;
+        uint8_t* str_start_ptr = *data;
         uint8_t b;
         do
         {
@@ -390,8 +391,8 @@ bool BinarySortableDeserializer::Write_Field(MemPool * pool, Tuple * tuple, uint
             else
             {
                 //escaping happened,
-                uint8_t* const str_real = pool->Allocate(len_str);
-                uint8_t* start_ptr=const_cast<uint8_t*> str_start_ptr;
+                uint8_t* str_real = pool->Allocate(len_str);
+                uint8_t* start_ptr=  str_start_ptr;
                 uint8_t b;
                 for(int i = 0 ; i < len_str; i++)
                 {
@@ -451,7 +452,7 @@ class KeyValue
 {
 
 public:
-    KeyValue():key_start_ptr_(NULL),key_len_(-1),value_start_ptr_(NULL),value_len_(-1)
+    KeyValue():key_deserializer_(),value_deserializer_(),key_start_ptr_(NULL),key_len_(-1),value_start_ptr_(NULL),value_len_(-1)
     {
     }
     void Set_Key_State(std::vector<PrimitiveType>& types,std::vector<SlotDescriptor*> & slot_desc)
@@ -463,10 +464,10 @@ public:
         value_deserializer_.Set_State(types,slot_desc);
     }
     bool Write_Tuple(MemPool* pool,Tuple* tuple,uint8_t** byte_buffer_ptr);
-    int Get_Key_Col_Num(uint8_t* data,int len,PrimitiveType* types)
+    int Get_Key_Col_Num(uint8_t* data,PrimitiveType* types)
     {
         Parse_Key_Value(&data);
-        return key_deserializer_.Get_Key_Col_Num(data,len,types);
+        return key_deserializer_.Get_Key_Col_Num(key_start_ptr_,key_len_,types);
     }
 
 private:
@@ -478,7 +479,7 @@ private:
     int key_len_;
     uint8_t* value_start_ptr_;
     int value_len_;
-}
+};
 
 void KeyValue::Parse_Key_Value(uint8_t** byte_buffer_ptr)
 {
