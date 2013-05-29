@@ -63,7 +63,7 @@ Status FixedFileTrailer::DeserializeFromBuffer(uint8_t* buffer, int len,
     {
         stringstream ss;
         ss << "Invalid magic : expected " + "TRABLK\"$"
-           << ",got "<< string(block_type_ptr, 8);
+           << ",got "<< string(static_cast<const char*>(block_type_ptr), 8);
         return Status(ss.str());
     }
 
@@ -131,9 +131,7 @@ Status FixedFileTrailer::DeserializeFromBuffer(uint8_t* buffer, int len,
         }
         //move end pointer one step further?
 
-        std::string::size_t size = end_comparator_ptr-trailer_ptr+1;
-
-        trailer.comparator_class_name_ = std::string(trailer_ptr,size);
+        trailer.comparator_class_name_ = std::string(static_cast<const char*>(trailer_ptr),end_comparator_ptr-trailer_ptr+1);
 
         trailer_ptr += MAX_COMPARATOR_NAME_LENGTH;
     }
