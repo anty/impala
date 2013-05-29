@@ -31,67 +31,6 @@ using namespace impala;
 using namespace hfile;
 
 
-class KeyValue
-{
-
-public:
-    KeyValue():key_start_ptr_(NULL),key_len_(-1),value_start_ptr_(NULL),value_len_(-1)
-    {
-    }
-    void Set_Key_State(std::vector<PrimitiveType>& types,std::vector<SlotDescriptor*> & slot_desc)
-    {
-        key_deserializer_.Set_State(types,slot_desc);
-    }
-    void Set_Value_State(std::vector<PrimitiveType>& types,std::vector<SlotDescriptor*>& slot_desc)
-    {
-        value_deserializer_.Set_State(types,slot_desc);
-    }
-    bool Write_Tuple(MemPool* pool,Tuple* tuple,uint8_t** byte_buffer_ptr);
-    int Get_Key_Col_Num(uint8_t* data,int len,PrimitiveType* types)
-    {
-        Parse_Key_Value(&data);
-        return key_deserializer_.Get_Key_Col_Num(data,len,types);
-    }
-
-private:
-    inline	void Parse_Key_Value(uint8_t** byte_buffer_ptr);
-
-    BinarySortableDeserializer key_deserializer_;
-    LazyBinaryDeserializer value_deserializer_;
-    uint8_t* key_start_ptr_;
-    int key_len_;
-    uint8_t* value_start_ptr_;
-    int value_len_;
-}
-
-void KeyValue::Parse_Key_Value(uint8_t** byte_buffer_ptr)
-{
-    key_len_ = ReadWriteUtil::GetInt(*byte_buffer_ptr);
-    *byte_buffer_ptr+=4;
-    value_len_ = ReadWriteUtil::GetInt(*byte_buffer_ptr);
-    *byte_buffer_ptr+=4;
-    key_start_ptr_= *byte_buffer_ptr;
-    *byte_buffer_ptr+=key_len_;
-    value_start_ptr_ = *byte_buffer_ptr;
-    *byte_buffer_ptr += value_len_;
-    //skip memstore timestamp
-    int8_t vlong_len = *static_cast<int8_t*>(*byte_buffer_ptr);
-    *byte_buffer_ptr+=ReadWriteUtil::DecodeVIntSize(vlong_len);
-    //adjust key_start_ptr_ to point to row key start position.
-    key_len_ =   ReadWriteUtil::GetSmallInt(key_start_ptr_);
-    key_start_ptr_+=2;
-}
-
-bool KeyValue:: Write_Tuple(MemPool* pool,Tuple* tuple,uint8_t** byte_buffer_ptr)
-{
-    Parse_Key_Value(byte_buffer_ptr);
-    bool result = true;
-    result &=key_deserializer_.Write_Tuple(pool, tuple, key_start_ptr_,key_len_);
-    result &= value_deserializer_.Write_Tuple(pool,tuple,value_start_ptr_,value_len_);
-    return result;
-}
-
-
 
 class Deserializer
 {
@@ -504,6 +443,69 @@ bool BinarySortableDeserializer:: Write_Tuple(MemPool* pool,Tuple*tuple,uint8_t*
     DCHECK(data_cur_ptr == data_end_ptr);
     return true;
 }
+
+
+
+class KeyValue
+{
+
+public:
+    KeyValue():key_start_ptr_(NULL),key_len_(-1),value_start_ptr_(NULL),value_len_(-1)
+    {
+    }
+    void Set_Key_State(std::vector<PrimitiveType>& types,std::vector<SlotDescriptor*> & slot_desc)
+    {
+        key_deserializer_.Set_State(types,slot_desc);
+    }
+    void Set_Value_State(std::vector<PrimitiveType>& types,std::vector<SlotDescriptor*>& slot_desc)
+    {
+        value_deserializer_.Set_State(types,slot_desc);
+    }
+    bool Write_Tuple(MemPool* pool,Tuple* tuple,uint8_t** byte_buffer_ptr);
+    int Get_Key_Col_Num(uint8_t* data,int len,PrimitiveType* types)
+    {
+        Parse_Key_Value(&data);
+        return key_deserializer_.Get_Key_Col_Num(data,len,types);
+    }
+
+private:
+    inline	void Parse_Key_Value(uint8_t** byte_buffer_ptr);
+
+    BinarySortableDeserializer key_deserializer_;
+    LazyBinaryDeserializer value_deserializer_;
+    uint8_t* key_start_ptr_;
+    int key_len_;
+    uint8_t* value_start_ptr_;
+    int value_len_;
+}
+
+void KeyValue::Parse_Key_Value(uint8_t** byte_buffer_ptr)
+{
+    key_len_ = ReadWriteUtil::GetInt(*byte_buffer_ptr);
+    *byte_buffer_ptr+=4;
+    value_len_ = ReadWriteUtil::GetInt(*byte_buffer_ptr);
+    *byte_buffer_ptr+=4;
+    key_start_ptr_= *byte_buffer_ptr;
+    *byte_buffer_ptr+=key_len_;
+    value_start_ptr_ = *byte_buffer_ptr;
+    *byte_buffer_ptr += value_len_;
+    //skip memstore timestamp
+    int8_t vlong_len = *static_cast<int8_t*>(*byte_buffer_ptr);
+    *byte_buffer_ptr+=ReadWriteUtil::DecodeVIntSize(vlong_len);
+    //adjust key_start_ptr_ to point to row key start position.
+    key_len_ =   ReadWriteUtil::GetSmallInt(key_start_ptr_);
+    key_start_ptr_+=2;
+}
+
+bool KeyValue:: Write_Tuple(MemPool* pool,Tuple* tuple,uint8_t** byte_buffer_ptr)
+{
+    Parse_Key_Value(byte_buffer_ptr);
+    bool result = true;
+    result &=key_deserializer_.Write_Tuple(pool, tuple, key_start_ptr_,key_len_);
+    result &= value_deserializer_.Write_Tuple(pool,tuple,value_start_ptr_,value_len_);
+    return result;
+}
+
 
 
 
