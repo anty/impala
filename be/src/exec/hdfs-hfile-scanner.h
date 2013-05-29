@@ -42,6 +42,8 @@ public:
 
 private:
 
+	friend class LazyBinaryDeserializer;
+	friend class BinarySortableDeserializer;
 	Status ProcessTrailer();
 	Status ReadDataBlock();
 	Status IssueFileRanges(const char* filename);
