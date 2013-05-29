@@ -72,7 +72,7 @@ public:
 
     virtual bool Write_Tuple(MemPool* pool,Tuple*tuple,uint8_t* data ,int len);
 private:
-    friend class KeyValue;
+    friend class HdfsHFileScanner::KeyValue;
 
     bool Write_Field(MemPool* pool,Tuple*tuple,uint8_t** data,PrimitiveType type,SlotDescriptor* slot_desc);
     int Get_Key_Col_Num(uint8_t* data, int len, PrimitiveType* types);
