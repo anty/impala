@@ -63,7 +63,7 @@ private:
 	int num_key_cols_;
 	int num_clustering_cols_;
 	class KeyValue;
-	boost::scoped_ptr<KeyValue> kv_parser;
+	boost::scoped_ptr<KeyValue> kv_parser_;
 	hfile::FixedFileTrailer* trailer_;
 	bool only_parsing_trailer_;
 

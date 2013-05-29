@@ -71,11 +71,11 @@ class BinarySortableDeserializer:public Deserializer
 public:
 
     virtual bool Write_Tuple(MemPool* pool,Tuple*tuple,uint8_t* data ,int len);
+	    int Get_Key_Col_Num(uint8_t* data, int len, PrimitiveType* types);
 private:
-    friend class HdfsHFileScanner::KeyValue;
 
     bool Write_Field(MemPool* pool,Tuple*tuple,uint8_t** data,PrimitiveType type,SlotDescriptor* slot_desc);
-    int Get_Key_Col_Num(uint8_t* data, int len, PrimitiveType* types);
+
 };
 
 
@@ -550,7 +550,7 @@ Status HdfsHFileScanner::ProcessSplit(ScannerContext* context)
 
     only_parsing_trailer_ = false;
 
-    kv_parser.reset(new KeyValue());
+    kv_parser_.reset(new KeyValue());
 
     RETURN_IF_ERROR(ProcessSplitInternal());
 
@@ -661,7 +661,7 @@ bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple)
         std::vector<PrimitiveType> value_types;
         std::vector<SlotDescriptor*> value_slot_desc;
 
-        num_key_cols_ = kv_parser->Get_Key_Col_Num(byte_buffer_ptr_,&col_types_[num_clustering_cols_]);
+        num_key_cols_ = kv_parser_->Get_Key_Col_Num(byte_buffer_ptr_,&col_types_[num_clustering_cols_]);
         for(int i = num_clustering_cols_; i < (num_clustering_cols_+num_key_cols_); i++)
         {
             key_types.push_back((col_types_)[i]);
@@ -689,11 +689,11 @@ bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple)
                 value_slot_desc.push_back(NULL);
             }
         }
-        kv_parser->Set_Key_State(key_types,key_slot_desc,stream_->compact_data());
-        kv_parser->Set_Value_State(value_types,value_slot_desc,stream_->compact_data());
+        kv_parser_->Set_Key_State(key_types,key_slot_desc,stream_->compact_data());
+        kv_parser_->Set_Value_State(value_types,value_slot_desc,stream_->compact_data());
     }
 
-    bool ret = kv_parser->Write_Tuple(pool,Tuple,&byte_buffer_ptr_);
+    bool ret = kv_parser_->Write_Tuple(pool,Tuple,&byte_buffer_ptr_);
     return ret;
 
 }
