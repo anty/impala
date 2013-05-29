@@ -20,8 +20,7 @@ class FixedFileTrailer
 {
 public:
 	
-	static impala::Status DeserializeFromBuffer(const uint8_t* buffer, int len,
-			FixedFileTrailer& trailer);
+	static impala::Status DeserializeFromBuffer( uint8_t* buffer, int len,FixedFileTrailer& trailer);
 	
 	static const int MAX_COMPARATOR_NAME_LENGTH = 128;
 	static const uint8_t TRAILER_BLOCK_TYPE[] ;
