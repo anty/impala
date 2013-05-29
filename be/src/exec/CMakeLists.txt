@@ -42,7 +42,6 @@ add_library(Exec STATIC
   hdfs-table-writer.cc
   hdfs-rcfile-scanner.cc
   hdfs-hfile-scanner.cc
-  hfile-types.cc
   hdfs-sequence-scanner.cc
   hdfs-avro-scanner.cc
   hdfs-text-scanner.cc

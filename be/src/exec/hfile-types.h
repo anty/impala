@@ -10,7 +10,10 @@
 
 #include "hfile-common.h"
 #include "common/status.h"
+#include "hfile-types.h"
+
 #include <string>
+
 
 namespace hfile
 {
@@ -32,7 +35,6 @@ public:
 	static const int MINOR_VERSION_WITH_CHECKSUM=1;
 	static const int HEADER_SIZE_NO_CHECKSUM=24;
 	static const int HEADER_SIZE_WITH_CHECKSUMS=HEADER_SIZE_NO_CHECKSUM+9;
-	static  const uint32_t MAX_COMPARATOR_NAME_LENGTH = 128;
 	static int GetTrailerSize(int version);
 	
 	//offset to the file info data, a small block of vitals.
@@ -57,7 +59,7 @@ public:
 	//the total uncompressed size of keys/values stored in the file
 	uint64_t total_uncompressed_bytes_;
 
-	uint64_t entry_count_
+	uint64_t entry_count_;
 
 	//TODO
 

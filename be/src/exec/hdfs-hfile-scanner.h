@@ -10,7 +10,6 @@
 
 #include "exec/hdfs-scanner.h"
 #include "exec/scan-node.h"
-#include "exec/hfile-types.h"
 #include "exec/hdfs-scan-node.h"
 #include <boost/scoped_ptr.hpp>
 
@@ -26,7 +25,7 @@ class Status;
 class HdfsHFileScanner: public HdfsScanner
 {
 public:
-	HdfsHFileScanner(ScanNode* scan_node, RuntimeState* state);
+	HdfsHFileScanner(HdfsScanNode* scan_node, RuntimeState* state);
 	virtual ~HdfsHFileScanner();
 
 	// Issue io manager byte ranges for 'files'
@@ -41,7 +40,7 @@ public:
 	static Status Init();
 
 private:
-	class KeyValue;
+
 	Status ProcessTrailer();
 	Status ReadDataBlock();
 	Status IssueFileRanges(const char* filename);
@@ -53,13 +52,14 @@ private:
 	uint32_t num_checksum_bytes_;
 
 
-	std::vector<PrimitiveType>* col_types_;
+	std::vector<PrimitiveType> col_types_;
 	std::vector<PrimitiveType>  key_col_types_;
 	std::vector<PrimitiveType>  value_col_types_;
 	//in current implementation, there is no easy to figure out the number of columns in key part of a KeyValue object.
 	//So we de-serialize a record to get this number.
 	int num_key_cols_;
 	int num_clustering_cols_;
+	class KeyValue;
 	boost::scoped_ptr<KeyValue> kv_parser;
 	hfile::FixedFileTrailer* trailer_;
 	bool only_parsing_trailer_;

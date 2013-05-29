@@ -31,194 +31,67 @@ using namespace impala;
 using namespace hfile;
 
 
-impala::HdfsHFileScanner::HdfsHFileScanner(ScanNode* scan_node, RuntimeState* state) :
-    HdfsScanner(scan_node, state),byte_buffer_ptr_(NULL),byte_buffer_end_(NULL),num_checksum_bytes_(0),num_key_cols_(-1),only_parsing_trailer_(false)
-{
-}
-
-impala::HdfsHFileScanner::~HdfsHFileScanner()
-{
-}
-
-
-Status HdfsHFileScanner::ProcessSplit(ScannerContext* context)
+class KeyValue
 {
 
-    SetContext(context);
-
-    HdfsFileDesc* file_desc = scan_node_->GetFileDesc(stream_->filename());
-    DCHECK(file_desc != NULL);
-
-    //each scanner object associated with a scanner thread in current context.
-    //
-    //keep trailer_ in per file meta data in order to let another scan range get access to it.
-    trailer_ = reinterpret_cast<hfile::FixedFileTrailer*>(scan_node_->GetFileMetadata(
-                   stream_->filename()));
-
-    if (trailer_ == NULL)
+public:
+    KeyValue():key_start_ptr_(NULL),key_len_(-1),value_start_ptr_(NULL),value_len_(-1)
     {
-        //this is the initial scan range just to parse the trailer
-        only_parsing_trailer_ = true;
-
-        trailer_ = state_->obj_pool()->Add(new hfile::FixedFileTrailer());
-
-        RETURN_IF_ERROR(ProcessTrailer());
-
-        scan_node_->SetFileMetadata(stream_->filename(), trailer_);
-
-        //release scanner thread after done its work.
-        scan_node_->runtime_state_->resource_pool()->ReleaseThreadToken(false);
-
-        //before this scan thread die, it will pass queued scan ranges to disk io manager.
-        return IssueFileRanges(stream_->filename());
+    }
+    void Set_Key_State(std::vector<PrimitiveType>& types,std::vector<SlotDescriptor*> & slot_desc)
+    {
+        key_deserializer_.Set_State(types,slot_desc);
+    }
+    void Set_Value_State(std::vector<PrimitiveType>& types,std::vector<SlotDescriptor*>& slot_desc)
+    {
+        value_deserializer_.Set_State(types,slot_desc);
+    }
+    bool Write_Tuple(MemPool* pool,Tuple* tuple,uint8_t** byte_buffer_ptr);
+    int Get_Key_Col_Num(uint8_t* data,int len,PrimitiveType* types)
+    {
+        Parse_Key_Value(&data);
+        return key_deserializer_.Get_Key_Col_Num(data,len,types);
     }
 
-    only_parsing_trailer_ = false;
+private:
+    inline	void Parse_Key_Value(uint8_t** byte_buffer_ptr);
 
-    kv_parser.reset(new KeyValue());
-
-    RETURN_IF_ERROR(ProcessSplitInternal());
-
-    return Status::OK;
+    BinarySortableDeserializer key_deserializer_;
+    LazyBinaryDeserializer value_deserializer_;
+    uint8_t* key_start_ptr_;
+    int key_len_;
+    uint8_t* value_start_ptr_;
+    int value_len_;
 }
 
-
-Status HdfsHFileScanner::ProcessTrailer()
+void KeyValue::Parse_Key_Value(uint8_t** byte_buffer_ptr)
 {
-
-    uint8_t* buffer;
-    int len;
-    bool eos;
-
-    if (!stream_->GetBytes(0, &buffer, &len, &eos, &parse_status_))
-    {
-        return parse_status_;
-    }
-    //sure to end of file.
-    DCHECK(eos);
-
-    DCHECK_GE(len, FixedFileTrailer::MAX_TRAILER_SIZE);
-
-    RETURN_IF_ERROR(hfile::FixedFileTrailer::DeserializeFromBuffer(buffer, len, *trailer_));
-
-    return Status::OK;
-
+    key_len_ = ReadWriteUtil::GetInt(*byte_buffer_ptr);
+    *byte_buffer_ptr+=4;
+    value_len_ = ReadWriteUtil::GetInt(*byte_buffer_ptr);
+    *byte_buffer_ptr+=4;
+    key_start_ptr_= *byte_buffer_ptr;
+    *byte_buffer_ptr+=key_len_;
+    value_start_ptr_ = *byte_buffer_ptr;
+    *byte_buffer_ptr += value_len_;
+    //skip memstore timestamp
+    int8_t vlong_len = *static_cast<int8_t*>(*byte_buffer_ptr);
+    *byte_buffer_ptr+=ReadWriteUtil::DecodeVIntSize(vlong_len);
+    //adjust key_start_ptr_ to point to row key start position.
+    key_len_ =   ReadWriteUtil::GetSmallInt(key_start_ptr_);
+    key_start_ptr_+=2;
 }
 
-
-
-Status HdfsHFileScanner::ProcessSplitInternal()
+bool KeyValue:: Write_Tuple(MemPool* pool,Tuple* tuple,uint8_t** byte_buffer_ptr)
 {
-    while(!scan_node_->ReachedLimit() && !context_->cancelled())
-    {
-
-        MemPool* pool;
-        Tuple* tuple;
-        TupleRow* row;
-        int num_rows = context_->GetMemory(&pool, &tuple, &row);
-        int num_to_commit = 0;
-
-        for(int i = 0; i < num_rows; i++)
-        {
-            InitTuple(context_->template_tuple(), tuple);
-            if(!WriteTuple(pool, tuple))
-            {
-                context_->CommitRows(num_to_commit);
-
-                return parse_status_;
-            }
-            row->SetTuple(scan_node_->tuple_idx(), tuple);
-            if(ExecNode::EvalConjuncts(conjuncts_, num_conjuncts_, row))
-            {
-                row = context_->next_row(row);
-                tuple = context_->next_tuple(tuple);
-                ++num_to_commit;
-            }
-        }
-        context_->CommitRows(num_to_commit);
-    }
-
-    if(context_->cancelled())
-        return Status::CANCELLED;
-    return parse_status_;
-
+    Parse_Key_Value(byte_buffer_ptr);
+    bool result = true;
+    result &=key_deserializer_.Write_Tuple(pool, tuple, key_start_ptr_,key_len_);
+    result &= value_deserializer_.Write_Tuple(pool,tuple,value_start_ptr_,value_len_);
+    return result;
 }
 
 
-
-Status HdfsHFileScanner::Prepare()
-{
-    const TupleDescriptor* tuple_desc = scan_node_->tuple_desc();
-    const std::vector<SlotDescriptor*>& slots = tuple_desc->slots();
-    const HdfsTableDescriptor* hdfs_table = static_cast<const HdfsTableDescriptor*>(tuple_desc->table_desc());
-    col_types_ = &hdfs_table->col_types();
-    num_clustering_cols_ = hdfs_table->num_clustering_cols();
-}
-
-bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple)
-{
-
-    if(byte_buffer_ptr_ == byte_buffer_end_)
-    {
-        if(num_checksum_bytes_ > 0)
-        {
-            Status dumy_status;
-            if(!stream_->SkipBytes(num_checksum_bytes_, &dumy_status))
-            {
-                parse_status_ = dumy_status;
-                return false;
-            }
-        }
-        RETURN_IF_ERROR(ReadDataBlock());
-        if(byte_buffer_ptr_== byte_buffer_end_)
-            return false;
-    }
-
-    //de-serialize a record beforehand to get number of columns constituting key and value ,respectively.
-    if(UNLIKELY(num_key_cols_ == -1))
-    {
-        std::vector<SlotDescriptor*>& materailized_slots = scan_node_->materialized_slots();
-        std::vector<PrimitiveType> key_types;
-        std::vector<SlotDescriptor*> key_slot_desc;
-        std::vector<PrimitiveType> value_types;
-        std::vector<SlotDescriptor*> value_slot_desc;
-
-        num_key_cols_ = kv_parser->Get_Key_Col_Num(byte_buffer_ptr_,&(*col_types_)[num_clustering_cols_]);
-        for(int i = num_clustering_cols_; i < (num_clustering_cols_+num_key_cols_); i++)
-        {
-            key_types.push_back((*col_types_)[i]);
-            int index_slot = scan_node_->GetMaterializedSlotIdx(i);
-            if(index_slot != HdfsScanNode::SKIP_COLUMN)
-            {
-                key_slot_desc.push_back(materailized_slots[index_slot]);
-            }
-            else
-            {
-                key_slot_desc.push_back(NULL);
-            }
-        }
-
-        for(int i = num_clustering_cols_+num_key_cols_; i< (*col_types_).size(); i++)
-        {
-            value_types.push_back((*col_types_)[i]);
-            int index_slot = scan_node_->GetMaterializedSlotIdx(i);
-            if(index_slot != HdfsScanNode::SKIP_COLUMN)
-            {
-                value_slot_desc.push_back(materailized_slots[index_slot]);
-            }
-            else
-            {
-                value_slot_desc.push_back(NULL);
-            }
-        }
-        kv_parser->Set_Key_State(key_types,key_slot_desc);
-        kv_parser->Set_Value_State(value_types,value_slot_desc);
-    }
-
-
-    return kv_parser->Write_Tuple(pool,Tuple,&byte_buffer_ptr_);
-
-}
 
 class Deserializer
 {
@@ -249,6 +122,21 @@ public:
 private:
     bool Write_Field(MemPool* pool,Tuple*tuple,uint8_t** data,PrimitiveType type,SlotDescriptor* slot_desc);
 }
+
+//row key part of KeyValue use BinarySortableSerDe to encode it's data.
+class BinarySortableDeserializer:public Deserializer
+{
+public:
+
+    virtual bool Write_Tuple(MemPool* pool,Tuple*tuple,uint8_t* data ,int len);
+private:
+    friend class KeyValue;
+
+    bool Write_Field(MemPool* pool,Tuple*tuple,uint8_t** data,PrimitiveType type,SlotDescriptor* slot_desc);
+    int Get_Key_Col_Num(uint8_t* data, int len, PrimitiveType* types);
+}
+
+
 bool LazyBinaryDeserializer::Write_Field(MemPool* pool,Tuple*tuple,uint8_t** data,PrimitiveType type,SlotDescriptor* slot_desc)
 {
 
@@ -412,18 +300,6 @@ bool LazyBinaryDeserializer::Write_Tuple(MemPool* pool,Tuple*tuple,uint8_t* data
     DCHECK(data == data_end_ptr);
 }
 
-//row key part of KeyValue use BinarySortableSerDe to encode it's data.
-class BinarySortableDeserializer:public Deserializer
-{
-public:
-
-    virtual bool Write_Tuple(MemPool* pool,Tuple*tuple,uint8_t* data ,int len);
-private:
-    friend class KeyValue;
-
-    bool Write_Field(MemPool* pool,Tuple*tuple,uint8_t** data,PrimitiveType type,SlotDescriptor* slot_desc);
-    int Get_Key_Col_Num(uint8_t* data, int len, PrimitiveType* types);
-}
 bool BinarySortableDeserializer::Write_Field(MemPool * pool, Tuple * tuple, uint8_t ** data, PrimitiveType type, SlotDescriptor * slot_desc)
 {
 
@@ -630,64 +506,197 @@ bool BinarySortableDeserializer:: Write_Tuple(MemPool* pool,Tuple*tuple,uint8_t*
 }
 
 
-class KeyValue
+
+impala::HdfsHFileScanner::HdfsHFileScanner(HdfsScanNode* scan_node, RuntimeState* state) :
+    HdfsScanner(scan_node, state),byte_buffer_ptr_(NULL),byte_buffer_end_(NULL),num_checksum_bytes_(0),num_key_cols_(-1),only_parsing_trailer_(false)
 {
-
-public:
-    KeyValue():key_start_ptr_(NULL),key_len_(-1),value_start_ptr_(NULL),value_len_(-1)
-    {
-    }
-    void Set_Key_State(std::vector<PrimitiveType>& types,std::vector<SlotDescriptor*> & slot_desc)
-    {
-        key_deserializer_.Set_State(types,slot_desc);
-    }
-    void Set_Value_State(std::vector<PrimitiveType>& types,std::vector<SlotDescriptor*>& slot_desc)
-    {
-        value_deserializer_.Set_State(types,slot_desc);
-    }
-    bool Write_Tuple(MemPool* pool,Tuple* tuple,uint8_t** byte_buffer_ptr);
-    int Get_Key_Col_Num(uint8_t* data,int len,PrimitiveType* types)
-    {
-        Parse_Key_Value(&data);
-        return key_deserializer_.Get_Key_Col_Num(data,len,types);
-    }
-
-private:
-    inline	void Parse_Key_Value(uint8_t** byte_buffer_ptr);
-
-    BinarySortableDeserializer key_deserializer_;
-    LazyBinaryDeserializer value_deserializer_;
-    uint8_t* key_start_ptr_;
-    int key_len_;
-    uint8_t* value_start_ptr_;
-    int value_len_;
 }
 
-void KeyValue::Parse_Key_Value(uint8_t** byte_buffer_ptr)
+impala::HdfsHFileScanner::~HdfsHFileScanner()
 {
-    key_len_ = ReadWriteUtil::GetInt(*byte_buffer_ptr);
-    *byte_buffer_ptr+=4;
-    value_len_ = ReadWriteUtil::GetInt(*byte_buffer_ptr);
-    *byte_buffer_ptr+=4;
-    key_start_ptr_= *byte_buffer_ptr;
-    *byte_buffer_ptr+=key_len_;
-    value_start_ptr_ = *byte_buffer_ptr;
-    *byte_buffer_ptr += value_len_;
-    //skip memstore timestamp
-    int8_t vlong_len = *static_cast<int8_t*>(*byte_buffer_ptr);
-    *byte_buffer_ptr+=ReadWriteUtil::DecodeVIntSize(vlong_len);
-    //adjust key_start_ptr_ to point to row key start position.
-    key_len_ =   ReadWriteUtil::GetSmallInt(key_start_ptr_);
-    key_start_ptr_+=2;
 }
 
-bool KeyValue:: Write_Tuple(MemPool* pool,Tuple* tuple,uint8_t** byte_buffer_ptr)
+
+Status HdfsHFileScanner::ProcessSplit(ScannerContext* context)
 {
-    Parse_Key_Value(byte_buffer_ptr);
-    bool result = true;
-    result &=key_deserializer_.Write_Tuple(pool, tuple, key_start_ptr_,key_len_);
-    result &= value_deserializer_.Write_Tuple(pool,tuple,value_start_ptr_,value_len_);
-    return result;
+
+    SetContext(context);
+
+    HdfsFileDesc* file_desc = scan_node_->GetFileDesc(stream_->filename());
+    DCHECK(file_desc != NULL);
+
+    //each scanner object associated with a scanner thread in current context.
+    //
+    //keep trailer_ in per file meta data in order to let another scan range get access to it.
+    trailer_ = reinterpret_cast<hfile::FixedFileTrailer*>(scan_node_->GetFileMetadata(
+                   stream_->filename()));
+
+    if (trailer_ == NULL)
+    {
+        //this is the initial scan range just to parse the trailer
+        only_parsing_trailer_ = true;
+
+        trailer_ = state_->obj_pool()->Add(new hfile::FixedFileTrailer());
+
+        RETURN_IF_ERROR(ProcessTrailer());
+
+        scan_node_->SetFileMetadata(stream_->filename(), trailer_);
+
+        //release scanner thread after done its work.
+        scan_node_->runtime_state()->resource_pool()->ReleaseThreadToken(false);
+
+        //before this scan thread die, it will pass queued scan ranges to disk io manager.
+        return IssueFileRanges(stream_->filename());
+    }
+
+    only_parsing_trailer_ = false;
+
+    kv_parser.reset(new KeyValue());
+
+    RETURN_IF_ERROR(ProcessSplitInternal());
+
+    return Status::OK;
+}
+
+
+Status HdfsHFileScanner::ProcessTrailer()
+{
+
+    uint8_t* buffer;
+    int len;
+    bool eos;
+
+    if (!stream_->GetBytes(0, &buffer, &len, &eos, &parse_status_))
+    {
+        return parse_status_;
+    }
+    //sure to end of file.
+    DCHECK(eos);
+
+    DCHECK_GE(len, FixedFileTrailer::MAX_TRAILER_SIZE);
+
+    RETURN_IF_ERROR(hfile::FixedFileTrailer::DeserializeFromBuffer(buffer, len, *trailer_));
+
+    return Status::OK;
+
+}
+
+
+
+Status HdfsHFileScanner::ProcessSplitInternal()
+{
+    while(!scan_node_->ReachedLimit() && !context_->cancelled())
+    {
+
+        MemPool* pool;
+        Tuple* tuple;
+        TupleRow* row;
+        int num_rows = context_->GetMemory(&pool, &tuple, &row);
+        int num_to_commit = 0;
+
+        for(int i = 0; i < num_rows; i++)
+        {
+            InitTuple(context_->template_tuple(), tuple);
+            if(!WriteTuple(pool, tuple))
+            {
+                context_->CommitRows(num_to_commit);
+
+                return parse_status_;
+            }
+            row->SetTuple(scan_node_->tuple_idx(), tuple);
+            if(ExecNode::EvalConjuncts(conjuncts_, num_conjuncts_, row))
+            {
+                row = context_->next_row(row);
+                tuple = context_->next_tuple(tuple);
+                ++num_to_commit;
+            }
+        }
+        context_->CommitRows(num_to_commit);
+    }
+
+    if(context_->cancelled())
+        return Status::CANCELLED;
+    return parse_status_;
+
+}
+
+
+
+Status HdfsHFileScanner::Prepare()
+{
+    const TupleDescriptor* tuple_desc = scan_node_->tuple_desc();
+//    const std::vector<SlotDescriptor*>& slots = tuple_desc->slots();
+    const HdfsTableDescriptor* hdfs_table = static_cast<const HdfsTableDescriptor*>(tuple_desc->table_desc());
+    col_types_ = hdfs_table->col_types();
+    num_clustering_cols_ = hdfs_table->num_clustering_cols();
+    return Status::0K;
+}
+
+bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple)
+{
+
+    if(byte_buffer_ptr_ == byte_buffer_end_)
+    {
+        if(num_checksum_bytes_ > 0)
+        {
+            Status dumy_status;
+            if(!stream_->SkipBytes(num_checksum_bytes_, &dumy_status))
+            {
+                parse_status_ = dumy_status;
+                return false;
+            }
+        }
+        Status s = ReadDataBlock();
+        if(!s.ok())
+            return false;
+        if(byte_buffer_ptr_== byte_buffer_end_)
+            return false;
+    }
+
+    //de-serialize a record beforehand to get number of columns constituting key and value ,respectively.
+    if(UNLIKELY(num_key_cols_ == -1))
+    {
+ 	const  std::vector<SlotDescriptor*>& materailized_slots = scan_node_->materialized_slots();
+        std::vector<PrimitiveType> key_types;
+        std::vector<SlotDescriptor*> key_slot_desc;
+        std::vector<PrimitiveType> value_types;
+        std::vector<SlotDescriptor*> value_slot_desc;
+
+        num_key_cols_ = kv_parser->Get_Key_Col_Num(byte_buffer_ptr_,&col_types_[num_clustering_cols_]);
+        for(int i = num_clustering_cols_; i < (num_clustering_cols_+num_key_cols_); i++)
+        {
+            key_types.push_back((col_types_)[i]);
+            int index_slot = scan_node_->GetMaterializedSlotIdx(i);
+            if(index_slot != HdfsScanNode::SKIP_COLUMN)
+            {
+                key_slot_desc.push_back(materailized_slots[index_slot]);
+            }
+            else
+            {
+                key_slot_desc.push_back(NULL);
+            }
+        }
+
+        for(int i = num_clustering_cols_+num_key_cols_; i< (col_types_).size(); i++)
+        {
+            value_types.push_back((col_types_)[i]);
+            int index_slot = scan_node_->GetMaterializedSlotIdx(i);
+            if(index_slot != HdfsScanNode::SKIP_COLUMN)
+            {
+                value_slot_desc.push_back(materailized_slots[index_slot]);
+            }
+            else
+            {
+                value_slot_desc.push_back(NULL);
+            }
+        }
+        kv_parser->Set_Key_State(key_types,key_slot_desc);
+        kv_parser->Set_Value_State(value_types,value_slot_desc);
+    }
+
+
+    return kv_parser->Write_Tuple(pool,Tuple,&byte_buffer_ptr_);
+
 }
 
 
@@ -781,7 +790,7 @@ Status HdfsHFileScanner::IssueFileRanges(const char* filename)
     HdfsFileDesc* file_desc = scan_node_->GetFileDesc(filename);
 
     ScanRangeMetadata* metadata =
-        reinterpret_cast<ScanRangeMetadata*>(file_desc->splits[0]->meta_data_);
+        reinterpret_cast<ScanRangeMetadata*>(file_desc->splits[0]->meta_data());
 
     DiskIoMgr::ScanRange* range = scan_node_->AllocateScanRange(filename, file_desc->file_length,
                                   trailer_->first_data_block_offset_, metadata->partition_id, -1);

@@ -20,7 +20,7 @@
 #include "exec/hdfs-rcfile-scanner.h"
 #include "exec/hdfs-avro-scanner.h"
 #include "exec/hdfs-parquet-scanner.h"
-
+#include "exec/hdfs-hfile-scanner.h"
 #include <sstream>
 #include <boost/algorithm/string.hpp>
 #include <boost/foreach.hpp>
