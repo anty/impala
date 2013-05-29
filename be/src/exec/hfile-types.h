@@ -10,8 +10,6 @@
 
 #include "hfile-common.h"
 #include "common/status.h"
-#include "hfile-types.h"
-
 #include <string>
 
 

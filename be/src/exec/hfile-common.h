@@ -13,8 +13,7 @@
 namespace hfile
 {
 
-const uint32_t MIN_FORMAT_VERSION = 1;
-const uint32_t MAX_FORMAT_VERSION = 2;
+
 
 }
 

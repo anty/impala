@@ -198,7 +198,7 @@ bool LazyBinaryDeserializer::Write_Field(MemPool* pool,Tuple*tuple,uint8_t** dat
     default:
         DCHECK(false);
     }
-
+	return true;
 }
 
 bool LazyBinaryDeserializer::Write_Tuple(MemPool* pool,Tuple*tuple,uint8_t* data ,int len)
@@ -242,6 +242,7 @@ bool LazyBinaryDeserializer::Write_Tuple(MemPool* pool,Tuple*tuple,uint8_t* data
 
     }
     DCHECK(data == data_end_ptr);
+	return true;
 }
 
 bool BinarySortableDeserializer::Write_Field(MemPool * pool, Tuple * tuple, uint8_t ** data, PrimitiveType type, SlotDescriptor * slot_desc)
@@ -623,7 +624,7 @@ Status HdfsHFileScanner::ProcessSplitInternal()
 
 }
 
-Status HdfsHFileScanner::close()
+Status HdfsHFileScanner::Close()
 {
     context_->Close();
     // not uniformly compressed.
