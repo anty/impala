@@ -11,6 +11,7 @@
 #include "exec/hdfs-scanner.h"
 #include "exec/scan-node.h"
 #include "exec/hdfs-scan-node.h"
+#include "exec/hfile-types.h"
 #include <boost/scoped_ptr.hpp>
 
 namespace impala

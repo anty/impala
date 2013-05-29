@@ -138,10 +138,10 @@ HdfsTableDescriptor::HdfsTableDescriptor(const TTableDescriptor& tdesc,
     object_pool_->Add(partition);
     partition_descriptors_[it->first] =  partition;
   }
-  std::vector<TPrimitiveType>::const_iterator it;
-  for(it = tdesc.hdfsTable.colTypes.begin();it != tdesc.hdfsTable.colTypes.end();++it)
+  std::vector<TPrimitiveType>::const_iterator type_it;
+  for(type_it = tdesc.hdfsTable.colTypes.begin();type_it != tdesc.hdfsTable.colTypes.end();++type_it)
   {
-  	col_types_.push_back(ThriftToType(*it));
+  	col_types_.push_back(ThriftToType(*type_it));
   }
 }
 
