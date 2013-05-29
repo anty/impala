@@ -121,7 +121,7 @@ bool LazyBinaryDeserializer::Write_Field(MemPool* pool,Tuple*tuple,uint8_t** dat
         if(slot)
 
         {
-            int len = ReadWriteUtil::GetVInt(uint8_t * data, reinterpret_cast<int32_t*>(slot));
+            int len = ReadWriteUtil::GetVInt(** data, reinterpret_cast<int32_t*>(slot));
             *data+=len;
         }
         else
@@ -150,8 +150,8 @@ bool LazyBinaryDeserializer::Write_Field(MemPool* pool,Tuple*tuple,uint8_t** dat
 
         if(slot)
         {
-            int len = ReadWriteUtil::GetVLong(*data, reinterpret_cast<int64_t*>( slot))
-                      *data+=len;
+            int len = ReadWriteUtil::GetVLong(*data, reinterpret_cast<int64_t*>( slot));
+            *data+=len;
 
         }
         else
@@ -163,6 +163,7 @@ bool LazyBinaryDeserializer::Write_Field(MemPool* pool,Tuple*tuple,uint8_t** dat
         break;
 
     case TYPE_DOUBLE:
+    {
 
         int64_t val = ReadWriteUtil::GetLongInt(*data);
 
@@ -170,15 +171,15 @@ bool LazyBinaryDeserializer::Write_Field(MemPool* pool,Tuple*tuple,uint8_t** dat
 
         *data+=8;
         break;
-
+    }
     case TYPE_STRING:
     {
 
         StringValue* sv = reinterpret_cast<StringValue*>(slot);
-        *data+=ReadWriteUtil::GetVInt(*data, reinterpret_cast<int32_t*>(&sv->len))
+        *data+=ReadWriteUtil::GetVInt(*data, reinterpret_cast<int32_t*>(&sv->len));
 
 
-               if (stream_->compact_data() && sv->len > 0)
+        if (stream_->compact_data() && sv->len > 0)
         {
             sv->ptr = reinterpret_cast<char*>(pool->Allocate(sv->len));
             memcpy(sv->ptr, *data, sv->len);
