@@ -39,16 +39,18 @@ public:
     virtual ~Deserializer() {}
 
     //in most cases, this should be call once.
-    void Set_State(std::vector<PrimitiveType>& types, std::vector<SlotDescriptor*>& slot_desc)
+    void Set_State(std::vector<PrimitiveType>& types, std::vector<SlotDescriptor*>& slot_desc,bool compact_data)
     {
         types_ = types;
         slot_desc_ = slot_desc;
+        compact_data_ = compact_data;
     }
     virtual bool Write_Tuple(MemPool* pool,Tuple*tuple,uint8_t* data ,int len) = 0;
 
 protected:
     std::vector<PrimitiveType> types_;
     std::vector<SlotDescriptor*> slot_desc_;
+    bool compact_data_;
 //private:
 //    Deserializer(const Deserializer&);
 //    Deserializer& operator=(const Deserializer&);
@@ -180,7 +182,7 @@ bool LazyBinaryDeserializer::Write_Field(MemPool* pool,Tuple*tuple,uint8_t** dat
         *data+=ReadWriteUtil::GetVInt(*data, reinterpret_cast<int32_t*>(&sv->len));
 
 
-        if (HdfsScanner::stream_->compact_data() && sv->len > 0)
+        if (compact_data_&& sv->len > 0)
         {
             sv->ptr = reinterpret_cast<char*>(pool->Allocate(sv->len));
             memcpy(sv->ptr, *data, sv->len);
@@ -378,7 +380,7 @@ bool BinarySortableDeserializer::Write_Field(MemPool * pool, Tuple * tuple, uint
             sv->len = len_str;
             if(len_str == ((*data) - str_start_ptr))
             {
-                if (HdfsScanner::stream_->compact_data() && sv->len > 0)
+                if (compact_data_&& sv->len > 0)
                 {
                     sv->ptr = reinterpret_cast<char*>(pool->Allocate(len_str));
                     memcpy(sv->ptr, str_start_ptr, sv->len);
@@ -694,8 +696,8 @@ bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple)
                 value_slot_desc.push_back(NULL);
             }
         }
-        kv_parser->Set_Key_State(key_types,key_slot_desc);
-        kv_parser->Set_Value_State(value_types,value_slot_desc);
+        kv_parser->Set_Key_State(key_types,key_slot_desc,stream_->compact_data());
+        kv_parser->Set_Value_State(value_types,value_slot_desc,stream_->compact_data());
     }
 
 
