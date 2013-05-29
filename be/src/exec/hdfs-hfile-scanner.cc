@@ -693,7 +693,7 @@ bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple)
         kv_parser_->Set_Value_State(value_types,value_slot_desc,stream_->compact_data());
     }
 
-    bool ret = kv_parser_->Write_Tuple(pool,Tuple,&byte_buffer_ptr_);
+    bool ret = kv_parser_->Write_Tuple(pool,tuple,&byte_buffer_ptr_);
     return ret;
 
 }
