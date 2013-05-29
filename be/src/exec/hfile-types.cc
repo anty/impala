@@ -20,6 +20,8 @@ using namespace std;
 
 namespace hfile
 {
+static	const uint32_t MIN_FORMAT_VERSION = 1;
+static const uint32_t MAX_FORMAT_VERSION = 2;
 const uint8_t FixedFileTrailer::TRAILER_BLOCK_TYPE[] = { 'T', 'R', 'A', 'B', 'L', 'K', '"', '$' };
 const uint8_t FixedFileTrailer::DATA_BLOCK_TYPE[] = {'D','A','T','A','B','L','K','*'};
 const uint8_t FixedFileTrailer::ENCODED_DATA_BLOCK_TYPE[] = {'D','A','T','A','B','L','K','E'};
@@ -31,7 +33,7 @@ int FixedFileTrailer::GetTrailerSize(int version)
     return TRAILER_SIZE[version];
 }
 
-Status FixedFileTrailer::DeserializeFromBuffer(const uint8_t* buffer, int len,
+Status FixedFileTrailer::DeserializeFromBuffer(uint8_t* buffer, int len,
         FixedFileTrailer& trailer)
 {
     uint32_t* ver = reinterpret_cast<uint32_t*>(buffer + len - sizeof(uint32_t));
