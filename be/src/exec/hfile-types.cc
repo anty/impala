@@ -62,7 +62,7 @@ Status FixedFileTrailer::DeserializeFromBuffer(uint8_t* buffer, int len,
     if (memcmp(block_type_ptr, TRAILER_BLOCK_TYPE, sizeof(TRAILER_BLOCK_TYPE)))
     {
         stringstream ss;
-        ss << "Invalid magic : expected " + "TRABLK\"$"
+        ss << "Invalid magic : expected " <<"TRABLK\"$"
            << ",got "<< string(static_cast<const char*>(block_type_ptr), 8);
         return Status(ss.str());
     }
