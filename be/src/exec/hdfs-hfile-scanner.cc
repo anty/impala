@@ -32,7 +32,8 @@ using namespace impala;
 using namespace hfile;
 
 
-
+namespace
+{
 class Deserializer
 {
 public:
@@ -71,7 +72,7 @@ class BinarySortableDeserializer:public Deserializer
 public:
 
     virtual bool Write_Tuple(MemPool* pool,Tuple*tuple,uint8_t* data ,int len);
-	    int Get_Key_Col_Num(uint8_t* data, int len, PrimitiveType* types);
+    int Get_Key_Col_Num(uint8_t* data, int len, PrimitiveType* types);
 private:
 
     bool Write_Field(MemPool* pool,Tuple*tuple,uint8_t** data,PrimitiveType type,SlotDescriptor* slot_desc);
@@ -450,6 +451,9 @@ bool BinarySortableDeserializer:: Write_Tuple(MemPool* pool,Tuple*tuple,uint8_t*
 
 
 
+}
+
+
 class HdfsHFileScanner:: KeyValue
 {
 
@@ -619,7 +623,14 @@ Status HdfsHFileScanner::ProcessSplitInternal()
 
 }
 
-
+Status HdfsHFileScanner::close()
+{
+    context_->Close();
+    // not uniformly compressed.
+    scan_node_->RangeComplete(THdfsFileFormat::HFILE, THdfsCompression::NONE);
+//  assemble_rows_timer_.UpdateCounter();
+    return Status::OK;
+}
 
 Status HdfsHFileScanner::Prepare()
 {
