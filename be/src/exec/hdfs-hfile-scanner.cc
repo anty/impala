@@ -51,7 +51,7 @@ protected:
 private:
     Deserializer(const Deserializer&);
     Deserializer& operator=(const Deserializer&);
-}
+};
 
 
 class LazyBinaryDeserializer:public Deserializer
@@ -60,7 +60,7 @@ public:
     virtual bool Write_Tuple(MemPool* pool,Tuple*tuple,uint8_t* data ,int len);
 private:
     bool Write_Field(MemPool* pool,Tuple*tuple,uint8_t** data,PrimitiveType type,SlotDescriptor* slot_desc);
-}
+};
 
 //row key part of KeyValue use BinarySortableSerDe to encode it's data.
 class BinarySortableDeserializer:public Deserializer
@@ -73,7 +73,7 @@ private:
 
     bool Write_Field(MemPool* pool,Tuple*tuple,uint8_t** data,PrimitiveType type,SlotDescriptor* slot_desc);
     int Get_Key_Col_Num(uint8_t* data, int len, PrimitiveType* types);
-}
+};
 
 
 bool LazyBinaryDeserializer::Write_Field(MemPool* pool,Tuple*tuple,uint8_t** data,PrimitiveType type,SlotDescriptor* slot_desc)
@@ -658,7 +658,7 @@ bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple)
     //de-serialize a record beforehand to get number of columns constituting key and value ,respectively.
     if(UNLIKELY(num_key_cols_ == -1))
     {
- 	const  std::vector<SlotDescriptor*>& materailized_slots = scan_node_->materialized_slots();
+        const  std::vector<SlotDescriptor*>& materailized_slots = scan_node_->materialized_slots();
         std::vector<PrimitiveType> key_types;
         std::vector<SlotDescriptor*> key_slot_desc;
         std::vector<PrimitiveType> value_types;
