@@ -316,7 +316,7 @@ HdfsScanner* HdfsScanNode::CreateScanner(HdfsPartitionDescriptor* partition) {
     case THdfsFileFormat::PARQUET:
       scanner = new HdfsParquetScanner(this, runtime_state_);
       break;
-    case THdfsFileFormat::HFile:
+    case THdfsFileFormat::HFILE:
 	scanner = new HdfsHFileScanner(this,runtime_state_);
 	break;
     default:
