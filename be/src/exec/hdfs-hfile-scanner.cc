@@ -450,7 +450,7 @@ bool BinarySortableDeserializer:: Write_Tuple(MemPool* pool,Tuple*tuple,uint8_t*
 
 
 
-class KeyValue
+class HdfsHFileScanner:: KeyValue
 {
 
 public:
@@ -465,7 +465,14 @@ public:
     {
         value_deserializer_.Set_State(types,slot_desc,compact_data);
     }
-    bool Write_Tuple(MemPool* pool,Tuple* tuple,uint8_t** byte_buffer_ptr);
+    bool Write_Tuple(MemPool* pool,Tuple* tuple,uint8_t** byte_buffer_ptr)
+    {
+        Parse_Key_Value(byte_buffer_ptr);
+        bool result = true;
+        result &=key_deserializer_.Write_Tuple(pool, tuple, key_start_ptr_,key_len_);
+        result &= value_deserializer_.Write_Tuple(pool,tuple,value_start_ptr_,value_len_);
+        return result;
+    }
     int Get_Key_Col_Num(uint8_t* data,PrimitiveType* types)
     {
         Parse_Key_Value(&data);
@@ -473,7 +480,23 @@ public:
     }
 
 private:
-    inline	void Parse_Key_Value(uint8_t** byte_buffer_ptr);
+    void Parse_Key_Value(uint8_t** byte_buffer_ptr)
+    {
+        key_len_ = ReadWriteUtil::GetInt(*byte_buffer_ptr);
+        *byte_buffer_ptr+=4;
+        value_len_ = ReadWriteUtil::GetInt(*byte_buffer_ptr);
+        *byte_buffer_ptr+=4;
+        key_start_ptr_= *byte_buffer_ptr;
+        *byte_buffer_ptr+=key_len_;
+        value_start_ptr_ = *byte_buffer_ptr;
+        *byte_buffer_ptr += value_len_;
+        //skip memstore timestamp
+        int8_t vlong_len = **byte_buffer_ptr;
+        *byte_buffer_ptr+=ReadWriteUtil::DecodeVIntSize(vlong_len);
+        //adjust key_start_ptr_ to point to row key start position.
+        key_len_ =   ReadWriteUtil::GetSmallInt(key_start_ptr_);
+        key_start_ptr_+=2;
+    }
 
     BinarySortableDeserializer key_deserializer_;
     LazyBinaryDeserializer value_deserializer_;
@@ -482,36 +505,6 @@ private:
     uint8_t* value_start_ptr_;
     int value_len_;
 };
-
-void KeyValue::Parse_Key_Value(uint8_t** byte_buffer_ptr)
-{
-    key_len_ = ReadWriteUtil::GetInt(*byte_buffer_ptr);
-    *byte_buffer_ptr+=4;
-    value_len_ = ReadWriteUtil::GetInt(*byte_buffer_ptr);
-    *byte_buffer_ptr+=4;
-    key_start_ptr_= *byte_buffer_ptr;
-    *byte_buffer_ptr+=key_len_;
-    value_start_ptr_ = *byte_buffer_ptr;
-    *byte_buffer_ptr += value_len_;
-    //skip memstore timestamp
-    int8_t vlong_len = **byte_buffer_ptr;
-    *byte_buffer_ptr+=ReadWriteUtil::DecodeVIntSize(vlong_len);
-    //adjust key_start_ptr_ to point to row key start position.
-    key_len_ =   ReadWriteUtil::GetSmallInt(key_start_ptr_);
-    key_start_ptr_+=2;
-}
-
-bool KeyValue:: Write_Tuple(MemPool* pool,Tuple* tuple,uint8_t** byte_buffer_ptr)
-{
-    Parse_Key_Value(byte_buffer_ptr);
-    bool result = true;
-    result &=key_deserializer_.Write_Tuple(pool, tuple, key_start_ptr_,key_len_);
-    result &= value_deserializer_.Write_Tuple(pool,tuple,value_start_ptr_,value_len_);
-    return result;
-}
-
-
-
 
 impala::HdfsHFileScanner::HdfsHFileScanner(HdfsScanNode* scan_node, RuntimeState* state) :
     HdfsScanner(scan_node, state),byte_buffer_ptr_(NULL),byte_buffer_end_(NULL),num_checksum_bytes_(0),num_key_cols_(-1),only_parsing_trailer_(false)
@@ -700,7 +693,7 @@ bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple)
         kv_parser->Set_Value_State(value_types,value_slot_desc,stream_->compact_data());
     }
 
-	bool ret = kv_parser->Write_Tuple(pool,Tuple,&byte_buffer_ptr_);
+    bool ret = kv_parser->Write_Tuple(pool,Tuple,&byte_buffer_ptr_);
     return ret;
 
 }
