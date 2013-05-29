@@ -62,7 +62,7 @@ private:
 	//So we de-serialize a record to get this number.
 	int num_key_cols_;
 	int num_clustering_cols_;
-	class KeyValue;
+//	class KeyValue;
 	boost::scoped_ptr<KeyValue> kv_parser;
 	hfile::FixedFileTrailer* trailer_;
 	bool only_parsing_trailer_;
