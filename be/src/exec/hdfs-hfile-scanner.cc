@@ -47,14 +47,10 @@ public:
         compact_data_ = compact_data;
     }
     virtual bool Write_Tuple(MemPool* pool,Tuple*tuple,uint8_t* data ,int len) = 0;
-
 protected:
     std::vector<PrimitiveType> types_;
     std::vector<SlotDescriptor*> slot_desc_;
     bool compact_data_;
-//private:
-//    Deserializer(const Deserializer&);
-//    Deserializer& operator=(const Deserializer&);
 };
 
 
@@ -66,18 +62,50 @@ private:
     bool Write_Field(MemPool* pool,Tuple*tuple,uint8_t** data,PrimitiveType type,SlotDescriptor* slot_desc);
 };
 
-//row key part of KeyValue use BinarySortableSerDe to encode it's data.
-class BinarySortableDeserializer:public Deserializer
+
+bool LazyBinaryDeserializer::Write_Tuple(MemPool* pool,Tuple*tuple,uint8_t* data ,int len)
 {
-public:
 
-    virtual bool Write_Tuple(MemPool* pool,Tuple*tuple,uint8_t* data ,int len);
-    int Get_Key_Col_Num(uint8_t* data, int len, PrimitiveType* types);
-private:
+    uint8_t* const data_end_ptr = data +len;
+    uint8_t null_byte = *data++;
+    int fields = 0;
+    for(int i =0; i < types_.size(); i ++)
+    {
+        //this field is null
+        if((null_byte&(1<<(i % 8))) == 0)
+        {
+            //this field need materialized
+            if(slot_desc_[i])
+            {
+                tuple->SetNull(slot_desc_[i]->null_indicator_offset());
+            }
+        }
+        else//there is data exist for this field, materialized it or skip it based on whether slot_desc == NULL or not.
+        {
+            Write_Field(pool,tuple,&data,types_[i],slot_desc_[i]);
+        }
 
-    bool Write_Field(MemPool* pool,Tuple*tuple,uint8_t** data,PrimitiveType type,SlotDescriptor* slot_desc);
+        if(data <= data_end_ptr)
+        {
+            fields++;
+        }
 
-};
+        if(7 == (i%8))
+        {
+            if(data < data_end_ptr)
+            {
+                null_byte = *data++;
+            }
+            else
+            {
+                null_byte = 0;
+            }
+        }
+
+    }
+    DCHECK(data == data_end_ptr);
+    return true;
+}
 
 
 bool LazyBinaryDeserializer::Write_Field(MemPool* pool,Tuple*tuple,uint8_t** data,PrimitiveType type,SlotDescriptor* slot_desc)
@@ -198,51 +226,48 @@ bool LazyBinaryDeserializer::Write_Field(MemPool* pool,Tuple*tuple,uint8_t** dat
     default:
         DCHECK(false);
     }
-	return true;
+    return true;
 }
 
-bool LazyBinaryDeserializer::Write_Tuple(MemPool* pool,Tuple*tuple,uint8_t* data ,int len)
+
+//row key part of KeyValue use BinarySortableSerDe to encode it's data.
+class BinarySortableDeserializer:public Deserializer
 {
+public:
+    virtual bool Write_Tuple(MemPool* pool,Tuple*tuple,uint8_t* data ,int len);
+    int Get_Key_Col_Num(uint8_t* data, int len, PrimitiveType* types);
+private:
+    bool Write_Field(MemPool* pool,Tuple*tuple,uint8_t** data,PrimitiveType type,SlotDescriptor* slot_desc);
 
-    uint8_t* const data_end_ptr = data +len;
-    uint8_t null_byte = *data++;
-    int fields = 0;
-    for(int i =0; i < types_.size(); i ++)
+};
+
+int BinarySortableDeserializer::Get_Key_Col_Num(uint8_t* data,int len,PrimitiveType* types)
+{
+    uint8_t* data_cur_ptr = data;
+    uint8_t* const data_end_ptr = data + len;
+    int col_count = 0;
+    while(data_cur_ptr != data_end_ptr)
     {
-        //this field is null
-        if((null_byte&(1<<(i % 8))) == 0)
-        {
-            //this field need materialized
-            if(slot_desc_[i])
-            {
-                tuple->SetNull(slot_desc_[i]->null_indicator_offset());
-            }
-        }
-        else//there is data exist for this field, materialized it or skip it based on whether slot_desc == NULL or not.
-        {
-            Write_Field(pool,tuple,&data,types_[i],slot_desc_[i]);
-        }
-
-        if(data <= data_end_ptr)
-        {
-            fields++;
-        }
-
-        if(7 == (i%8))
-        {
-            if(data < data_end_ptr)
-            {
-                null_byte = *data++;
-            }
-            else
-            {
-                null_byte = 0;
-            }
-        }
-
+        Write_Field(NULL,NULL, &data_cur_ptr, *types, NULL);
+        ++types;
+        ++col_count;
     }
-    DCHECK(data == data_end_ptr);
-	return true;
+    DCHECK(data_cur_ptr == data_end_ptr);
+
+    return col_count;
+}
+
+bool BinarySortableDeserializer:: Write_Tuple(MemPool* pool,Tuple*tuple,uint8_t* data ,int len)
+{
+    uint8_t* data_cur_ptr = data;
+    uint8_t* data_end_ptr = data + len;
+
+    for(int i = 0 ; i < types_.size(); i ++)
+    {
+        Write_Field(pool, tuple, &data_cur_ptr, types_[i], slot_desc_[i]);
+    }
+    DCHECK(data_cur_ptr == data_end_ptr);
+    return true;
 }
 
 bool BinarySortableDeserializer::Write_Field(MemPool * pool, Tuple * tuple, uint8_t ** data, PrimitiveType type, SlotDescriptor * slot_desc)
@@ -421,37 +446,6 @@ bool BinarySortableDeserializer::Write_Field(MemPool * pool, Tuple * tuple, uint
 
 }
 
-int BinarySortableDeserializer::Get_Key_Col_Num(uint8_t* data,int len,PrimitiveType* types)
-{
-    uint8_t* data_cur_ptr = data;
-    uint8_t* const data_end_ptr = data + len;
-    int col_count = 0;
-    while(data_cur_ptr != data_end_ptr)
-    {
-        Write_Field(NULL,NULL, &data_cur_ptr, *types, NULL);
-        ++types;
-        ++col_count;
-    }
-    DCHECK(data_cur_ptr == data_end_ptr);
-
-    return col_count;
-}
-
-bool BinarySortableDeserializer:: Write_Tuple(MemPool* pool,Tuple*tuple,uint8_t* data ,int len)
-{
-    uint8_t* data_cur_ptr = data;
-    uint8_t* data_end_ptr = data + len;
-
-    for(int i = 0 ; i < types_.size(); i ++)
-    {
-        Write_Field(pool, tuple, &data_cur_ptr, types_[i], slot_desc_[i]);
-    }
-    DCHECK(data_cur_ptr == data_end_ptr);
-    return true;
-}
-
-
-
 }
 
 
@@ -472,43 +466,48 @@ public:
     }
     bool Write_Tuple(MemPool* pool,Tuple* tuple,uint8_t** byte_buffer_ptr)
     {
-        Parse_Key_Value(byte_buffer_ptr);
+        uint8_t* key_start_ptr;
+        int key_len;
+        uint8_t* value_start_ptr;
+        int value_len;
+        Parse_Key_Value(&data,&key_start_ptr,&key_len,&value_start_ptr,&value_len);
+
         bool result = true;
-        result &=key_deserializer_.Write_Tuple(pool, tuple, key_start_ptr_,key_len_);
-        result &= value_deserializer_.Write_Tuple(pool,tuple,value_start_ptr_,value_len_);
+        result &=key_deserializer_.Write_Tuple(pool, tuple, key_start_ptr,key_len);
+        result &= value_deserializer_.Write_Tuple(pool,tuple,value_start_ptr,value_len);
         return result;
     }
     int Get_Key_Col_Num(uint8_t* data,PrimitiveType* types)
     {
-        Parse_Key_Value(&data);
-        return key_deserializer_.Get_Key_Col_Num(key_start_ptr_,key_len_,types);
+        uint8_t* key_start_ptr;
+        int key_len;
+        uint8_t* value_start_ptr;
+        int value_len;
+        Parse_Key_Value(&data,&key_start_ptr,&key_len,&value_start_ptr,&value_len);
+
+        return key_deserializer_.Get_Key_Col_Num(key_start_ptr,key_len,types);
     }
 
 private:
-    void Parse_Key_Value(uint8_t** byte_buffer_ptr)
+    void Parse_Key_Value(uint8_t** byte_buffer_ptr,uint8_t** key_start_ptr,int* key_len,uint8_**value_start_ptr,int* value_len)
     {
-        key_len_ = ReadWriteUtil::GetInt(*byte_buffer_ptr);
+        *key_len = ReadWriteUtil::GetInt(*byte_buffer_ptr);
         *byte_buffer_ptr+=4;
-        value_len_ = ReadWriteUtil::GetInt(*byte_buffer_ptr);
+        *value_len = ReadWriteUtil::GetInt(*byte_buffer_ptr);
         *byte_buffer_ptr+=4;
-        key_start_ptr_= *byte_buffer_ptr;
-        *byte_buffer_ptr+=key_len_;
-        value_start_ptr_ = *byte_buffer_ptr;
-        *byte_buffer_ptr += value_len_;
+        *key_start_ptr= *byte_buffer_ptr;
+        *byte_buffer_ptr+=*key_len;
+        *value_start_ptr = *byte_buffer_ptr;
+        *byte_buffer_ptr += *value_len;
         //skip memstore timestamp
         int8_t vlong_len = **byte_buffer_ptr;
         *byte_buffer_ptr+=ReadWriteUtil::DecodeVIntSize(vlong_len);
         //adjust key_start_ptr_ to point to row key start position.
-        key_len_ =   ReadWriteUtil::GetSmallInt(key_start_ptr_);
-        key_start_ptr_+=2;
+        *key_len =   ReadWriteUtil::GetSmallInt(*key_start_ptr);
+        *key_start_ptr+=2;
     }
-
     BinarySortableDeserializer key_deserializer_;
     LazyBinaryDeserializer value_deserializer_;
-    uint8_t* key_start_ptr_;
-    int key_len_;
-    uint8_t* value_start_ptr_;
-    int value_len_;
 };
 
 impala::HdfsHFileScanner::HdfsHFileScanner(HdfsScanNode* scan_node, RuntimeState* state) :
@@ -577,9 +576,9 @@ Status HdfsHFileScanner::ProcessTrailer()
     //sure to end of file.
     DCHECK(eos);
 
-    DCHECK_GE(len, FixedFileTrailer::MAX_TRAILER_SIZE);
+//    DCHECK_GE(len, FixedFileTrailer::MAX_TRAILER_SIZE);
 
-    RETURN_IF_ERROR(hfile::FixedFileTrailer::DeserializeFromBuffer(buffer, len, *trailer_));
+    RETURN_IF_ERROR(hfile::FixedFileTrailer::SetDataFromBuffer(buffer, len, *trailer_));
 
     return Status::OK;
 
@@ -635,11 +634,12 @@ Status HdfsHFileScanner::Close()
 
 Status HdfsHFileScanner::Prepare()
 {
+    RETURN_IF_ERROR(HdfsScanner::Prepare());
     const TupleDescriptor* tuple_desc = scan_node_->tuple_desc();
-//    const std::vector<SlotDescriptor*>& slots = tuple_desc->slots();
     const HdfsTableDescriptor* hdfs_table = static_cast<const HdfsTableDescriptor*>(tuple_desc->table_desc());
     col_types_ = hdfs_table->col_types();
     num_clustering_cols_ = hdfs_table->num_clustering_cols();
+    scan_node_->IncNumScannersCodegenDisabled();
     return Status::OK;
 }
 
@@ -656,6 +656,7 @@ bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple)
                 parse_status_ = dumy_status;
                 return false;
             }
+            num_checksum_bytes_ = 0;
         }
         Status s = ReadDataBlock();
         if(!s.ok())
@@ -664,7 +665,7 @@ bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple)
             return false;
     }
 
-    //de-serialize a record beforehand to get number of columns constituting key and value ,respectively.
+    //de-serialize a record beforehand to get num. of columns constituting key and value ,respectively.
     if(UNLIKELY(num_key_cols_ == -1))
     {
         const  std::vector<SlotDescriptor*>& materailized_slots = scan_node_->materialized_slots();
@@ -676,7 +677,7 @@ bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple)
         num_key_cols_ = kv_parser_->Get_Key_Col_Num(byte_buffer_ptr_,&col_types_[num_clustering_cols_]);
         for(int i = num_clustering_cols_; i < (num_clustering_cols_+num_key_cols_); i++)
         {
-            key_types.push_back((col_types_)[i]);
+            key_types.push_back(col_types_[i]);
             int index_slot = scan_node_->GetMaterializedSlotIdx(i);
             if(index_slot != HdfsScanNode::SKIP_COLUMN)
             {
@@ -717,21 +718,17 @@ Status HdfsHFileScanner::ReadDataBlock()
     uint8_t* buffer;
     int num_bytes;
     bool eos;
-
+    //need to read in a loop to skip no-data-block-type block
     while(true)
     {
-
         if(!stream_->GetBytes(trailer_->header_size_, &buffer, &num_bytes, &eos, &status))
             return status;
-
         DCHECK_EQ(trailer_->header_size_, num_bytes);
-
         if(stream_->file_offset() - num_bytes >  trailer_->last_data_block_offset_)
         {
             //has already read all data blocks
             break;
         }
-
 
         uint8_t* block_type = buffer;
         buffer += 8;
@@ -747,7 +744,6 @@ Status HdfsHFileScanner::ReadDataBlock()
         uint32_t on_disk_size_with_header;
 
         if(trailer_->minor_version_  >=  FixedFileTrailer::MINOR_VERSION_WITH_CHECKSUM)
-
         {
             checksum_type = *buffer;
             buffer++;
@@ -762,7 +758,6 @@ Status HdfsHFileScanner::ReadDataBlock()
             bytes_per_checksum = 0;
             on_disk_size_with_header = on_disk_size + FixedFileTrailer::HEADER_SIZE_NO_CHECKSUM;
         }
-
         //it is suffice to  compare prefix to determine whether this block is a data block
         if(memcmp(block_type,FixedFileTrailer::DATA_BLOCK_TYPE,7))
         {
@@ -771,7 +766,6 @@ Status HdfsHFileScanner::ReadDataBlock()
                 return status;
             continue;
         }
-
         //it's really a data block.
         if(!stream_->ReadBytes(uncompressed_size, &buffer, &status))
         {
@@ -780,14 +774,11 @@ Status HdfsHFileScanner::ReadDataBlock()
 
         byte_buffer_ptr_ = buffer;
         byte_buffer_end_ = buffer + uncompressed_size;
-
-
         num_checksum_bytes_ = 0;
         if(checksum_type)
         {
             num_checksum_bytes_  = on_disk_size-uncompressed_size;
         }
-
     }
 
     return Status::OK;
