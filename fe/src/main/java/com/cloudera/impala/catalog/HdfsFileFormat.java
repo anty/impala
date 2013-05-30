@@ -58,7 +58,7 @@ public enum HdfsFileFormat {
   
   // Input format class for HFile tables read by hive
   private static final String HFILE_INPUT_FORMAT=
-            "com.hugetable.hive.io.HugetableInputFormatProxy"
+            "com.hugetable.hive.io.HugetableInputFormatProxy";
             
   private static final Map<String, HdfsFileFormat> VALID_FORMATS =
       ImmutableMap.<String, HdfsFileFormat>builder()

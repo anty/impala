@@ -9,9 +9,9 @@
 #define HDFS_HFILE_SCANNER_H_
 
 #include "exec/hdfs-scanner.h"
-#include "exec/scan-node.h"
 #include "exec/hdfs-scan-node.h"
 #include "exec/hfile-types.h"
+
 #include <boost/scoped_ptr.hpp>
 
 namespace impala
@@ -41,8 +41,6 @@ public:
 
 private:
 
-//	friend class LazyBinaryDeserializer;
-//	friend class BinarySortableDeserializer;
 	Status ProcessTrailer();
 	Status ReadDataBlock();
 	Status IssueFileRanges(const char* filename);
@@ -52,7 +50,6 @@ private:
 	uint8_t* byte_buffer_ptr_;
 	uint8_t* byte_buffer_end_;
 	uint32_t num_checksum_bytes_;
-
 
 	std::vector<PrimitiveType> col_types_;
 	std::vector<PrimitiveType>  key_col_types_;

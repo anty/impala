@@ -6,21 +6,17 @@
  */
 
 #include "hfile-types.h"
-#include "hfile-common.h"
 #include "exec/read-write-util.h"
-#include "common/status.h"
 
-#include <iostream>
 #include <sstream>
-#include <string>
-#include <memory>
+#include <string.h>
 
 using namespace impala;
 using namespace std;
 
 namespace hfile
 {
-static	const uint32_t MIN_FORMAT_VERSION = 1;
+static const uint32_t MIN_FORMAT_VERSION = 1;
 static const uint32_t MAX_FORMAT_VERSION = 2;
 const uint8_t FixedFileTrailer::TRAILER_BLOCK_TYPE[] = { 'T', 'R', 'A', 'B', 'L', 'K', '"', '$' };
 const uint8_t FixedFileTrailer::DATA_BLOCK_TYPE[] = {'D','A','T','A','B','L','K','*'};
@@ -33,7 +29,7 @@ int FixedFileTrailer::GetTrailerSize(int version)
     return TRAILER_SIZE[version];
 }
 
-Status FixedFileTrailer::DeserializeFromBuffer(uint8_t* buffer, int len,
+Status FixedFileTrailer::SetDataFromBuffer(uint8_t* buffer, int len,
         FixedFileTrailer& trailer)
 {
     uint32_t* ver = reinterpret_cast<uint32_t*>(buffer + len - sizeof(uint32_t));
@@ -63,7 +59,7 @@ Status FixedFileTrailer::DeserializeFromBuffer(uint8_t* buffer, int len,
     {
         stringstream ss;
         ss << "Invalid magic : expected " <<"TRABLK\"$"
-           << ",got "<< string(static_cast<const char*>(block_type_ptr), 8);
+           << ",got "<< string(reinterpret_cast<char*>(block_type_ptr), 8);
         return Status(ss.str());
     }
 
@@ -131,7 +127,7 @@ Status FixedFileTrailer::DeserializeFromBuffer(uint8_t* buffer, int len,
         }
         //move end pointer one step further?
 
-        trailer.comparator_class_name_ = std::string(static_cast<const char*>(trailer_ptr),end_comparator_ptr-trailer_ptr+1);
+        trailer.comparator_class_name_ = std::string(reinterpret_cast<char*>(trailer_ptr),end_comparator_ptr-trailer_ptr+1);
 
         trailer_ptr += MAX_COMPARATOR_NAME_LENGTH;
     }
@@ -151,7 +147,7 @@ Status FixedFileTrailer::DeserializeFromBuffer(uint8_t* buffer, int len,
     {
         stringstream ss;
         ss << "Invalid HFile major version " << (version & 0x00ffffff)
-           << "(expected " << major_version_ << ")";
+           << "(expected " << trailer.major_version_ << ")";
         return Status(ss.str());
     }
     if (trailer.minor_version_ != (version & 0xff000000))
