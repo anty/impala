@@ -63,7 +63,8 @@ public class HdfsStorageDescriptor {
   final static List<String> COMPATIBLE_SERDES = ImmutableList.of(
       "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe", // (seq / text / parquet)
       "org.apache.hadoop.hive.serde2.avro.AvroSerDe", // (avro)
-      "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"); // (rc)
+      "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe",
+	"com.hugetable.engine.HorizonSerDe"); // (rc)
 
   private final static Logger LOG = LoggerFactory.getLogger(HdfsStorageDescriptor.class);
 

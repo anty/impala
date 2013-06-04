@@ -561,6 +561,7 @@ public class HdfsTable extends Table {
       Column col = new Column(s.getName(), type, s.getComment(), pos);
       colsByPos.add(col);
       colsByName.put(s.getName(), col);
+      colTypes.add(type.toThrift());
       ++pos;
 
       ColumnStatistics colStats = null;
@@ -586,7 +587,7 @@ public class HdfsTable extends Table {
    * partition keys.
    */
   public void loadPartitions(
-      List<org.apache.hadoop.hive.metastore.api.Partition> msPartitions,
+List<org.apache.hadoop.hive.metastore.api.Partition> msPartitions,
       org.apache.hadoop.hive.metastore.api.Table msTbl)
       throws IOException, InvalidStorageDescriptorException {
     partitions.clear();
@@ -602,7 +603,7 @@ public class HdfsTable extends Table {
       // We model partitions slightly differently to Hive - every file must exist in a
       // partition, so add a single partition with no keys which will get all the
       // files in the table's root directory.
-      addPartition(msTbl.getSd(), null, new ArrayList<LiteralExpr>());
+      addPartition(msTbl,msTbl.getSd(), null, new ArrayList<LiteralExpr>());
     } else {
       // keep track of distinct partition key values and how many nulls there are
       Set<String>[] uniquePartitionKeys = new HashSet[numClusteringCols];
@@ -678,6 +679,15 @@ public class HdfsTable extends Table {
     return -1;
   }
 
+
+    private HdfsPartition addPartition(StorageDescriptor storageDescriptor,
+                                       org.apache.hadoop.hive.metastore.api.Partition msPartition,
+                                       List<LiteralExpr> partitionKeyExprs) throws IOException, InvalidStorageDescriptorException
+    {
+        return addPartition(null, storageDescriptor, msPartition, partitionKeyExprs);
+    }
+
+
   /**
    * Adds a new HdfsPartition to internal partition list, populating with file format
    * information and file locations. If a partition contains no files, it's not added.
@@ -686,7 +696,7 @@ public class HdfsTable extends Table {
    * @throws InvalidStorageDescriptorException if the supplied storage descriptor contains
    *         metadata that Impala can't understand.
    */
-  private HdfsPartition addPartition(StorageDescriptor storageDescriptor,
+  private HdfsPartition addPartition(org.apache.hadoop.hive.metastore.api.Table msTbl,StorageDescriptor storageDescriptor,
       org.apache.hadoop.hive.metastore.api.Partition msPartition,
       List<LiteralExpr> partitionKeyExprs)
       throws IOException, InvalidStorageDescriptorException {
@@ -712,7 +722,7 @@ public class HdfsTable extends Table {
       assert fileDescriptors.size() == 0 && msPartition == null;
       Configuration conf = new Configuration();
       //TODO this parameter should be table properties.
-      Map<String, String> parameters = storageDescriptor.getParameters();
+      Map<String, String> parameters = msTbl.getParameters();
       conf.set(HorizonConstants.HIVE_TABLE_PARTITION_INFO_CONF_KEY,
               parameters.get(HorizonConstants.HIVE_TABLE_PARTITION_INFO_CONF_KEY));
       conf.set(HugetableInputFormatProxy.HIVE_TABLE_NAME, this.name);
@@ -801,7 +811,7 @@ public class HdfsTable extends Table {
       idToValue.put(partition.getId(), partition.toThrift());
     }
     THdfsTable tHdfsTable = new THdfsTable(hdfsBaseDir,
-        colNames, nullPartitionKeyValue, idToValue);
+        colNames, nullPartitionKeyValue, idToValue,colTypes);
 
     TTableDescriptor.setHdfsTable(tHdfsTable);
     return TTableDescriptor;

@@ -18,6 +18,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
+import com.cloudera.impala.thrift.TPrimitiveType;
+
 import org.apache.hadoop.hive.metastore.HiveMetaStoreClient;
 import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
@@ -57,7 +59,7 @@ public abstract class Table {
    * the clustering columns.
    */
   protected final ArrayList<Column> colsByPos;
-
+  protected final List<TPrimitiveType> colTypes;
   /**  map from lowercase col. name to Column */
   protected final Map<String, Column> colsByName;
 
@@ -70,6 +72,7 @@ public abstract class Table {
     this.owner = owner;
     this.colsByPos = Lists.newArrayList();
     this.colsByName = Maps.newHashMap();
+    this.colTypes = Lists.newArrayList();
   }
 
   public TableId getId() {
