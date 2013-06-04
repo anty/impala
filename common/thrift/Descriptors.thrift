@@ -92,7 +92,7 @@ struct THdfsTable {
 
   // map from partition id to partition metadata
   4: required map<i64, THdfsPartition> partitions
-  5: optional list<Types.TPrimitiveType> colTypes
+  5: required list<Types.TPrimitiveType> colTypes
 }
 
 struct THBaseTable {

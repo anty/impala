@@ -561,6 +561,7 @@ public class HdfsTable extends Table {
       Column col = new Column(s.getName(), type, s.getComment(), pos);
       colsByPos.add(col);
       colsByName.put(s.getName(), col);
+      colTypes.add(type);
       ++pos;
 
       ColumnStatistics colStats = null;
@@ -801,7 +802,7 @@ public class HdfsTable extends Table {
       idToValue.put(partition.getId(), partition.toThrift());
     }
     THdfsTable tHdfsTable = new THdfsTable(hdfsBaseDir,
-        colNames, nullPartitionKeyValue, idToValue);
+        colNames, nullPartitionKeyValue, idToValue,colTypes);
 
     TTableDescriptor.setHdfsTable(tHdfsTable);
     return TTableDescriptor;

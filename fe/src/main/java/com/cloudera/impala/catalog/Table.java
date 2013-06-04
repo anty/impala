@@ -57,6 +57,7 @@ public abstract class Table {
    * the clustering columns.
    */
   protected final ArrayList<Column> colsByPos;
+  protected final List<PrimitiveType> colTypes;
 
   /**  map from lowercase col. name to Column */
   protected final Map<String, Column> colsByName;
@@ -70,6 +71,7 @@ public abstract class Table {
     this.owner = owner;
     this.colsByPos = Lists.newArrayList();
     this.colsByName = Maps.newHashMap();
+    this.colTypes = Lists.newArrayList();
   }
 
   public TableId getId() {

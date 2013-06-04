@@ -59,7 +59,7 @@ public:
 
 	
 	static impala::Status SetDataFromBuffer( uint8_t* buffer, int len,FixedFileTrailer& trailer);
-	static int GetTrailerSize(int version) const;
+	static int GetTrailerSize(int version);
 
 	static const int TRAILER_SIZE[];	
 	static const int MAX_COMPARATOR_NAME_LENGTH = 128;
