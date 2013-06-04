@@ -814,11 +814,11 @@ Status HdfsHFileScanner::ReadDataBlock()
         }
 	  //trailer_.compression_codec_ is ordinal value of compression enum.
         // no compression
-        if(trailer_.compression_codec_ == 2)
+        if(trailer_->compression_codec_ == 2)
         {
 		DCHECK_EQ(on_disk_size, uncompressed_size);
         }
-        else if(trailer_.compression_codec_ == 3) //snappy compression.
+        else if(trailer_->compression_codec_ == 3) //snappy compression.
         {
 		size_t uncompressed_actual_size;
 		bool success = snappy::GetUncompressedLength(reinterpret_cast<const char*>(buffer),on_disk_size,&uncompressed_actual_size);
