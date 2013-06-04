@@ -32,15 +32,15 @@ int FixedFileTrailer::GetTrailerSize(int version)
 Status FixedFileTrailer::SetDataFromBuffer(uint8_t* buffer, int len,
         FixedFileTrailer& trailer)
 {
-    uint32_t* ver = reinterpret_cast<uint32_t*>(buffer + len - sizeof(uint32_t));
-    uint32_t major_version = (*ver) & 0x00ffffff;
-    uint32_t minor_version = (*ver) & 0xff000000;
+    uint32_t ver = ReadWriteUtil::GetInt(buffer + len - sizeof(uint32_t));
+    uint32_t major_version = (ver) & 0x00ffffff;
+    uint32_t minor_version = (ver) & 0xff000000;
 
     if (major_version < MIN_FORMAT_VERSION
             || major_version > MAX_FORMAT_VERSION)
     {
         stringstream ss;
-        ss << "Invalid HFile version " + major_version
+        ss << "Invalid HFile version " <<major_version
            << " (expected to be between " << MIN_FORMAT_VERSION << " and "
            << MAX_FORMAT_VERSION << ")";
         return Status(ss.str());
@@ -108,12 +108,10 @@ Status FixedFileTrailer::SetDataFromBuffer(uint8_t* buffer, int len,
         trailer.num_data_index_levels_ = ReadWriteUtil::GetInt(trailer_ptr);
         trailer_ptr +=  sizeof(uint32_t);
 
-        trailer.first_data_block_offset_ = ReadWriteUtil::GetLongInt(
-                                               trailer_ptr);
+        trailer.first_data_block_offset_ = ReadWriteUtil::GetLongInt(trailer_ptr);
         trailer_ptr += sizeof(uint64_t);
 
-        trailer.last_data_block_offset_ = ReadWriteUtil::GetLongInt(
-                                              trailer_ptr);
+        trailer.last_data_block_offset_ = ReadWriteUtil::GetLongInt(trailer_ptr);
         trailer_ptr += sizeof(uint64_t);
 
         uint8_t* end_comparator_ptr = trailer_ptr + MAX_COMPARATOR_NAME_LENGTH;
