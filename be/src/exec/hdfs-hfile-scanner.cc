@@ -24,6 +24,7 @@
 #include "algorithm"
 #include "exec/hdfs-scan-node.h"
 #include "exec/hdfs-scanner.h"
+#include <snappy.h>
 
 #include <boost/scoped_ptr.hpp>
 
@@ -220,6 +221,9 @@ bool LazyBinaryDeserializer::Write_Field(MemPool* pool,Tuple*tuple,uint8_t** dat
         {
             sv->ptr = reinterpret_cast<char*>(*data);
         }
+
+        *data+=sv->len;
+
         break;
     }
 
@@ -453,7 +457,7 @@ class HdfsHFileScanner:: KeyValue
 {
 
 public:
-    KeyValue():key_deserializer_(),value_deserializer_(),key_start_ptr_(NULL),key_len_(-1),value_start_ptr_(NULL),value_len_(-1)
+    KeyValue():key_deserializer_(),value_deserializer_()
     {
     }
     void Set_Key_State(std::vector<PrimitiveType>& types,std::vector<SlotDescriptor*> & slot_desc,bool compact_data)
@@ -464,13 +468,15 @@ public:
     {
         value_deserializer_.Set_State(types,slot_desc,compact_data);
     }
-    bool Write_Tuple(MemPool* pool,Tuple* tuple,uint8_t** byte_buffer_ptr)
+    bool Write_Tuple(MemPool* pool,Tuple* tuple,uint8_t** byte_buffer_ptr,bool skip)
     {
         uint8_t* key_start_ptr;
         int key_len;
         uint8_t* value_start_ptr;
         int value_len;
-        Parse_Key_Value(&data,&key_start_ptr,&key_len,&value_start_ptr,&value_len);
+        Parse_Key_Value(byte_buffer_ptr,&key_start_ptr,&key_len,&value_start_ptr,&value_len);
+        if(skip)
+            return true;
 
         bool result = true;
         result &=key_deserializer_.Write_Tuple(pool, tuple, key_start_ptr,key_len);
@@ -489,7 +495,7 @@ public:
     }
 
 private:
-    void Parse_Key_Value(uint8_t** byte_buffer_ptr,uint8_t** key_start_ptr,int* key_len,uint8_**value_start_ptr,int* value_len)
+    void Parse_Key_Value(uint8_t** byte_buffer_ptr,uint8_t** key_start_ptr,int* key_len,uint8_t**value_start_ptr,int* value_len)
     {
         *key_len = ReadWriteUtil::GetInt(*byte_buffer_ptr);
         *byte_buffer_ptr+=4;
@@ -511,7 +517,8 @@ private:
 };
 
 impala::HdfsHFileScanner::HdfsHFileScanner(HdfsScanNode* scan_node, RuntimeState* state) :
-    HdfsScanner(scan_node, state),byte_buffer_ptr_(NULL),byte_buffer_end_(NULL),num_checksum_bytes_(0),num_key_cols_(-1),only_parsing_trailer_(false)
+    HdfsScanner(scan_node, state),byte_buffer_ptr_(NULL),byte_buffer_end_(NULL),num_checksum_bytes_(0),num_key_cols_(-1),only_parsing_trailer_(false),
+    decompressed_data_pool_(new MemPool()),block_buffer_len_(0)
 {
 }
 
@@ -546,7 +553,8 @@ Status HdfsHFileScanner::ProcessSplit(ScannerContext* context)
         scan_node_->SetFileMetadata(stream_->filename(), trailer_);
 
         //release scanner thread after done its work.
-        scan_node_->runtime_state()->resource_pool()->ReleaseThreadToken(false);
+        //FIXME XXX
+//        scan_node_->runtime_state()->resource_pool()->ReleaseThreadToken(false);
 
         //before this scan thread die, it will pass queued scan ranges to disk io manager.
         return IssueFileRanges(stream_->filename());
@@ -588,33 +596,55 @@ Status HdfsHFileScanner::ProcessTrailer()
 
 Status HdfsHFileScanner::ProcessSplitInternal()
 {
+    bool skip = scan_node_ ->materialized_slots().size() ==0;
     while(!scan_node_->ReachedLimit() && !context_->cancelled())
     {
-
         MemPool* pool;
         Tuple* tuple;
         TupleRow* row;
         int num_rows = context_->GetMemory(&pool, &tuple, &row);
         int num_to_commit = 0;
 
-        for(int i = 0; i < num_rows; i++)
-        {
-            InitTuple(context_->template_tuple(), tuple);
-            if(!WriteTuple(pool, tuple))
-            {
-                context_->CommitRows(num_to_commit);
 
-                return parse_status_;
-            }
-            row->SetTuple(scan_node_->tuple_idx(), tuple);
-            if(ExecNode::EvalConjuncts(conjuncts_, num_conjuncts_, row))
+        if(num_rows > 0 && !skip)
+        {
+            for(int i = 0; i < num_rows; i++)
             {
-                row = context_->next_row(row);
-                tuple = context_->next_tuple(tuple);
-                ++num_to_commit;
+                InitTuple(context_->template_tuple(), tuple);
+                if(!WriteTuple(pool, tuple,false))
+                {
+                    context_->CommitRows(num_to_commit);
+
+                    return parse_status_;
+                }
+                row->SetTuple(scan_node_->tuple_idx(), tuple);
+                if(ExecNode::EvalConjuncts(conjuncts_, num_conjuncts_, row))
+                {
+                    row = context_->next_row(row);
+                    tuple = context_->next_tuple(tuple);
+                    ++num_to_commit;
+                }
             }
         }
-        context_->CommitRows(num_to_commit);
+        else
+        {
+            for(int i = 0; i < num_rows; i++)
+            {
+                if(!WriteTuple(pool, tuple,true))
+                {
+                    num_to_commit =  WriteEmptyTuples(context_, row, num_to_commit);
+                    if(num_to_commit > 0)
+                        context_->CommitRows(num_to_commit);
+                    return parse_status_;
+                }
+                num_to_commit++;
+            }
+            // for count(*), there is no materialized fields.
+            num_to_commit =  WriteEmptyTuples(context_, row, num_to_commit);
+        }
+        if(num_to_commit > 0)
+            context_->CommitRows(num_to_commit);
+
     }
 
     if(context_->cancelled())
@@ -627,7 +657,8 @@ Status HdfsHFileScanner::Close()
 {
     context_->Close();
     // not uniformly compressed.
-    scan_node_->RangeComplete(THdfsFileFormat::HFILE, THdfsCompression::NONE);
+    if(!only_parsing_trailer_)
+        scan_node_->RangeComplete(THdfsFileFormat::HFILE, THdfsCompression::NONE);
 //  assemble_rows_timer_.UpdateCounter();
     return Status::OK;
 }
@@ -643,7 +674,7 @@ Status HdfsHFileScanner::Prepare()
     return Status::OK;
 }
 
-bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple)
+bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple,bool skip)
 {
 
     if(byte_buffer_ptr_ == byte_buffer_end_)
@@ -661,12 +692,12 @@ bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple)
         Status s = ReadDataBlock();
         if(!s.ok())
             return false;
-        if(byte_buffer_ptr_== byte_buffer_end_)
+        if(byte_buffer_ptr_ == byte_buffer_end_)
             return false;
     }
 
     //de-serialize a record beforehand to get num. of columns constituting key and value ,respectively.
-    if(UNLIKELY(num_key_cols_ == -1))
+    if(UNLIKELY(num_key_cols_ == -1 && !skip))
     {
         const  std::vector<SlotDescriptor*>& materailized_slots = scan_node_->materialized_slots();
         std::vector<PrimitiveType> key_types;
@@ -675,6 +706,7 @@ bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple)
         std::vector<SlotDescriptor*> value_slot_desc;
 
         num_key_cols_ = kv_parser_->Get_Key_Col_Num(byte_buffer_ptr_,&col_types_[num_clustering_cols_]);
+//        VLOG(2)<<"#num_key_cols"<<num_key_cols_;
         for(int i = num_clustering_cols_; i < (num_clustering_cols_+num_key_cols_); i++)
         {
             key_types.push_back(col_types_[i]);
@@ -706,7 +738,7 @@ bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple)
         kv_parser_->Set_Value_State(value_types,value_slot_desc,stream_->compact_data());
     }
 
-    bool ret = kv_parser_->Write_Tuple(pool,tuple,&byte_buffer_ptr_);
+    bool ret = kv_parser_->Write_Tuple(pool,tuple,&byte_buffer_ptr_,skip);
     return ret;
 
 }
@@ -718,6 +750,13 @@ Status HdfsHFileScanner::ReadDataBlock()
     uint8_t* buffer;
     int num_bytes;
     bool eos;
+
+    if(!stream_->compact_data())
+    {
+        context_->AcquirePool(decompressed_data_pool_.get());
+        block_buffer_len_ = 0;
+    }
+
     //need to read in a loop to skip no-data-block-type block
     while(true)
     {
@@ -766,10 +805,43 @@ Status HdfsHFileScanner::ReadDataBlock()
                 return status;
             continue;
         }
+        DCHECK_EQ(block_type+num_bytes, buffer);
+
         //it's really a data block.
-        if(!stream_->ReadBytes(uncompressed_size, &buffer, &status))
+        if(!stream_->ReadBytes(on_disk_size, &buffer, &status))
         {
             return status;
+        }
+	  //trailer_.compression_codec_ is ordinal value of compression enum.
+        // no compression
+        if(trailer_.compression_codec_ == 2)
+        {
+		DCHECK_EQ(on_disk_size, uncompressed_size);
+        }
+        else if(trailer_.compression_codec_ == 3) //snappy compression.
+        {
+		size_t uncompressed_actual_size;
+		bool success = snappy::GetUncompressedLength(reinterpret_cast<const char*>(buffer),on_disk_size,&uncompressed_actual_size);
+
+		if(!success || uncompressed_actual_size!=uncompressed_size)
+		{
+			return Status("Corrupte data block");
+		}
+		if(block_buffer_len_ < uncompressed_size)
+		{
+			block_buffer_len_ = uncompressed_size;
+			block_buffer_= decompressed_data_pool_->Allocate(uncompressed_size);
+		}
+		success = snappy::RawUncompress(reinterpret_cast<const char*>(buffer),on_disk_size,reinterpret_cast<char*>(block_buffer_));
+
+		if(!success)
+			return Status("Corrupte data page");
+		buffer = block_buffer_;
+
+        }
+        else
+        {
+            DCHECK(false);//currently only support snappy compression.
         }
 
         byte_buffer_ptr_ = buffer;
@@ -779,6 +851,7 @@ Status HdfsHFileScanner::ReadDataBlock()
         {
             num_checksum_bytes_  = on_disk_size-uncompressed_size;
         }
+        break;
     }
 
     return Status::OK;

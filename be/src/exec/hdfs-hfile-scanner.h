@@ -44,8 +44,15 @@ private:
 	Status ProcessTrailer();
 	Status ReadDataBlock();
 	Status IssueFileRanges(const char* filename);
-	bool WriteTuple(MemPool* pool, Tuple* tuple);
+	bool WriteTuple(MemPool* pool, Tuple* tuple,bool skip);
 	Status ProcessSplitInternal();
+
+
+	boost::scoped_ptr<MemPool> decompressed_data_pool_;
+	//Buffer to hold decompressed data.
+	uint8_t* block_buffer_;
+	//Allocated length of the block_buffer_;
+	int32_t block_buffer_len_;
 
 	uint8_t* byte_buffer_ptr_;
 	uint8_t* byte_buffer_end_;
