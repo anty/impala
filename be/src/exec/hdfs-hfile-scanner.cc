@@ -25,7 +25,7 @@
 #include "exec/hdfs-scan-node.h"
 #include "exec/hdfs-scanner.h"
 #include <snappy.h>
-
+#include "util/codec.h"
 #include <boost/scoped_ptr.hpp>
 
 using namespace std;
@@ -563,7 +563,9 @@ Status HdfsHFileScanner::ProcessSplit(ScannerContext* context)
     only_parsing_trailer_ = false;
 
     kv_parser_.reset(new KeyValue());
-
+       RETURN_IF_ERROR(Codec::CreateDecompressor(state_,
+                    decompressed_data_pool_.get(), stream_->compact_data(),
+                    "SNAPPY", &decompressor_));
     RETURN_IF_ERROR(ProcessSplitInternal());
 
     return Status::OK;
@@ -690,8 +692,10 @@ bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple,bool skip)
             num_checksum_bytes_ = 0;
         }
         Status s = ReadDataBlock();
-        if(!s.ok())
+        if(!s.ok()){
+            parse_status_ = s;
             return false;
+        }
         if(byte_buffer_ptr_ == byte_buffer_end_)
             return false;
     }
@@ -760,7 +764,8 @@ Status HdfsHFileScanner::ReadDataBlock()
     //need to read in a loop to skip no-data-block-type block
     while(true)
     {
-        if(!stream_->GetBytes(trailer_->header_size_, &buffer, &num_bytes, &eos, &status))
+
+   if(!stream_->GetBytes(trailer_->header_size_, &buffer, &num_bytes, &eos, &status))
             return status;
         DCHECK_EQ(trailer_->header_size_, num_bytes);
         if(stream_->file_offset() - num_bytes >  trailer_->last_data_block_offset_)
@@ -771,16 +776,16 @@ Status HdfsHFileScanner::ReadDataBlock()
 
         uint8_t* block_type = buffer;
         buffer += 8;
-        uint32_t on_disk_size = ReadWriteUtil::GetInt(buffer);
+        uint32_t on_disk_size_without_header = ReadWriteUtil::GetInt(buffer);
         buffer += 4;
-        uint32_t uncompressed_size = ReadWriteUtil::GetInt(buffer);
+        uint32_t uncompressed_size_without_header = ReadWriteUtil::GetInt(buffer);
         buffer += 4;
         //skip previous block offset field
         buffer += 8;
 
         uint8_t checksum_type;
         uint32_t bytes_per_checksum;
-        uint32_t on_disk_size_with_header;
+        uint32_t on_disk_data_size_with_header;
 
         if(trailer_->minor_version_  >=  FixedFileTrailer::MINOR_VERSION_WITH_CHECKSUM)
         {
@@ -788,56 +793,44 @@ Status HdfsHFileScanner::ReadDataBlock()
             buffer++;
             bytes_per_checksum=ReadWriteUtil::GetInt(buffer);
             buffer+=4;
-            on_disk_size_with_header=ReadWriteUtil::GetInt(buffer);
+            on_disk_data_size_with_header=ReadWriteUtil::GetInt(buffer);
             buffer+=4;
         }
         else
         {
             checksum_type=0;
             bytes_per_checksum = 0;
-            on_disk_size_with_header = on_disk_size + FixedFileTrailer::HEADER_SIZE_NO_CHECKSUM;
+            on_disk_data_size_with_header = on_disk_size_without_header + FixedFileTrailer::HEADER_SIZE_NO_CHECKSUM;
         }
+
+        uint32_t on_disk_data_size_without_header = on_disk_data_size_with_header -trailer_->header_size_;
+        uint32_t checksum_size = on_disk_size_without_header - on_disk_data_size_without_header;
+
         //it is suffice to  compare prefix to determine whether this block is a data block
         if(memcmp(block_type,FixedFileTrailer::DATA_BLOCK_TYPE,7))
         {
             //this block is not a data block, skip this block and continue;
-            if(!stream_->SkipBytes(on_disk_size, &status))
+            if(!stream_->SkipBytes(on_disk_size_without_header, &status))
                 return status;
             continue;
         }
         DCHECK_EQ(block_type+num_bytes, buffer);
 
         //it's really a data block.
-        if(!stream_->ReadBytes(on_disk_size, &buffer, &status))
+        if(!stream_->ReadBytes(on_disk_data_size_without_header, &buffer, &status))
         {
             return status;
         }
-	  //trailer_.compression_codec_ is ordinal value of compression enum.
+        //trailer_.compression_codec_ is ordinal value of compression enum.
         // no compression
         if(trailer_->compression_codec_ == 2)
         {
-		DCHECK_EQ(on_disk_size, uncompressed_size);
+            DCHECK_EQ(on_disk_size_without_header, uncompressed_size_without_header+checksum_size);
         }
         else if(trailer_->compression_codec_ == 3) //snappy compression.
         {
-		size_t uncompressed_actual_size;
-		bool success = snappy::GetUncompressedLength(reinterpret_cast<const char*>(buffer),on_disk_size,&uncompressed_actual_size);
-
-		if(!success || uncompressed_actual_size!=uncompressed_size)
-		{
-			return Status("Corrupte data block");
-		}
-		if(block_buffer_len_ < uncompressed_size)
-		{
-			block_buffer_len_ = uncompressed_size;
-			block_buffer_= decompressed_data_pool_->Allocate(uncompressed_size);
-		}
-		success = snappy::RawUncompress(reinterpret_cast<const char*>(buffer),on_disk_size,reinterpret_cast<char*>(block_buffer_));
-
-		if(!success)
-			return Status("Corrupte data page");
-		buffer = block_buffer_;
-
+            RETURN_IF_ERROR(decompressor_->ProcessBlock(static_cast<int>(on_disk_data_size_without_header),buffer,uncompressed_size_without_header,&block_buffer_));
+            buffer = block_buffer_;
         }
         else
         {
@@ -845,13 +838,19 @@ Status HdfsHFileScanner::ReadDataBlock()
         }
 
         byte_buffer_ptr_ = buffer;
-        byte_buffer_end_ = buffer + uncompressed_size;
+        byte_buffer_end_ = buffer + uncompressed_size_without_header;
         num_checksum_bytes_ = 0;
         if(checksum_type)
         {
-            num_checksum_bytes_  = on_disk_size-uncompressed_size;
+            num_checksum_bytes_  = checksum_size;
+        }
+        else
+        {
+            DCHECK_EQ(checksum_size, 0);
         }
         break;
+
+
     }
 
     return Status::OK;

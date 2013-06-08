@@ -716,25 +716,29 @@ List<org.apache.hadoop.hive.metastore.api.Partition> msPartitions,
             fileStatus.getLen());
         fileDescriptors.add(fd);
       }
-	//if file format is HFile, intercept its its process to search files
-     if (fileFormatDescriptor.getFileFormat() == HdfsFileFormat.HFILE)
-     {
-      assert fileDescriptors.size() == 0 && msPartition == null;
-      Configuration conf = new Configuration();
-      //TODO this parameter should be table properties.
-      Map<String, String> parameters = msTbl.getParameters();
-      conf.set(HorizonConstants.HIVE_TABLE_PARTITION_INFO_CONF_KEY,
-              parameters.get(HorizonConstants.HIVE_TABLE_PARTITION_INFO_CONF_KEY));
-      conf.set(HugetableInputFormatProxy.HIVE_TABLE_NAME, this.name);
-      conf = HBaseConfiguration.addHbaseResources(conf);
-      Path rootDir = FSUtils.getRootDir(conf);
-  
-      Set<FileStatus> splits = HFileLayerInputFormat.getTableManagedFiles(conf, rootDir);
-      for (FileStatus status : splits)
-      {
-          fileDescriptors.add(new FileDescriptor(status.getPath().toString(), status.getLen()));
-      }  
-     }
+
+  //if file format is HFile, intercept its its process to search files
+            if (fileFormatDescriptor.getFileFormat() == HdfsFileFormat.HFILE)
+            {
+                assert fileDescriptors.size() == 0 && msPartition == null;
+
+                Configuration conf = new Configuration();
+                Map<String, String> parameters = msTbl.getParameters();
+                conf.set(HorizonConstants.HIVE_TABLE_PARTITION_INFO_CONF_KEY,
+                        parameters.get(HorizonConstants.HIVE_TABLE_PARTITION_INFO_CONF_KEY));
+                conf.set(HugetableInputFormatProxy.HIVE_TABLE_NAME, msTbl.getTableName());
+                conf = HBaseConfiguration.addHbaseResources(conf);
+                Path rootDir = FSUtils.getRootDir(conf);
+                LOG.info("hive table name is "+msTbl.getTableName(),", HBase root directory is "+rootDir.toString());
+
+                Set<FileStatus> splits = HFileLayerInputFormat.getTableManagedFiles(conf, rootDir);
+
+                for (FileStatus status : splits)
+                {
+                    fileDescriptors.add(new FileDescriptor(status.getPath().toString(), status.getLen()));
+                }
+            }
+
 
 
       HdfsPartition partition =

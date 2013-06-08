@@ -11,7 +11,7 @@
 #include "exec/hdfs-scanner.h"
 #include "exec/hdfs-scan-node.h"
 #include "exec/hfile-types.h"
-
+#include "util/codec.h"
 #include <boost/scoped_ptr.hpp>
 
 namespace impala
@@ -49,6 +49,7 @@ private:
 
 
 	boost::scoped_ptr<MemPool> decompressed_data_pool_;
+        boost::scoped_ptr<Codec> decompressor_;
 	//Buffer to hold decompressed data.
 	uint8_t* block_buffer_;
 	//Allocated length of the block_buffer_;
