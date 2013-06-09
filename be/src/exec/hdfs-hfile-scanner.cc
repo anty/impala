@@ -517,8 +517,8 @@ private:
 };
 
 impala::HdfsHFileScanner::HdfsHFileScanner(HdfsScanNode* scan_node, RuntimeState* state) :
-    HdfsScanner(scan_node, state),byte_buffer_ptr_(NULL),byte_buffer_end_(NULL),num_checksum_bytes_(0),num_key_cols_(-1),only_parsing_trailer_(false),
-    decompressed_data_pool_(new MemPool()),block_buffer_len_(0)
+    HdfsScanner(scan_node, state),byte_buffer_ptr_(NULL),byte_buffer_end_(NULL),num_key_cols_(-1),only_parsing_trailer_(false),
+    decompressed_data_pool_(new MemPool()),read_block_header_(false),block_buffer_len_(0)
 {
 }
 
@@ -563,9 +563,9 @@ Status HdfsHFileScanner::ProcessSplit(ScannerContext* context)
     only_parsing_trailer_ = false;
 
     kv_parser_.reset(new KeyValue());
-       RETURN_IF_ERROR(Codec::CreateDecompressor(state_,
+    RETURN_IF_ERROR(Codec::CreateDecompressor(state_,
                     decompressed_data_pool_.get(), stream_->compact_data(),
-                    "SNAPPY", &decompressor_));
+                    Codec::SNAPPY_COMPRESSION, &decompressor_));
     RETURN_IF_ERROR(ProcessSplitInternal());
 
     return Status::OK;
@@ -681,18 +681,9 @@ bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple,bool skip)
 
     if(byte_buffer_ptr_ == byte_buffer_end_)
     {
-        if(num_checksum_bytes_ > 0)
-        {
-            Status dumy_status;
-            if(!stream_->SkipBytes(num_checksum_bytes_, &dumy_status))
-            {
-                parse_status_ = dumy_status;
-                return false;
-            }
-            num_checksum_bytes_ = 0;
-        }
         Status s = ReadDataBlock();
-        if(!s.ok()){
+        if(!s.ok())
+        {
             parse_status_ = s;
             return false;
         }
@@ -758,99 +749,69 @@ Status HdfsHFileScanner::ReadDataBlock()
     if(!stream_->compact_data())
     {
         context_->AcquirePool(decompressed_data_pool_.get());
-        block_buffer_len_ = 0;
     }
 
     //need to read in a loop to skip no-data-block-type block
     while(true)
     {
 
-   if(!stream_->GetBytes(trailer_->header_size_, &buffer, &num_bytes, &eos, &status))
-            return status;
-        DCHECK_EQ(trailer_->header_size_, num_bytes);
-        if(stream_->file_offset() - num_bytes >  trailer_->last_data_block_offset_)
+        if(!read_block_header_)
         {
-            //has already read all data blocks
-            break;
-        }
-
-        uint8_t* block_type = buffer;
-        buffer += 8;
-        uint32_t on_disk_size_without_header = ReadWriteUtil::GetInt(buffer);
-        buffer += 4;
-        uint32_t uncompressed_size_without_header = ReadWriteUtil::GetInt(buffer);
-        buffer += 4;
-        //skip previous block offset field
-        buffer += 8;
-
-        uint8_t checksum_type;
-        uint32_t bytes_per_checksum;
-        uint32_t on_disk_data_size_with_header;
-
-        if(trailer_->minor_version_  >=  FixedFileTrailer::MINOR_VERSION_WITH_CHECKSUM)
-        {
-            checksum_type = *buffer;
-            buffer++;
-            bytes_per_checksum=ReadWriteUtil::GetInt(buffer);
-            buffer+=4;
-            on_disk_data_size_with_header=ReadWriteUtil::GetInt(buffer);
-            buffer+=4;
-        }
-        else
-        {
-            checksum_type=0;
-            bytes_per_checksum = 0;
-            on_disk_data_size_with_header = on_disk_size_without_header + FixedFileTrailer::HEADER_SIZE_NO_CHECKSUM;
-        }
-
-        uint32_t on_disk_data_size_without_header = on_disk_data_size_with_header -trailer_->header_size_;
-        uint32_t checksum_size = on_disk_size_without_header - on_disk_data_size_without_header;
-
-        //it is suffice to  compare prefix to determine whether this block is a data block
-        if(memcmp(block_type,FixedFileTrailer::DATA_BLOCK_TYPE,7))
-        {
-            //this block is not a data block, skip this block and continue;
-            if(!stream_->SkipBytes(on_disk_size_without_header, &status))
+            //this is the first time reading data block, or just skip a no data block.
+            if(!stream_->GetBytes(trailer_->header_size_, &buffer, &num_bytes, &eos, &status))
                 return status;
+            DCHECK_EQ(trailer_->header_size_, num_bytes);
+            Read_Header(buffer, trailer_->minor_version_);
+            read_block_header_ = true;
+        }
+        //it is suffice to  compare prefix to determine whether this block is a data block
+        if(memcmp(block_header_.block_type_,FixedFileTrailer::DATA_BLOCK_TYPE,7))
+        {
+            if(stream_->file_offset() >  trailer_->last_data_block_offset_)
+                //has already read all data blocks, mission complete.
+                break;
+            //this block is not a data block, skip this block and continue;
+            if(!stream_->SkipBytes(block_header_.on_disk_size_without_header_, &status))
+                return status;
+            read_block_header_ = false;
             continue;
         }
-        DCHECK_EQ(block_type+num_bytes, buffer);
-
-        //it's really a data block.
-        if(!stream_->ReadBytes(on_disk_data_size_without_header, &buffer, &status))
+        //it's really a data block, read it, plus next block's header.
+        if(!stream_->ReadBytes(block_header_.on_disk_size_without_header_ + trailer_->header_size_, &buffer, &status))
         {
             return status;
         }
         //trailer_.compression_codec_ is ordinal value of compression enum.
         // no compression
+        uint8_t* data_buffer_ptr;
         if(trailer_->compression_codec_ == 2)
         {
-            DCHECK_EQ(on_disk_size_without_header, uncompressed_size_without_header+checksum_size);
+            DCHECK_EQ(block_header_.on_disk_size_without_header_, block_header_.uncompressed_size_without_header_+block_header_.checksum_size_);
+            data_buffer_ptr = buffer;
         }
         else if(trailer_->compression_codec_ == 3) //snappy compression.
         {
-            RETURN_IF_ERROR(decompressor_->ProcessBlock(static_cast<int>(on_disk_data_size_without_header),buffer,uncompressed_size_without_header,&block_buffer_));
-            buffer = block_buffer_;
+            if(block_buffer_len_ < block_header_.uncompressed_size_without_header_)
+            {
+                block_buffer_len_ = block_header_.uncompressed_size_without_header_;
+                block_buffer_ = decompressed_data_pool_->Allocate(block_buffer_len_);
+            }
+            RETURN_IF_ERROR(decompressor_->ProcessBlock(static_cast<int>(block_header_.on_disk_data_size_without_header_),
+                            buffer,reinterpret_cast<int*>(&block_header_.uncompressed_size_without_header_),&block_buffer_));
+            data_buffer_ptr = block_buffer_;
         }
         else
         {
             DCHECK(false);//currently only support snappy compression.
         }
+        byte_buffer_ptr_ = data_buffer_ptr;
+        byte_buffer_end_ = data_buffer_ptr +block_header_.uncompressed_size_without_header_;
 
-        byte_buffer_ptr_ = buffer;
-        byte_buffer_end_ = buffer + uncompressed_size_without_header;
-        num_checksum_bytes_ = 0;
-        if(checksum_type)
-        {
-            num_checksum_bytes_  = checksum_size;
-        }
-        else
-        {
-            DCHECK_EQ(checksum_size, 0);
-        }
+        uint8_t*  byte_next_header_ptr = buffer + block_header_.on_disk_size_without_header_;
+
+        Read_Header(byte_next_header_ptr, trailer_->minor_version_);
+        //has found a data block, break out of the loop
         break;
-
-
     }
 
     return Status::OK;
