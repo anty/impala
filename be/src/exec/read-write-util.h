@@ -104,7 +104,9 @@ inline int64_t ReadWriteUtil::GetLongInt(const uint8_t* buf) {
       (static_cast<int64_t>(buf[1]) << 48) |
       (static_cast<int64_t>(buf[2]) << 40) |
       (static_cast<int64_t>(buf[3]) << 32) |
-      (buf[4] << 24) | (buf[5] << 16) | (buf[6] << 8) | buf[7];
+      (static_cast<int64_t>(buf[4]) << 24) | 
+      (static_cast<int64_t>(buf[5]) << 16) |
+      (static_cast<int64_t>(buf[6]) << 8) | buf[7];
 }
 
 inline void ReadWriteUtil::PutInt(uint8_t* buf, int32_t integer) {
