@@ -156,23 +156,20 @@ Status FixedFileTrailer::SetDataFromBuffer(uint8_t* buffer, int len,
         return Status(ss.str());
     }
 
-	stringstream ss;
-     ss<<"fileinfoOffset="<<trailer.file_info_offset_<<"loadOnOpenDataOffset="<<trailer.load_on_open_data_offset_
-	 	<<"dataIndexCount="<<trailer.data_index_count_
-	 	<<"totalUncomressedBytes="<<trailer.total_uncompressed_bytes_
-	 	<<"entryCount="<<trailer.entry_count_
-	 	<<"compressionCodec="<<trailer.compression_codec_
-	 	<<"uncompressedDataIndexSize="<<trailer.uncompressed_data_index_size
-	 	<<"numDataIndexLevels="<<trailer.num_data_index_levels_
-	 	<<"firstDataBlockOffset="<<trailer.first_data_block_offset_
-	 	<<"lastDataBlockOffset="<<trailer.last_data_block_offset_
-	 	<<"majorVersion="<<trailer.major_version_
-	 	<<"minorVersion="<<trailer.minor_version_;
+//	stringstream ss;
+//     ss<<"fileinfoOffset="<<trailer.file_info_offset_<<"loadOnOpenDataOffset="<<trailer.load_on_open_data_offset_
+//	 	<<"dataIndexCount="<<trailer.data_index_count_
+//	 	<<"totalUncomressedBytes="<<trailer.total_uncompressed_bytes_
+//	 	<<"entryCount="<<trailer.entry_count_
+//	 	<<"compressionCodec="<<trailer.compression_codec_
+//	 	<<"uncompressedDataIndexSize="<<trailer.uncompressed_data_index_size
+//	 	<<"numDataIndexLevels="<<trailer.num_data_index_levels_
+//	 	<<"firstDataBlockOffset="<<trailer.first_data_block_offset_
+//	 	<<"lastDataBlockOffset="<<trailer.last_data_block_offset_
+//	 	<<"majorVersion="<<trailer.major_version_
+//	 	<<"minorVersion="<<trailer.minor_version_;
 
-		return Status(ss.str());
-	 	
-
-
+//		return Status(ss.str());
 	
     return Status::OK;
 }
