@@ -196,37 +196,41 @@ bool LazyBinaryDeserializer::Write_Field(MemPool* pool,Tuple*tuple,uint8_t** dat
 
     case TYPE_DOUBLE:
     {
-        int64_t val = ReadWriteUtil::GetLongInt(*data);
-
-        *reinterpret_cast<double*>( slot) = *(reinterpret_cast<double*>(&val));
-
+        if(slot)
+        {
+            int64_t val = ReadWriteUtil::GetLongInt(*data);
+            *reinterpret_cast<double*>( slot) = *(reinterpret_cast<double*>(&val));
+        }
         *data+=8;
         break;
     }
     case TYPE_STRING:
     {
-        StringValue* sv = reinterpret_cast<StringValue*>(slot);
-        *data+=ReadWriteUtil::GetVInt(*data, reinterpret_cast<int32_t*>(&sv->len));
-
-        if (compact_data_&& sv->len > 0)
+        int32_t len;
+        *data+= ReadWriteUtil::GetVInt(*data, &len);
+        if(slot)
         {
-            sv->ptr = reinterpret_cast<char*>(pool->Allocate(sv->len));
-            memcpy(sv->ptr, *data, sv->len);
+            StringValue* sv = reinterpret_cast<StringValue*>(slot);
+            sv->len = len;
+            if (compact_data_&& sv->len > 0)
+            {
+                sv->ptr = reinterpret_cast<char*>(pool->Allocate(sv->len));
+                memcpy(sv->ptr, *data, sv->len);
+            }
+            else
+            {
+                sv->ptr = reinterpret_cast<char*>(*data);
+            }
         }
-        else
-        {
-            sv->ptr = reinterpret_cast<char*>(*data);
-        }
-
-        *data+=sv->len;
-
-        break;
+        *data+=len;
+    }
+    break;
     }
 
-    default:
-        DCHECK(false);
-    }
-    return true;
+default:
+    DCHECK(false);
+}
+return true;
 }
 
 
@@ -343,8 +347,8 @@ bool BinarySortableDeserializer::Write_Field(MemPool * pool, Tuple * tuple, uint
                                                (static_cast<int64_t>((*data)[1]) << 48) |
                                                (static_cast<int64_t>((*data)[2]) << 40) |
                                                (static_cast<int64_t>((*data)[3]) << 32) |
-                                               (static_cast<int64_t>((*data)[4]) << 24) | 
-                                               (static_cast<int64_t>((*data)[5]) << 16) | 
+                                               (static_cast<int64_t>((*data)[4]) << 24) |
+                                               (static_cast<int64_t>((*data)[5]) << 16) |
                                                (static_cast<int64_t>((*data)[6]) << 8) |
                                                (*data)[7];
         *data += 8;
@@ -740,7 +744,7 @@ Status HdfsHFileScanner::ReadDataBlock()
     if(!stream_->compact_data())
     {
         context_->AcquirePool(decompressed_data_pool_.get());
-	  block_buffer_len_ = 0;
+        block_buffer_len_ = 0;
     }
 
     //need to read in a loop to skip no-data-block-type block
@@ -760,20 +764,20 @@ Status HdfsHFileScanner::ReadDataBlock()
         if(memcmp(block_header_.block_type_,FixedFileTrailer::DATA_BLOCK_TYPE,7))
         {
             if(stream_->file_offset() >  trailer_->last_data_block_offset_)
-				
+
                 //has already read all data blocks, mission complete.
                 break;
-		int64_t previous_offset = stream_->file_offset();
+            int64_t previous_offset = stream_->file_offset();
             //this block is not a data block, skip this block and continue;
             if(!stream_->SkipBytes(block_header_.on_disk_size_without_header_, &status))
             {
-			stringstream ss;
-			ss<<status.GetErrorMsg()<<",current file offset:"<<stream_->file_offset()<<",offset before skip :"<<previous_offset<<" ,last_data_block_offset_"<<trailer_->last_data_block_offset_
-				<<",on_disk_size_without_header_:"<<block_header_.on_disk_size_without_header_<<",block type"
-				<<string(reinterpret_cast<char*>(block_header_.block_type_),8);
-			return Status(ss.str());
+                stringstream ss;
+                ss<<status.GetErrorMsg()<<",current file offset:"<<stream_->file_offset()<<",offset before skip :"<<previous_offset<<" ,last_data_block_offset_"<<trailer_->last_data_block_offset_
+                  <<",on_disk_size_without_header_:"<<block_header_.on_disk_size_without_header_<<",block type"
+                  <<string(reinterpret_cast<char*>(block_header_.block_type_),8);
+                return Status(ss.str());
             }
-                
+
             read_block_header_ = false;
             continue;
         }
