@@ -223,8 +223,7 @@ bool LazyBinaryDeserializer::Write_Field(MemPool* pool,Tuple*tuple,uint8_t** dat
             }
         }
         *data+=len;
-    }
-    break;
+        break;
     }
 
 default:
