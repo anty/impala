@@ -226,10 +226,10 @@ bool LazyBinaryDeserializer::Write_Field(MemPool* pool,Tuple*tuple,uint8_t** dat
         break;
     }
 
-default:
-    DCHECK(false);
-}
-return true;
+    default:
+        DCHECK(false);
+    }
+    return true;
 }
 
 
@@ -468,16 +468,13 @@ public:
     {
         value_deserializer_.Set_State(types,slot_desc,compact_data);
     }
-    bool Write_Tuple(MemPool* pool,Tuple* tuple,uint8_t** byte_buffer_ptr,bool skip)
+    bool Write_Tuple(MemPool* pool,Tuple* tuple,uint8_t** byte_buffer_ptr)
     {
         uint8_t* key_start_ptr;
         int key_len;
         uint8_t* value_start_ptr;
         int value_len;
         Parse_Key_Value(byte_buffer_ptr,&key_start_ptr,&key_len,&value_start_ptr,&value_len);
-        if(skip)
-            return true;
-
         bool result = true;
         result &=key_deserializer_.Write_Tuple(pool, tuple, key_start_ptr,key_len);
         result &= value_deserializer_.Write_Tuple(pool,tuple,value_start_ptr,value_len);
@@ -548,8 +545,14 @@ Status HdfsHFileScanner::ProcessSplit(ScannerContext* context)
 
         trailer_ = state_->obj_pool()->Add(new hfile::FixedFileTrailer());
 
-        RETURN_IF_ERROR(ProcessTrailer());
+        bool eosr = false;
+        RETURN_IF_ERROR(ProcessTrailer(&eosr));
 
+        if(eosr)
+        {
+            only_parsing_trailer_ = false;
+            return Status::OK;
+        }
         scan_node_->SetFileMetadata(stream_->filename(), trailer_);
 
         //release scanner thread after done its work.
@@ -572,7 +575,7 @@ Status HdfsHFileScanner::ProcessSplit(ScannerContext* context)
 }
 
 
-Status HdfsHFileScanner::ProcessTrailer()
+Status HdfsHFileScanner::ProcessTrailer(bool* eosr)
 {
 
     uint8_t* buffer;
@@ -590,15 +593,38 @@ Status HdfsHFileScanner::ProcessTrailer()
 
     RETURN_IF_ERROR(hfile::FixedFileTrailer::SetDataFromBuffer(buffer, len, *trailer_));
 
-    return Status::OK;
+    if(scan_node_->materialized_slots().empty())
+    {
+        //no materialized columns. We can server this query from just the metadata.
+        //We don't need to read the column data.
 
+        int64_t num_tuples = trailer_->entry_count_;
+        COUNTER_UPDATE(scan_node_->rows_read_counter(), num_tuples);
+
+        MemPool* pool;
+        Tuple* tuple;
+        TupleRow* current_row;
+        while(num_tuples > 0)
+        {
+            int max_tuples = context_->GetMemory(&pool, &tuple,&current_row);
+            max_tuples = min(static_cast<int64_t>(max_tuples), num_tuples);
+            num_tuples -= max_tuples;
+
+            int num_to_commit = WriteEmptyTuples(context_, current_row,
+                                                 max_tuples);
+            if (num_to_commit > 0)
+                context_->CommitRows(num_to_commit);
+        }
+        *eosr = true;
+    }
+    return Status::OK;
 }
 
 
 
 Status HdfsHFileScanner::ProcessSplitInternal()
 {
-    bool skip = scan_node_ ->materialized_slots().size() ==0;
+    DCHECK(scan_node_ ->materialized_slots().size()!=0);
     while(!scan_node_->ReachedLimit() && !context_->cancelled())
     {
         MemPool* pool;
@@ -607,46 +633,25 @@ Status HdfsHFileScanner::ProcessSplitInternal()
         int num_rows = context_->GetMemory(&pool, &tuple, &row);
         int num_to_commit = 0;
 
-
-        if(num_rows > 0 && !skip)
+        for(int i = 0; i < num_rows; i++)
         {
-            for(int i = 0; i < num_rows; i++)
+            InitTuple(context_->template_tuple(), tuple);
+            if(!WriteTuple(pool, tuple))
             {
-                InitTuple(context_->template_tuple(), tuple);
-                if(!WriteTuple(pool, tuple,false))
-                {
-                    context_->CommitRows(num_to_commit);
+                context_->CommitRows(num_to_commit);
 
-                    return parse_status_;
-                }
-                row->SetTuple(scan_node_->tuple_idx(), tuple);
-                if(ExecNode::EvalConjuncts(conjuncts_, num_conjuncts_, row))
-                {
-                    row = context_->next_row(row);
-                    tuple = context_->next_tuple(tuple);
-                    ++num_to_commit;
-                }
+                return parse_status_;
             }
-        }
-        else
-        {
-            for(int i = 0; i < num_rows; i++)
+            row->SetTuple(scan_node_->tuple_idx(), tuple);
+            if(ExecNode::EvalConjuncts(conjuncts_, num_conjuncts_, row))
             {
-                if(!WriteTuple(pool, tuple,true))
-                {
-                    num_to_commit =  WriteEmptyTuples(context_, row, num_to_commit);
-                    if(num_to_commit > 0)
-                        context_->CommitRows(num_to_commit);
-                    return parse_status_;
-                }
-                num_to_commit++;
+                row = context_->next_row(row);
+                tuple = context_->next_tuple(tuple);
+                ++num_to_commit;
             }
-            // for count(*), there is no materialized fields.
-            num_to_commit =  WriteEmptyTuples(context_, row, num_to_commit);
         }
         if(num_to_commit > 0)
             context_->CommitRows(num_to_commit);
-
     }
 
     if(context_->cancelled())
@@ -676,7 +681,7 @@ Status HdfsHFileScanner::Prepare()
     return Status::OK;
 }
 
-bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple,bool skip)
+bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple)
 {
 
     if(byte_buffer_ptr_ == byte_buffer_end_)
@@ -687,7 +692,7 @@ bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple,bool skip)
     }
 
     //de-serialize a record beforehand to get num. of columns constituting key and value ,respectively.
-    if(UNLIKELY(num_key_cols_ == -1 && !skip))
+    if(UNLIKELY(num_key_cols_ == -1))
     {
         const  std::vector<SlotDescriptor*>& materailized_slots = scan_node_->materialized_slots();
         std::vector<PrimitiveType> key_types;
@@ -727,7 +732,7 @@ bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple,bool skip)
         kv_parser_->Set_Value_State(value_types,value_slot_desc,stream_->compact_data());
     }
 
-    bool ret = kv_parser_->Write_Tuple(pool,tuple,&byte_buffer_ptr_,skip);
+    bool ret = kv_parser_->Write_Tuple(pool,tuple,&byte_buffer_ptr_);
     return ret;
 
 }

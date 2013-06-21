@@ -88,10 +88,10 @@ private:
     }
 
 
-    Status ProcessTrailer();
+    Status ProcessTrailer(bool* eosr);
     Status ReadDataBlock();
     Status IssueFileRanges(const char* filename);
-    bool WriteTuple(MemPool* pool, Tuple* tuple,bool skip);
+    bool WriteTuple(MemPool* pool, Tuple* tuple);
     Status ProcessSplitInternal();
 
 
