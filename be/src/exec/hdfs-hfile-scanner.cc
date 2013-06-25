@@ -677,7 +677,9 @@ Status HdfsHFileScanner::Prepare()
     const HdfsTableDescriptor* hdfs_table = static_cast<const HdfsTableDescriptor*>(tuple_desc->table_desc());
     col_types_ = hdfs_table->col_types();
     num_clustering_cols_ = hdfs_table->num_clustering_cols();
-    scan_node_->IncNumScannersCodegenDisabled();
+//    scan_node_->IncNumScannersCodegenDisabled();
+    decompress_timer_ = ADD_TIMER(scan_node_->runtime_profile(), "DecompressionTime");
+   
     return Status::OK;
 }
 
@@ -715,7 +717,7 @@ bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple)
             }
         }
 
-        for(int i = num_clustering_cols_+num_key_cols_; i< (col_types_).size(); i++)
+        for(int i = num_clustering_cols_+num_key_cols_; i< col_types_.size(); i++)
         {
             value_types.push_back((col_types_)[i]);
             int index_slot = scan_node_->GetMaterializedSlotIdx(i);
@@ -800,6 +802,7 @@ Status HdfsHFileScanner::ReadDataBlock()
         }
         else if(trailer_->compression_codec_ == 3) //snappy compression.
         {
+	      SCOPED_TIMER(decompress_timer_);
             if(block_buffer_len_ < block_header_.uncompressed_size_without_header_)
             {
                 block_buffer_len_ = block_header_.uncompressed_size_without_header_;

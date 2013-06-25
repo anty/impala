@@ -116,6 +116,10 @@ private:
     hfile::FixedFileTrailer* trailer_;
     bool only_parsing_trailer_;
 
+    // Time spent decompressing bytes
+    RuntimeProfile::Counter* decompress_timer_;
+
+
 };
 
 } //namespace impala
