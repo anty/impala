@@ -23,7 +23,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import com.google.common.base.Strings;
 import com.hugetable.common.HorizonConstants;
+import com.hugetable.common.TableIndexInfo;
 import com.hugetable.hive.io.HFileLayerInputFormat;
 import com.hugetable.hive.io.HugetableInputFormatProxy;
 import org.apache.commons.codec.binary.Base64;
@@ -737,6 +739,20 @@ List<org.apache.hadoop.hive.metastore.api.Partition> msPartitions,
                 {
                     fileDescriptors.add(new FileDescriptor(status.getPath().toString(), status.getLen()));
                 }
+	         //populate row key columns
+                String indexStr = parameters.get(HorizonConstants.HIVE_TABLE_INDEX_INFO_CONF_KEY);
+                if(!Strings.isNullOrEmpty(indexStr))
+                {
+                    TableIndexInfo indexInfo = new TableIndexInfo(indexStr);
+			//to work around discrepancy between  table columns and index columns 
+			//columns names are lowercase in hive, however index columns may be upercase.
+                    for(String col : indexInfo.getPrimaryIndexColumns())
+                    {
+                        keyColNames.add(col.trim().toLowerCase());
+                    }
+                }
+
+				
             }
 
 
@@ -816,6 +832,9 @@ List<org.apache.hadoop.hive.metastore.api.Partition> msPartitions,
     }
     THdfsTable tHdfsTable = new THdfsTable(hdfsBaseDir,
         colNames, nullPartitionKeyValue, idToValue,colTypes);
+    if(!keyColNames.isEmpty()){
+        tHdfsTable.setKeyColNames(keyColNames);
+    }
 
     TTableDescriptor.setHdfsTable(tHdfsTable);
     return TTableDescriptor;

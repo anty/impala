@@ -566,6 +566,7 @@ Status HdfsHFileScanner::ProcessSplit(ScannerContext* context)
     only_parsing_trailer_ = false;
 
     kv_parser_.reset(new KeyValue());
+    InitKeyValue();
     RETURN_IF_ERROR(Codec::CreateDecompressor(state_,
                     decompressed_data_pool_.get(), stream_->compact_data(),
                     Codec::SNAPPY_COMPRESSION, &decompressor_));
@@ -574,7 +575,54 @@ Status HdfsHFileScanner::ProcessSplit(ScannerContext* context)
     return Status::OK;
 }
 
+void HdfsHFileScanner ::InitKeyValue()
+{
+    const  std::vector<SlotDescriptor*>& materailized_slots = scan_node_->materialized_slots();
 
+    std::vector<PrimitiveType> key_types;
+    std::vector<SlotDescriptor*> key_slot_desc;
+    key_types.resize(key_col_names_.size());
+    key_slot_desc.resize(key_col_names_.size());
+
+    std::vector<PrimitiveType> value_types;
+    std::vector<SlotDescriptor*> value_slot_desc;
+
+    for(int i = num_clustering_cols_; i< col_types_.size(); i++)
+    {
+        string col_name=col_names_[i];
+        int index_slot = scan_node_->GetMaterializedSlotIdx(i);
+        int index_key_col = 0;
+        for(; index_key_col < key_col_names_.size(); ++index_key_col)
+        {
+            if(key_col_names_[index_key_col].compare(col_name) ==0)
+                break;
+        }
+        //this is a  column comprise row key part
+        if(index_key_col < key_col_names_.size())
+        {
+            key_types[index_key_col] = col_types_[i];
+            if(index_slot != HdfsScanNode::SKIP_COLUMN)
+            {
+                key_slot_desc[index_key_col] = materailized_slots[index_slot];
+            }
+        }
+        else
+        {
+            value_types.push_back(col_types_[i]);
+            if(index_slot != HdfsScanNode::SKIP_COLUMN)
+            {
+                value_slot_desc.push_back(materailized_slots[index_slot]);
+            }
+            else
+            {
+                value_slot_desc.push_back(NULL);
+            }
+        }
+    }
+    kv_parser_->Set_Key_State(key_types,key_slot_desc,stream_->compact_data());
+    kv_parser_->Set_Value_State(value_types,value_slot_desc,stream_->compact_data());
+
+}
 Status HdfsHFileScanner::ProcessTrailer(bool* eosr)
 {
 
@@ -676,67 +724,25 @@ Status HdfsHFileScanner::Prepare()
     const TupleDescriptor* tuple_desc = scan_node_->tuple_desc();
     const HdfsTableDescriptor* hdfs_table = static_cast<const HdfsTableDescriptor*>(tuple_desc->table_desc());
     col_types_ = hdfs_table->col_types();
+    col_names_ = hdfs_table->col_names();
+    key_col_names_ = hdfs_table->key_col_names();
     num_clustering_cols_ = hdfs_table->num_clustering_cols();
 //    scan_node_->IncNumScannersCodegenDisabled();
     decompress_timer_ = ADD_TIMER(scan_node_->runtime_profile(), "DecompressionTime");
-   
+
     return Status::OK;
 }
 
 bool HdfsHFileScanner::WriteTuple(MemPool * pool, Tuple * tuple)
 {
-
     if(byte_buffer_ptr_ == byte_buffer_end_)
     {
         parse_status_= ReadDataBlock();
         if(byte_buffer_ptr_ == byte_buffer_end_)
             return false;
     }
-
-    //de-serialize a record beforehand to get num. of columns constituting key and value ,respectively.
-    if(UNLIKELY(num_key_cols_ == -1))
-    {
-        const  std::vector<SlotDescriptor*>& materailized_slots = scan_node_->materialized_slots();
-        std::vector<PrimitiveType> key_types;
-        std::vector<SlotDescriptor*> key_slot_desc;
-        std::vector<PrimitiveType> value_types;
-        std::vector<SlotDescriptor*> value_slot_desc;
-
-        num_key_cols_ = kv_parser_->Get_Key_Col_Num(byte_buffer_ptr_,&col_types_[num_clustering_cols_]);
-        for(int i = num_clustering_cols_; i < (num_clustering_cols_+num_key_cols_); i++)
-        {
-            key_types.push_back(col_types_[i]);
-            int index_slot = scan_node_->GetMaterializedSlotIdx(i);
-            if(index_slot != HdfsScanNode::SKIP_COLUMN)
-            {
-                key_slot_desc.push_back(materailized_slots[index_slot]);
-            }
-            else
-            {
-                key_slot_desc.push_back(NULL);
-            }
-        }
-
-        for(int i = num_clustering_cols_+num_key_cols_; i< col_types_.size(); i++)
-        {
-            value_types.push_back((col_types_)[i]);
-            int index_slot = scan_node_->GetMaterializedSlotIdx(i);
-            if(index_slot != HdfsScanNode::SKIP_COLUMN)
-            {
-                value_slot_desc.push_back(materailized_slots[index_slot]);
-            }
-            else
-            {
-                value_slot_desc.push_back(NULL);
-            }
-        }
-        kv_parser_->Set_Key_State(key_types,key_slot_desc,stream_->compact_data());
-        kv_parser_->Set_Value_State(value_types,value_slot_desc,stream_->compact_data());
-    }
-
     bool ret = kv_parser_->Write_Tuple(pool,tuple,&byte_buffer_ptr_);
     return ret;
-
 }
 
 
@@ -802,7 +808,7 @@ Status HdfsHFileScanner::ReadDataBlock()
         }
         else if(trailer_->compression_codec_ == 3) //snappy compression.
         {
-	      SCOPED_TIMER(decompress_timer_);
+            SCOPED_TIMER(decompress_timer_);
             if(block_buffer_len_ < block_header_.uncompressed_size_without_header_)
             {
                 block_buffer_len_ = block_header_.uncompressed_size_without_header_;

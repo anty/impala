@@ -93,7 +93,8 @@ private:
     Status IssueFileRanges(const char* filename);
     bool WriteTuple(MemPool* pool, Tuple* tuple);
     Status ProcessSplitInternal();
-
+    //do some initialization work for KeyValue de-serializer.
+    void InitKeyValue();
 
     boost::scoped_ptr<MemPool> decompressed_data_pool_;
     boost::scoped_ptr<Codec> decompressor_;
@@ -104,6 +105,9 @@ private:
     uint8_t* byte_buffer_ptr_;
     uint8_t* byte_buffer_end_;
 
+
+    std::vector<std::string> key_col_names_;
+    std::vector<std::string> col_names_;
     std::vector<PrimitiveType> col_types_;
     std::vector<PrimitiveType>  key_col_types_;
     std::vector<PrimitiveType>  value_col_types_;

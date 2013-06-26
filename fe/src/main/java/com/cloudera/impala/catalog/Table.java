@@ -62,7 +62,8 @@ public abstract class Table {
   protected final List<TPrimitiveType> colTypes;
   /**  map from lowercase col. name to Column */
   protected final Map<String, Column> colsByName;
-
+  protected final List<String> keyColNames;
+  
   protected Table(TableId id, org.apache.hadoop.hive.metastore.api.Table msTable, Db db,
       String name, String owner) {
     this.id = id;
@@ -73,6 +74,7 @@ public abstract class Table {
     this.colsByPos = Lists.newArrayList();
     this.colsByName = Maps.newHashMap();
     this.colTypes = Lists.newArrayList();
+    this.keyColNames = Lists.newArrayList();
   }
 
   public TableId getId() {

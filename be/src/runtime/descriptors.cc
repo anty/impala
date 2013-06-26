@@ -129,6 +129,7 @@ HdfsTableDescriptor::HdfsTableDescriptor(const TTableDescriptor& tdesc,
   : TableDescriptor(tdesc),
     hdfs_base_dir_(tdesc.hdfsTable.hdfsBaseDir),
     col_names_(tdesc.hdfsTable.colNames),
+    key_col_names_(tdesc.hdfsTable.keyColNames),
     null_partition_key_value_(tdesc.hdfsTable.nullPartitionKeyValue),
     object_pool_(pool) {
   map<int64_t, THdfsPartition>::const_iterator it;
