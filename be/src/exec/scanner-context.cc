@@ -51,8 +51,8 @@ ScannerContext::~ScannerContext() {
 }
 
 void ScannerContext::NewRowBatch() {
-  current_row_batch_ = new RowBatch(scan_node_->row_desc(), state_->batch_size());
-  current_row_batch_->tuple_data_pool()->set_limits(*state_->mem_limits());
+  current_row_batch_ = new RowBatch(
+      scan_node_->row_desc(), state_->batch_size(), *state_->mem_limits());
   tuple_mem_ = current_row_batch_->tuple_data_pool()->Allocate(
       state_->batch_size() * tuple_byte_size_);
 }
@@ -86,13 +86,13 @@ void ScannerContext::AddFinalBatch() {
 
 ScannerContext::Stream::Stream(ScannerContext* parent) 
   : parent_(parent), is_blocked_(false), total_len_(0), 
-    boundary_pool_(new MemPool()),
+    boundary_pool_(new MemPool(parent->state_->mem_limits())),
     boundary_buffer_(new StringBuffer(boundary_pool_.get())) {
-  boundary_pool_->set_limits(*parent_->state_->mem_limits());
 }
 
 void ScannerContext::Stream::SetInitialBuffer(DiskIoMgr::BufferDescriptor* buffer) {
   scan_range_ = buffer->scan_range();
+  file_desc_ = parent_->scan_node_->GetFileDesc(filename());
   scan_range_start_ = scan_range_->offset();
   total_bytes_returned_ = 0;
   current_buffer_pos_ = NULL;
@@ -158,6 +158,7 @@ void ScannerContext::Stream::RemoveFirstBuffer() {
   DCHECK(!is_blocked_);
   DCHECK(current_buffer_ != NULL);
   DCHECK(!buffers_.empty());
+  read_eosr_ = current_buffer_->eosr();
   parent_->scan_node_->UpdateNumQueuedBuffers(-1);
   buffers_.pop_front();
 
@@ -259,7 +260,6 @@ Status ScannerContext::Stream::GetBytesInternal(int requested_len,
     // Not enough bytes, copy the end of this buffer and combine it wit the next one
     if (requested_len > current_buffer_bytes_left_) {
       if (current_buffer_ != NULL) {
-        read_eosr_ = current_buffer_->eosr();
         boundary_buffer_->Append(current_buffer_pos_, current_buffer_bytes_left_);
         *out_len += current_buffer_bytes_left_;
         requested_len -= current_buffer_bytes_left_;
@@ -440,4 +440,8 @@ void ScannerContext::Cancel() {
   for (int i = 0; i < streams_.size(); ++i) {
     streams_[i]->read_ready_cv_.notify_one();
   }
+}
+
+bool ScannerContext::Stream::eof() {
+  return file_offset() == file_desc_->file_length;
 }

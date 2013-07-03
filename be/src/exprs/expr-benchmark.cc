@@ -19,8 +19,6 @@
 #include "gen-cpp/ImpalaService.h"
 #include "gen-cpp/ImpalaService_types.h"
 #include "gen-cpp/ImpalaInternalService.h"
-#include "gen-cpp/ImpalaPlanService.h"
-#include "gen-cpp/ImpalaPlanService_types.h"
 #include "gen-cpp/Frontend_types.h"
 #include "gen-cpp/ImpalaService.h"
 #include "gen-cpp/ImpalaInternalService.h"
@@ -61,11 +59,13 @@ class Planner {
     request.queryOptions = query_options_;
 
     JNIEnv* jni_env = getJNIEnv();
+    JniLocalFrame jni_frame;
+    RETURN_IF_ERROR(jni_frame.push(jni_env));
     jbyteArray request_bytes;
     RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &request, &request_bytes));
     jbyteArray result_bytes = static_cast<jbyteArray>(
         jni_env->CallObjectMethod(fe_, create_exec_request_id_, request_bytes));
-    RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
+    RETURN_ERROR_IF_EXC(jni_env);
     RETURN_IF_ERROR(DeserializeThriftMsg(jni_env, result_bytes, result));
     return Status::OK;
   }
@@ -87,7 +87,7 @@ struct TestData {
 Planner planner;
 ObjectPool pool;
 
-// Utility function to get prepare select list for exprs.  Assumes this is a 
+// Utility function to get prepare select list for exprs.  Assumes this is a
 // constant query
 static Status PrepareSelectList(const TExecRequest& request, vector<Expr*>* exprs) {
   const TQueryExecRequest& query_request = request.query_exec_request;
@@ -152,15 +152,16 @@ Benchmark* BenchmarkArithmetic() {
   return suite;
 }
 
+// Machine Info: Intel(R) Core(TM) i7-2600 CPU @ 3.40GHz
 // Like:                 Function                Rate          Comparison
 // ----------------------------------------------------------------------
-//                         equals               206.8                  1X
-//                     not equals               440.6              2.131X
-//                         strstr               141.8             0.6857X
-//                       strncmp1               300.3              1.452X
-//                       strncmp2               300.4              1.453X
-//                       strncmp3               862.7              3.803X
-//                          regex               6.027            0.02915X
+//                         equals               203.9                  1X
+//                     not equals               426.4              2.091X
+//                         strstr               142.8             0.7001X
+//                       strncmp1               269.7              1.323X
+//                       strncmp2               294.1              1.442X
+//                       strncmp3               775.7              3.804X
+//                          regex                19.7             0.0966X
 Benchmark* BenchmarkLike() {
   Benchmark* suite = new Benchmark("Like");
   BENCHMARK("equals", "'abcdefghijklmnopqrstuvwxyz' = 'abcdefghijklmnopqrstuvwxyz'");
@@ -249,32 +250,32 @@ Benchmark* BenchmarkConditionalFunctions() {
 
 // StringFunctions:      Function                Rate          Comparison
 // ----------------------------------------------------------------------
-//                         length               823.5                  1X
-//                     substring1               25.75            0.03127X
-//                     substring2               26.21            0.03183X
-//                           left               455.1             0.5527X
-//                          right               455.4              0.553X
-//                          lower               93.85              0.114X
-//                          upper               93.85              0.114X
-//                        reverse               291.4             0.3538X
-//                           trim               377.3             0.4582X
-//                          ltrim               471.9              0.573X
-//                          rtrim               507.5             0.6162X
-//                          space               52.18            0.06337X
-//                          ascii               937.5              1.138X
-//                          instr                 157             0.1907X
-//                         locate               169.1             0.2053X
-//                        locate2               150.3             0.1825X
-//                         concat               97.98              0.119X
-//                        concat2               67.86            0.08241X
-//                       concatws                 131             0.1591X
-//                      concatws2               64.59            0.07843X
-//                         repeat                88.2             0.1071X
-//                           lpad               133.2             0.1618X
-//                           rpad                 131              0.159X
-//                    find_in_set               117.1             0.1422X
-//                 regexp_extract               5.189           0.006299X
-//                 regexp_replace              0.5945          0.0007217X
+//                         length               920.2                  1X
+//                     substring1               351.4             0.3819X
+//                     substring2               327.9             0.3563X
+//                           left               508.6             0.5527X
+//                          right               508.2             0.5522X
+//                          lower               103.9             0.1129X
+//                          upper               103.2             0.1121X
+//                        reverse               324.9             0.3531X
+//                           trim               421.2             0.4578X
+//                          ltrim               526.6             0.5723X
+//                          rtrim               566.5             0.6156X
+//                          space               94.63             0.1028X
+//                          ascii                1048              1.139X
+//                          instr               175.6             0.1909X
+//                         locate               184.7             0.2007X
+//                        locate2               175.8             0.1911X
+//                         concat               109.5              0.119X
+//                        concat2               75.83            0.08241X
+//                       concatws               143.4             0.1559X
+//                      concatws2               70.38            0.07649X
+//                         repeat               98.54             0.1071X
+//                           lpad               154.7             0.1681X
+//                           rpad               145.6             0.1582X
+//                    find_in_set               83.38            0.09061X
+//                 regexp_extract                6.42           0.006977X
+//                 regexp_replace              0.7435           0.000808X
 Benchmark* BenchmarkStringFunctions() {
   Benchmark* suite = new Benchmark("StringFunctions");
   BENCHMARK("length", "length('Hello World!')");
@@ -440,7 +441,7 @@ Benchmark* BenchmarkMathFunctions() {
 Benchmark* BenchmarkTimestampFunctions() {
   Benchmark* suite = new Benchmark("TimestampFunctions");
   BENCHMARK("literal", "cast('2012-01-01 09:10:11.123456789' as timestamp)");
-  BENCHMARK("to_string", 
+  BENCHMARK("to_string",
       "cast(cast('2012-01-01 09:10:11.123456789' as timestamp) as string)");
   BENCHMARK("add_year", "date_add(cast('2012-01-01 09:10:11.123456789' "
       "as timestamp), interval 10 years)");
@@ -464,9 +465,9 @@ Benchmark* BenchmarkTimestampFunctions() {
       "as timestamp), interval 1033 microseconds)");
   BENCHMARK("add_nano", "date_add(cast('2012-01-01 00:00:00.000000001' "
       "as timestamp), interval 1033 nanoseconds)");
-  BENCHMARK("unix_timestamp1", 
+  BENCHMARK("unix_timestamp1",
       "unix_timestamp('1970-01-01 00:00:00', 'yyyy-MM-dd HH:mm:ss')");
-  BENCHMARK("unix_timestamp2", 
+  BENCHMARK("unix_timestamp2",
       "unix_timestamp('1970-10-01', 'yyyy-MM-dd')");
   BENCHMARK("from_unix1", "from_unixtime(0, 'yyyy-MM-dd HH:mm:ss')");
   BENCHMARK("from_unix2", "from_unixtime(0, 'yyyy-MM-dd')");
@@ -478,15 +479,15 @@ Benchmark* BenchmarkTimestampFunctions() {
   BENCHMARK("hour", "hour(cast('09:10:11.000000' as timestamp))");
   BENCHMARK("minute", "minute(cast('09:10:11.000000' as timestamp))");
   BENCHMARK("second", "second(cast('09:10:11.000000' as timestamp))");
-  BENCHMARK("to date", 
+  BENCHMARK("to date",
       "to_date(cast('2011-12-22 09:10:11.12345678' as timestamp))");
   BENCHMARK("date diff", "datediff(cast('2011-12-22 09:10:11.12345678' as timestamp), "
       "cast('2012-12-22' as timestamp))");
 #if 0
   // TODO: need to create a valid runtime state for these functions
-  BENCHMARK("from utc", 
+  BENCHMARK("from utc",
       "from_utc_timestamp(cast(1.3041352164485E9 as timestamp), 'PST')");
-  BENCHMARK("to utc", 
+  BENCHMARK("to utc",
       "to_utc_timestamp(cast('2011-01-01 01:01:01' as timestamp), 'PST')");
   BENCHMARK("now", "now()");
   BENCHMARK("unix_timestamp", "unix_timestamp()");

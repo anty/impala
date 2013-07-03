@@ -19,6 +19,7 @@ import com.cloudera.impala.catalog.RowFormat;
 import com.cloudera.impala.catalog.PrimitiveType;
 import com.cloudera.impala.analysis.UnionStmt.UnionOperand;
 import com.cloudera.impala.analysis.UnionStmt.Qualifier;
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 import java_cup.runtime.Symbol;
@@ -178,14 +179,14 @@ terminal KW_ADD, KW_AND, KW_ALL, KW_ALTER, KW_AS, KW_ASC, KW_AVG, KW_BETWEEN, KW
   KW_SEMI, KW_SMALLINT, KW_STORED, KW_STRING, KW_SUM, KW_TABLES, KW_TERMINATED,
   KW_TINYINT, KW_TO, KW_TRUE, KW_UNION, KW_USE, KW_USING, KW_WHEN, KW_WHERE, KW_TEXTFILE,
   KW_THEN, KW_TIMESTAMP, KW_INSERT, KW_INTO, KW_OVERWRITE, KW_TABLE, KW_PARTITION,
-  KW_INTERVAL;
+  KW_INTERVAL, KW_VALUES, KW_EXPLAIN;
 
 terminal COMMA, DOT, STAR, LPAREN, RPAREN, LBRACKET, RBRACKET, DIVIDE, MOD, ADD, SUBTRACT;
 terminal BITAND, BITOR, BITXOR, BITNOT;
 terminal EQUAL, NOT, LESSTHAN, GREATERTHAN;
 terminal String IDENT;
 terminal String NUMERIC_OVERFLOW;
-terminal Long INTEGER_LITERAL;
+terminal BigInteger INTEGER_LITERAL;
 terminal Double FLOATINGPOINT_LITERAL;
 terminal String STRING_LITERAL;
 terminal String UNMATCHED_STRING_LITERAL;
@@ -193,12 +194,16 @@ terminal String UNMATCHED_STRING_LITERAL;
 nonterminal ParseNodeBase stmt;
 // Single select statement.
 nonterminal SelectStmt select_stmt;
+// Single values statement.
+nonterminal ValuesStmt values_stmt;
 // Select or union statement.
 nonterminal QueryStmt query_stmt;
 // Single select_stmt or parenthesized query_stmt.
 nonterminal QueryStmt union_operand;
 // List of select or union blocks connected by UNION operators or a single select block.
 nonterminal List<UnionOperand> union_operand_list;
+// List of union operands consisting of constant selects.
+nonterminal List<UnionOperand> values_operand_list;
 // USE stmt
 nonterminal UseStmt use_stmt;
 nonterminal ShowTablesStmt show_tables_stmt;
@@ -242,6 +247,7 @@ nonterminal ArrayList<String> opt_join_hints;
 nonterminal PrimitiveType primitive_type;
 nonterminal Expr sign_chain_expr;
 nonterminal InsertStmt insert_stmt;
+nonterminal ParseNodeBase explain_stmt;
 nonterminal ArrayList<PartitionKeyValue> partition_spec;
 nonterminal ArrayList<PartitionKeyValue> partition_clause;
 nonterminal ArrayList<PartitionKeyValue> static_partition_key_value_list;
@@ -322,6 +328,21 @@ stmt ::=
   {: RESULT = drop_db; :}
   | drop_tbl_stmt:drop_tbl
   {: RESULT = drop_tbl; :}
+  | explain_stmt: explain
+  {: RESULT = explain; :}
+  ;
+
+explain_stmt ::=
+  KW_EXPLAIN query_stmt:query
+  {: 
+     query.setIsExplain(true);
+     RESULT = query;
+  :}
+  | KW_EXPLAIN insert_stmt:insert
+  {: 
+     insert.setIsExplain(true);
+     RESULT = insert;
+  :}
   ;
 
 insert_stmt ::=
@@ -679,13 +700,11 @@ union_with_order_by_or_limit ::=
 
 union_operand ::=
   select_stmt:select
-  {:
-    RESULT = select;
-  :}
+  {: RESULT = select; :}
+  | values_stmt:values
+  {: RESULT = values; :}
   | LPAREN query_stmt:query RPAREN
-  {:
-    RESULT = query;
-  :}
+  {: RESULT = query; :}
   ;
 
 union_operand_list ::=
@@ -709,6 +728,39 @@ union_op ::=
   {: RESULT = Qualifier.DISTINCT; :}
   | KW_UNION KW_ALL
   {: RESULT = Qualifier.ALL; :}
+  ;
+
+values_stmt ::=
+  KW_VALUES values_operand_list:operands
+  order_by_clause:orderByClause
+  limit_clause:limitClause
+  {:
+    RESULT = new ValuesStmt(operands, orderByClause,
+                            (limitClause == null ? -1 : limitClause.longValue()));
+  :}
+  | KW_VALUES LPAREN values_operand_list:operands RPAREN
+    order_by_clause:orderByClause
+    limit_clause:limitClause
+  {:
+    RESULT = new ValuesStmt(operands, orderByClause,
+                            (limitClause == null ? -1 : limitClause.longValue()));
+  :}
+  ;
+
+values_operand_list ::=
+  LPAREN select_list:selectList RPAREN
+  {:
+    List<UnionOperand> operands = new ArrayList<UnionOperand>();
+    operands.add(new UnionOperand(
+        new SelectStmt(selectList, null, null, null, null, null, -1), null));
+    RESULT = operands;
+  :}
+  | values_operand_list:operands COMMA LPAREN select_list:selectList RPAREN
+  {:
+    operands.add(new UnionOperand(
+        new SelectStmt(selectList, null, null, null, null, null, -1), Qualifier.ALL));
+    RESULT = operands;
+  :}
   ;
 
 use_stmt ::=
@@ -1047,11 +1099,15 @@ sign_chain_expr ::=
   SUBTRACT expr:e
   {:
     // integrate signs into literals
-    if (e.isLiteral() && e.getType().isNumericType()) {
+    // integer literals require analysis to set their type, so the instance check below
+    // is not equivalent to e.getType().isNumericType()
+    if (e.isLiteral() &&
+       (e instanceof IntLiteral || e instanceof FloatLiteral)) {
       ((LiteralExpr)e).swapSign();
       RESULT = e;
     } else {
-      RESULT = new ArithmeticExpr(ArithmeticExpr.Operator.MULTIPLY, new IntLiteral((long)-1), e);
+      RESULT = new ArithmeticExpr(ArithmeticExpr.Operator.MULTIPLY,
+                                  new IntLiteral(BigInteger.valueOf(-1)), e);
     }
   :}
   | ADD expr:e

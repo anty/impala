@@ -65,7 +65,8 @@ Status HdfsSequenceScanner::InitNewRange() {
 
   HdfsPartitionDescriptor* hdfs_partition = context_->partition_descriptor();
   
-  text_converter_.reset(new TextConverter(hdfs_partition->escape_char()));
+  text_converter_.reset(new TextConverter(hdfs_partition->escape_char(),
+      scan_node_->hdfs_table()->null_column_value()));
   
   delimited_text_parser_.reset(new DelimitedTextParser(scan_node_, '\0',
       hdfs_partition->field_delim(), hdfs_partition->collection_delim(),
@@ -448,7 +449,7 @@ Status HdfsSequenceScanner::ReadFileHeader() {
   RETURN_IF_FALSE(stream_->ReadBytes(SYNC_HASH_SIZE, &sync, &parse_status_));
   memcpy(header_->sync, sync, SYNC_HASH_SIZE);
 
-  if (header_->is_compressed && !seq_header->is_row_compressed) {
+  if (header_->is_compressed && !seq_header->is_row_compressed && !stream_->eof()) {
     // With block compression, record blocks have a leading -1 marker and sync
     // (i.e., we just read the sync in the file header, but there is another
     // sync immediately following it which is the beginning of the first

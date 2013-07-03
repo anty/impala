@@ -24,9 +24,10 @@ add_library(Service
   impala-server.cc
   impala-hs2-server.cc
   impala-beeswax-server.cc
+  query-exec-state.cc
 )
 
-# this shared library provides Impala executor functionality to FE test and planservice
+# this shared library provides Impala executor functionality to FE test
 add_library(fesupport SHARED
   fe-support.cc
 )

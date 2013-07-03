@@ -43,16 +43,16 @@ class DecompressorTest : public ::testing::Test{
   void RunTest(THdfsCompression::type format) {
     scoped_ptr<Codec> compressor;
     scoped_ptr<Codec> decompressor;
-    MemPool* mem_pool = new MemPool;
+    MemPool mem_pool(NULL);
 
     EXPECT_TRUE(
-        Codec::CreateCompressor(NULL, mem_pool, true, format, &compressor).ok());
+        Codec::CreateCompressor(NULL, &mem_pool, true, format, &compressor).ok());
     EXPECT_TRUE(
-        Codec::CreateDecompressor(NULL, mem_pool, true, format, &decompressor).ok());
+        Codec::CreateDecompressor(NULL, &mem_pool, true, format, &decompressor).ok());
 
     uint8_t* compressed;
     int compressed_length = 0;
-    EXPECT_TRUE(compressor->ProcessBlock(sizeof (input_),
+    EXPECT_TRUE(compressor->ProcessBlock(sizeof(input_),
           input_, &compressed_length, &compressed).ok());
     uint8_t* output;
     int out_len = 0;
@@ -60,15 +60,15 @@ class DecompressorTest : public ::testing::Test{
         decompressor->ProcessBlock(compressed_length,
             compressed, &out_len, &output).ok());
 
-    EXPECT_TRUE(memcmp(&input_, output, sizeof (input_)) == 0);
+    EXPECT_TRUE(memcmp(&input_, output, sizeof(input_)) == 0);
 
     // Try again specifying the output buffer and length.
     out_len = sizeof (input_);
-    output = mem_pool->Allocate(out_len);
+    output = mem_pool.Allocate(out_len);
     EXPECT_TRUE(decompressor->ProcessBlock(compressed_length,
           compressed, &out_len, &output).ok());
 
-    EXPECT_TRUE(memcmp(&input_, output, sizeof (input_)) == 0);
+    EXPECT_TRUE(memcmp(&input_, output, sizeof(input_)) == 0);
   }
 
   uint8_t input_[2 * 26 * 1024];

@@ -218,7 +218,7 @@ public class HBaseScanNode extends ScanNode {
     List<HRegionLocation> regionsLoc;
     try {
       hbaseTbl   = new HTable(hbaseConf, tbl.getHBaseTableName());
-      regionsLoc = getRegionsInRange(hbaseTbl, startKey, stopKey);
+      regionsLoc = HBaseTable.getRegionsInRange(hbaseTbl, startKey, stopKey);
     } catch (IOException e) {
       throw new RuntimeException(
           "couldn't retrieve HBase table (" + tbl.getHBaseTableName() + ") info:\n"
@@ -276,44 +276,12 @@ public class HBaseScanNode extends ScanNode {
   }
 
   /**
-   * Get the corresponding regions for an arbitrary range of keys.
-   * TODO: this function will be implemented inside HTable in Dave's patch.
-   *       use HTable's implementation when the patch published.
-   * <p>
-   * @param startRow Starting row in range, inclusive
-   * @param endRow Ending row in range, inclusive
-   * @return A list of HRegionLocations corresponding to the regions that
-   * contain the specified range
-   * @throws IOException if a remote or network exception occurs
-   */
-  private List<HRegionLocation> getRegionsInRange(HTable hbaseTbl,
-      final byte[] startKey, final byte[] endKey) throws IOException {
-    boolean endKeyIsEndOfTable =
-        Bytes.equals(endKey, HConstants.EMPTY_END_ROW);
-    if ((Bytes.compareTo(startKey, endKey) > 0) &&
-        (endKeyIsEndOfTable == false)) {
-      throw new IllegalArgumentException(
-        "Invalid range: " + Bytes.toStringBinary(startKey) +
-        " > " + Bytes.toStringBinary(endKey));
-    }
-    List<HRegionLocation> regionList = new ArrayList<HRegionLocation>();
-    byte [] currentKey = startKey;
-    do {
-      HRegionLocation regionLocation = hbaseTbl.getRegionLocation(currentKey);
-      regionList.add(regionLocation);
-      currentKey = regionLocation.getRegionInfo().getEndKey();
-    } while (!Bytes.equals(currentKey, HConstants.EMPTY_END_ROW) &&
-             (endKeyIsEndOfTable == true ||
-              Bytes.compareTo(currentKey, endKey) < 0));
-    return regionList;
-  }
-
-  /**
    * Set the start key of keyRange using the provided key, bounded by startKey
    * @param keyRange the keyRange to be updated
    * @param rangeStartKey the start key value to be set to
    */
   private void setKeyRangeStart(THBaseKeyRange keyRange, byte[] rangeStartKey) {
+    keyRange.unsetStartKey();
     // use the max(startKey, rangeStartKey) for scan start
     if (!Bytes.equals(rangeStartKey, HConstants.EMPTY_START_ROW) ||
         !Bytes.equals(startKey, HConstants.EMPTY_START_ROW)) {
@@ -329,6 +297,7 @@ public class HBaseScanNode extends ScanNode {
    * @param rangeEndKey the end key value to be set to
    */
   private void setKeyRangeEnd(THBaseKeyRange keyRange, byte[] rangeEndKey) {
+    keyRange.unsetStopKey();
     // use the min(stopkey, regionStopKey) for scan stop
     if (!Bytes.equals(rangeEndKey, HConstants.EMPTY_END_ROW) ||
         !Bytes.equals(stopKey, HConstants.EMPTY_END_ROW)) {

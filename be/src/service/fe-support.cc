@@ -41,7 +41,6 @@
 #include "util/thrift-server.h"
 #include "util/debug-util.h"
 #include "gen-cpp/Data_types.h"
-#include "gen-cpp/ImpalaPlanService_types.h"
 
 using namespace impala;
 using namespace std;
@@ -61,8 +60,10 @@ Java_com_cloudera_impala_service_FeSupport_NativeEvalConstExpr(
   DeserializeThriftMsg(env, thrift_query_globals_bytes, &query_globals);
   RuntimeState state(query_globals.now_string);
   jbyteArray result_bytes;
-
+  JniLocalFrame jni_frame;
   Expr* e;
+  THROW_IF_ERROR_RET(jni_frame.push(env), env, JniUtil::internal_exc_class(),
+                     result_bytes);
   THROW_IF_ERROR_RET(Expr::CreateExprTree(&obj_pool, thrift_predicate, &e), env,
                      JniUtil::internal_exc_class(), result_bytes);
   THROW_IF_ERROR_RET(Expr::Prepare(e, &state, RowDescriptor()), env,

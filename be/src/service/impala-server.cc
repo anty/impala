@@ -15,12 +15,13 @@
 #include "service/impala-server.h"
 
 #include <algorithm>
+#include <exception>
 #include <boost/algorithm/string/join.hpp>
+#include <boost/filesystem.hpp>
 #include <boost/date_time/posix_time/posix_time_types.hpp>
 #include <boost/unordered_set.hpp>
 #include <jni.h>
 #include <thrift/protocol/TDebugProtocol.h>
-#include <gtest/gtest.h>
 #include <boost/foreach.hpp>
 #include <boost/bind.hpp>
 #include <boost/algorithm/string.hpp>
@@ -45,6 +46,7 @@
 #include "runtime/hdfs-fs-cache.h"
 #include "runtime/exec-env.h"
 #include "runtime/timestamp-value.h"
+#include "service/query-exec-state.h"
 #include "statestore/simple-scheduler.h"
 #include "util/bit-util.h"
 #include "util/container-util.h"
@@ -65,13 +67,13 @@
 #include "gen-cpp/ImpalaService.h"
 #include "gen-cpp/ImpalaService_types.h"
 #include "gen-cpp/ImpalaInternalService.h"
-#include "gen-cpp/ImpalaPlanService.h"
-#include "gen-cpp/ImpalaPlanService_types.h"
 #include "gen-cpp/Frontend_types.h"
 
 using namespace std;
 using namespace boost;
 using namespace boost::algorithm;
+using namespace boost::filesystem;
+using namespace boost::uuids;
 using namespace apache::thrift;
 using namespace apache::thrift::protocol;
 using namespace apache::thrift::transport;
@@ -79,13 +81,13 @@ using namespace apache::thrift::server;
 using namespace apache::thrift::concurrency;
 using namespace apache::hive::service::cli::thrift;
 using namespace beeswax;
+using namespace boost::posix_time;
 
-DEFINE_bool(use_planservice, false, "Use external planservice if true");
-DECLARE_string(planservice_host);
-DECLARE_int32(planservice_port);
 DECLARE_int32(be_port);
 DECLARE_string(nn);
 DECLARE_int32(nn_port);
+DECLARE_bool(enable_process_lifetime_heap_profiling);
+DECLARE_string(heap_profile_dir);
 
 DEFINE_int32(beeswax_port, 21000, "port on which Beeswax client requests are served");
 DEFINE_int32(hs2_port, 21050, "port on which HiveServer2 client requests are served");
@@ -104,296 +106,24 @@ DEFINE_bool(log_query_to_file, true, "if true, logs completed query profiles to 
 // TODO: this logging should go into a per query log.
 DEFINE_int32(log_mem_usage_interval, 0, "If non-zero, impalad will output memory usage "
     "every log_mem_usage_interval'th fragment completion.");
-DEFINE_string(heap_profile_dir, "", "if non-empty, enable heap profiling and output "
-    " to specified directory.");
 
 DEFINE_bool(abort_on_config_error, true, "Abort Impala if there are improper configs.");
+
+DEFINE_string(profile_log_dir, "", "The directory in which profile log files are"
+    " written. If blank, defaults to <log_file_dir>/profiles");
+DEFINE_int32(max_profile_log_file_size, 5000, "The maximum size (in queries) of the "
+    "profile log file before a new one is created");
 
 namespace impala {
 
 ThreadManager* fe_tm;
 ThreadManager* be_tm;
 
-Status ImpalaServer::QueryExecState::Exec(TExecRequest* exec_request) {
-  exec_request_ = *exec_request;
-  profile_.set_name("Query (id=" + PrintId(exec_request->request_id) + ")");
-  query_id_ = exec_request->request_id;
-
-  if (exec_request->stmt_type == TStmtType::QUERY ||
-      exec_request->stmt_type == TStmtType::DML) {
-    DCHECK(exec_request_.__isset.query_exec_request);
-    TQueryExecRequest& query_exec_request = exec_request_.query_exec_request;
-
-    // we always need at least one plan fragment
-    DCHECK_GT(query_exec_request.fragments.size(), 0);
-
-    // If desc_tbl is not set, query has SELECT with no FROM. In that
-    // case, the query can only have a single fragment, and that fragment needs to be
-    // executed by the coordinator. This check confirms that.
-    // If desc_tbl is set, the query may or may not have a coordinator fragment.
-    bool has_coordinator_fragment =
-        query_exec_request.fragments[0].partition.type == TPartitionType::UNPARTITIONED;
-    DCHECK(has_coordinator_fragment || query_exec_request.__isset.desc_tbl);
-    bool has_from_clause = query_exec_request.__isset.desc_tbl;
-
-    if (!has_from_clause) {
-      // query without a FROM clause: only one fragment, and it doesn't have a plan
-      DCHECK(!query_exec_request.fragments[0].__isset.plan);
-      DCHECK_EQ(query_exec_request.fragments.size(), 1);
-      // TODO: This does not handle INSERT INTO ... SELECT 1 because there is no
-      // coordinator fragment actually executing to drive the sink.
-      // Workaround: INSERT INTO ... SELECT 1 FROM tbl LIMIT 1
-      local_runtime_state_.reset(new RuntimeState(
-          exec_request->request_id, exec_request->query_options,
-          query_exec_request.query_globals.now_string,
-          NULL /* = we don't expect to be executing anything here */));
-      RETURN_IF_ERROR(PrepareSelectListExprs(local_runtime_state_.get(),
-          query_exec_request.fragments[0].output_exprs, RowDescriptor()));
-    } else {
-      // If the first fragment has a "limit 0", simply set EOS to true and return.
-      // TODO: Remove this check if this is an INSERT. To be compatible with
-      // Hive, OVERWRITE inserts must clear out target tables / static
-      // partitions even if no rows are written.
-      DCHECK(query_exec_request.fragments[0].__isset.plan);
-      if (query_exec_request.fragments[0].plan.nodes[0].limit == 0) {
-        eos_ = true;
-        return Status::OK;
-      }
-
-      coord_.reset(new Coordinator(exec_env_));
-      RETURN_IF_ERROR(coord_->Exec(
-          exec_request->request_id, &query_exec_request, exec_request->query_options));
-
-      if (has_coordinator_fragment) {
-        RETURN_IF_ERROR(PrepareSelectListExprs(coord_->runtime_state(),
-            query_exec_request.fragments[0].output_exprs, coord_->row_desc()));
-      }
-
-      summary_profile_.AddInfoString("Start Time", start_time().DebugString());
-      summary_profile_.AddInfoString("End Time", "");
-      summary_profile_.AddInfoString("Query Type", PrintTStmtType(stmt_type()));
-      summary_profile_.AddInfoString("Query State", PrintQueryState(query_state_));
-      summary_profile_.AddInfoString("Impala Version", GetVersionString());
-      summary_profile_.AddInfoString("User", user());
-      summary_profile_.AddInfoString("Default Db", default_db());
-      summary_profile_.AddInfoString("Sql Statement", exec_request->sql_stmt);
-      if (query_exec_request.__isset.query_plan) {
-        stringstream plan_ss;
-        // Add some delimiters to make it clearer where the plan
-        // begins and the profile ends
-        plan_ss << "\n----------------\n"
-                << query_exec_request.query_plan
-                << "----------------";
-        summary_profile_.AddInfoString("Plan", plan_ss.str());
-      }
-      profile_.AddChild(coord_->query_profile());
-    }
-  } else {
-    ddl_executor_.reset(new DdlExecutor(impala_server_));
-    RETURN_IF_ERROR(ddl_executor_->Exec(&exec_request_.ddl_exec_request));
-  }
-
-  return Status::OK;
-}
-
-void ImpalaServer::QueryExecState::Done() {
-  end_time_ = TimestampValue::local_time();
-  summary_profile_.AddInfoString("End Time", end_time().DebugString());
-  summary_profile_.AddInfoString("Query State", PrintQueryState(query_state_));
-  query_events_->MarkEvent("Unregister query");
-}
-
-Status ImpalaServer::QueryExecState::Exec(const TMetadataOpRequest& exec_request) {
-  ddl_executor_.reset(new DdlExecutor(impala_server_));
-  RETURN_IF_ERROR(ddl_executor_->Exec(exec_request));
-  query_id_ = ddl_executor_->request_id();
-  VLOG_QUERY << "query_id:" << query_id_.hi << ":" << query_id_.lo;
-  result_metadata_ = ddl_executor_->result_set_metadata();
-  return Status::OK;
-}
-
-Status ImpalaServer::QueryExecState::Wait() {
-  if (coord_.get() != NULL) {
-    RETURN_IF_ERROR(coord_->Wait());
-    RETURN_IF_ERROR(UpdateMetastore());
-  }
-
-  if (exec_request_.stmt_type == TStmtType::DML) {
-    // DML queries are finished by this point
-    eos_ = true;
-  }
-
-  return Status::OK;
-}
-
-Status ImpalaServer::QueryExecState::FetchRows(const int32_t max_rows,
-    QueryResultSet* fetched_rows) {
-  query_status_ = FetchRowsInternal(max_rows, fetched_rows);
-  if (!query_status_.ok()) {
-    query_state_ = QueryState::EXCEPTION;
-  }
-  return query_status_;
-}
-
-void ImpalaServer::QueryExecState::UpdateQueryState(QueryState::type query_state) {
-  lock_guard<mutex> l(lock_);
-  if (query_state_ < query_state) query_state_ = query_state;
-}
-
-void ImpalaServer::QueryExecState::SetErrorStatus(const Status& status) {
-  DCHECK(!status.ok());
-  lock_guard<mutex> l(lock_);
-  query_state_ = QueryState::EXCEPTION;
-  query_status_ = status;
-}
-
-Status ImpalaServer::QueryExecState::FetchRowsInternal(const int32_t max_rows,
-    QueryResultSet* fetched_rows) {
-  DCHECK(query_state_ != QueryState::EXCEPTION);
-
-  if (eos_) return Status::OK;
-
-  // List of expr values to hold evaluated rows from the query
-  vector<void*> result_row;
-  result_row.resize(output_exprs_.size());
-
-  // List of scales for floating point values in result_row
-  vector<int> scales;
-  scales.resize(result_row.size());
-
-  if (coord_ == NULL && ddl_executor_ == NULL) {
-    query_state_ = QueryState::FINISHED;  // results will be ready after this call
-    // query without FROM clause: we return exactly one row
-    eos_ = true;
-    RETURN_IF_ERROR(GetRowValue(NULL, &result_row, &scales));
-    return fetched_rows->AddOneRow(result_row, scales);
-  } else {
-    if (coord_ != NULL) {
-      RETURN_IF_ERROR(coord_->Wait());
-    }
-    query_state_ = QueryState::FINISHED;  // results will be ready after this call
-    if (coord_ != NULL) {
-      // Fetch the next batch if we've returned the current batch entirely
-      if (current_batch_ == NULL || current_batch_row_ >= current_batch_->num_rows()) {
-        RETURN_IF_ERROR(FetchNextBatch());
-      }
-      if (current_batch_ == NULL) return Status::OK;
-
-      {
-        SCOPED_TIMER(row_materialization_timer_);
-        // Convert the available rows, limited by max_rows
-        int available = current_batch_->num_rows() - current_batch_row_;
-        int fetched_count = available;
-        // max_rows <= 0 means no limit
-        if (max_rows > 0 && max_rows < available) fetched_count = max_rows;
-        for (int i = 0; i < fetched_count; ++i) {
-          TupleRow* row = current_batch_->GetRow(current_batch_row_);
-          RETURN_IF_ERROR(GetRowValue(row, &result_row, &scales));
-          RETURN_IF_ERROR(fetched_rows->AddOneRow(result_row, scales));
-          ++num_rows_fetched_;
-          ++current_batch_row_;
-        }
-      }
-    } else {
-      DCHECK(ddl_executor_.get());
-      int num_rows = 0;
-      const vector<TResultRow>& all_rows = ddl_executor_->result_set();
-      // If max_rows < 0, there's no maximum on the number of rows to return
-      while ((num_rows < max_rows || max_rows < 0)
-          && num_rows_fetched_ < all_rows.size()) {
-        fetched_rows->AddOneRow(all_rows[num_rows_fetched_]);
-        ++num_rows_fetched_;
-        ++num_rows;
-      }
-      eos_ = (num_rows_fetched_ == all_rows.size());
-      return Status::OK;
-    }
-  }
-  return Status::OK;
-}
-
-Status ImpalaServer::QueryExecState::GetRowValue(TupleRow* row, vector<void*>* result,
-                                                 vector<int>* scales) {
-  DCHECK(result->size() >= output_exprs_.size());
-  for (int i = 0; i < output_exprs_.size(); ++i) {
-    (*result)[i] = output_exprs_[i]->GetValue(row);
-    (*scales)[i] = output_exprs_[i]->output_scale();
-  }
-  return Status::OK;
-}
-
-void ImpalaServer::QueryExecState::Cancel() {
-  // If the query is completed, no need to cancel.
-  if (eos_) return;
-  // we don't want multiple concurrent cancel calls to end up executing
-  // Coordinator::Cancel() multiple times
-  if (query_state_ == QueryState::EXCEPTION) return;
-  query_state_ = QueryState::EXCEPTION;
-  if (coord_.get() != NULL) coord_->Cancel();
-}
-
-Status ImpalaServer::QueryExecState::PrepareSelectListExprs(
-    RuntimeState* runtime_state,
-    const vector<TExpr>& exprs, const RowDescriptor& row_desc) {
-  RETURN_IF_ERROR(
-      Expr::CreateExprTrees(runtime_state->obj_pool(), exprs, &output_exprs_));
-  for (int i = 0; i < output_exprs_.size(); ++i) {
-    RETURN_IF_ERROR(Expr::Prepare(output_exprs_[i], runtime_state, row_desc,
-        !impala_server_->select_exprs_codegen_enabled_));
-  }
-  return Status::OK;
-}
-
-void ImpalaServer::EnableCodegenForSelectExprs() {
-  select_exprs_codegen_enabled_ = true;
-}
-
-Status ImpalaServer::QueryExecState::UpdateMetastore() {
-  if (stmt_type() != TStmtType::DML) return Status::OK;
-
-
-  DCHECK(exec_request().__isset.query_exec_request);
-  TQueryExecRequest query_exec_request = exec_request().query_exec_request;
-  if (!query_exec_request.__isset.finalize_params) return Status::OK;
-
-  TFinalizeParams& finalize_params = query_exec_request.finalize_params;
-  // TODO: Doesn't handle INSERT with no FROM
-  if (coord() == NULL) {
-    stringstream ss;
-    ss << "INSERT with no FROM clause not fully supported, not updating metastore"
-       << " (query_id: " << query_id() << ")";
-    VLOG_QUERY << ss.str();
-    return Status(ss.str());
-  }
-
-  TCatalogUpdate catalog_update;
-  if (!coord()->PrepareCatalogUpdate(&catalog_update)) {
-    VLOG_QUERY << "No partitions altered, not updating metastore (query id: "
-               << query_id() << ")";
-  } else {
-    // TODO: We track partitions written to, not created, which means
-    // that we do more work than is necessary, because written-to
-    // partitions don't always require a metastore change.
-    VLOG_QUERY << "Updating metastore with " << catalog_update.created_partitions.size()
-               << " altered partitions ("
-               << join (catalog_update.created_partitions, ", ") << ")";
-
-    catalog_update.target_table = finalize_params.table_name;
-    catalog_update.db_name = finalize_params.table_db;
-    RETURN_IF_ERROR(impala_server_->UpdateMetastore(catalog_update));
-  }
-  return Status::OK;
-}
-
-Status ImpalaServer::QueryExecState::FetchNextBatch() {
-  DCHECK(!eos_);
-  DCHECK(coord_.get() != NULL);
-
-  RETURN_IF_ERROR(coord_->GetNext(&current_batch_, coord_->runtime_state()));
-  current_batch_row_ = 0;
-  eos_ = current_batch_ == NULL;
-  return Status::OK;
-}
+// Prefix of profile log filenames. The version number is
+// internal, and does not correspond to an Impala release - it should
+// be changed only when the file format changes.
+const string PROFILE_LOG_FILE_PREFIX = "impala_profile_log_1.0-";
+const ptime EPOCH = time_from_string("1970-01-01 00:00:00.000");
 
 // Execution state of a single plan fragment.
 class ImpalaServer::FragmentExecState {
@@ -479,6 +209,7 @@ Status ImpalaServer::FragmentExecState::Prepare(
     const TExecPlanFragmentParams& exec_params) {
   exec_params_ = exec_params;
   RETURN_IF_ERROR(executor_.Prepare(exec_params));
+  executor_.OptimizeLlvmModule();
   return Status::OK;
 }
 
@@ -575,89 +306,84 @@ const char* ImpalaServer::SQLSTATE_OPTIONAL_FEATURE_NOT_IMPLEMENTED = "HYC00";
 const int ImpalaServer::ASCII_PRECISION = 16; // print 16 digits for double/float
 
 ImpalaServer::ImpalaServer(ExecEnv* exec_env)
-    : exec_env_(exec_env),
-      select_exprs_codegen_enabled_(false) {
+    : profile_log_file_size_(0),
+      exec_env_(exec_env) {
   // Initialize default config
   InitializeConfigVariables();
 
 #ifndef ADDRESS_SANITIZER
   // tcmalloc and address sanitizer can not be used together
-  if (!FLAGS_heap_profile_dir.empty()) {
+  if (FLAGS_enable_process_lifetime_heap_profiling) {
     HeapProfilerStart(FLAGS_heap_profile_dir.c_str());
   }
 #endif
 
-  if (!FLAGS_use_planservice) {
-    JNIEnv* jni_env = getJNIEnv();
-    // create instance of java class JniFrontend
-    jclass fe_class = jni_env->FindClass("com/cloudera/impala/service/JniFrontend");
-    jmethodID fe_ctor = jni_env->GetMethodID(fe_class, "<init>", "(Z)V");
-    EXIT_IF_EXC(jni_env);
-    create_exec_request_id_ =
-        jni_env->GetMethodID(fe_class, "createExecRequest", "([B)[B");
-    EXIT_IF_EXC(jni_env);
-    get_explain_plan_id_ =
-        jni_env->GetMethodID(fe_class, "getExplainPlan", "([B)Ljava/lang/String;");
-    EXIT_IF_EXC(jni_env);
-    reset_catalog_id_ = jni_env->GetMethodID(fe_class, "resetCatalog", "()V");
-    EXIT_IF_EXC(jni_env);
-    reset_table_id_ = jni_env->GetMethodID(fe_class, "resetTable",
-        "(Ljava/lang/String;Ljava/lang/String;)V");
-    EXIT_IF_EXC(jni_env);
-    get_hadoop_config_id_ =
-        jni_env->GetMethodID(fe_class, "getHadoopConfigAsHtml", "()Ljava/lang/String;");
-    EXIT_IF_EXC(jni_env);
-    get_hadoop_config_value_id_ =
-        jni_env->GetMethodID(fe_class, "getHadoopConfigValue",
-          "(Ljava/lang/String;)Ljava/lang/String;");
-    EXIT_IF_EXC(jni_env);
-    check_hadoop_config_id_ = jni_env->GetMethodID(fe_class, "checkHadoopConfig",
-       "()Ljava/lang/String;");
-    EXIT_IF_EXC(jni_env);
-    update_metastore_id_ = jni_env->GetMethodID(fe_class, "updateMetastore", "([B)V");
-    EXIT_IF_EXC(jni_env);
-    get_table_names_id_ = jni_env->GetMethodID(fe_class, "getTableNames", "([B)[B");
-    EXIT_IF_EXC(jni_env);
-    describe_table_id_ = jni_env->GetMethodID(fe_class, "describeTable", "([B)[B");
-    EXIT_IF_EXC(jni_env);
-    get_db_names_id_ = jni_env->GetMethodID(fe_class, "getDbNames", "([B)[B");
-    EXIT_IF_EXC(jni_env);
-    exec_hs2_metadata_op_id_ =
-        jni_env->GetMethodID(fe_class, "execHiveServer2MetadataOp", "([B)[B");
-    EXIT_IF_EXC(jni_env);
-    alter_table_id_ = jni_env->GetMethodID(fe_class, "alterTable", "([B)V");
-    EXIT_IF_EXC(jni_env);
-    create_table_id_ = jni_env->GetMethodID(fe_class, "createTable", "([B)V");
-    EXIT_IF_EXC(jni_env);
-    create_table_like_id_ = jni_env->GetMethodID(fe_class, "createTableLike", "([B)V");
-    EXIT_IF_EXC(jni_env);
-    create_database_id_ = jni_env->GetMethodID(fe_class, "createDatabase", "([B)V");
-    EXIT_IF_EXC(jni_env);
-    drop_table_id_ = jni_env->GetMethodID(fe_class, "dropTable", "([B)V");
-    EXIT_IF_EXC(jni_env);
-    drop_database_id_ = jni_env->GetMethodID(fe_class, "dropDatabase", "([B)V");
-    EXIT_IF_EXC(jni_env);
+  JNIEnv* jni_env = getJNIEnv();
+  // create instance of java class JniFrontend
+  jclass fe_class = jni_env->FindClass("com/cloudera/impala/service/JniFrontend");
+  jmethodID fe_ctor = jni_env->GetMethodID(fe_class, "<init>", "(Z)V");
+  EXIT_IF_EXC(jni_env);
+  create_exec_request_id_ =
+      jni_env->GetMethodID(fe_class, "createExecRequest", "([B)[B");
+  EXIT_IF_EXC(jni_env);
+  get_explain_plan_id_ =
+      jni_env->GetMethodID(fe_class, "getExplainPlan", "([B)Ljava/lang/String;");
+  EXIT_IF_EXC(jni_env);
+  reset_catalog_id_ = jni_env->GetMethodID(fe_class, "resetCatalog", "()V");
+  EXIT_IF_EXC(jni_env);
+  reset_table_id_ = jni_env->GetMethodID(fe_class, "resetTable",
+      "(Ljava/lang/String;Ljava/lang/String;)V");
+  EXIT_IF_EXC(jni_env);
+  get_hadoop_config_id_ =
+      jni_env->GetMethodID(fe_class, "getHadoopConfig", "(Z)Ljava/lang/String;");
+  EXIT_IF_EXC(jni_env);
+  get_hadoop_config_value_id_ = jni_env->GetMethodID(fe_class, "getHadoopConfigValue",
+      "(Ljava/lang/String;)Ljava/lang/String;");
+  EXIT_IF_EXC(jni_env);
+  check_hadoop_config_id_ =
+      jni_env->GetMethodID(fe_class, "checkHadoopConfig", "()Ljava/lang/String;");
+  EXIT_IF_EXC(jni_env);
+  update_metastore_id_ = jni_env->GetMethodID(fe_class, "updateMetastore", "([B)V");
+  EXIT_IF_EXC(jni_env);
+  get_table_names_id_ = jni_env->GetMethodID(fe_class, "getTableNames", "([B)[B");
+  EXIT_IF_EXC(jni_env);
+  describe_table_id_ = jni_env->GetMethodID(fe_class, "describeTable", "([B)[B");
+  EXIT_IF_EXC(jni_env);
+  get_db_names_id_ = jni_env->GetMethodID(fe_class, "getDbNames", "([B)[B");
+  EXIT_IF_EXC(jni_env);
+  exec_hs2_metadata_op_id_ =
+      jni_env->GetMethodID(fe_class, "execHiveServer2MetadataOp", "([B)[B");
+  EXIT_IF_EXC(jni_env);
+  alter_table_id_ = jni_env->GetMethodID(fe_class, "alterTable", "([B)V");
+  EXIT_IF_EXC(jni_env);
+  create_table_id_ = jni_env->GetMethodID(fe_class, "createTable", "([B)V");
+  EXIT_IF_EXC(jni_env);
+  create_table_like_id_ = jni_env->GetMethodID(fe_class, "createTableLike", "([B)V");
+  EXIT_IF_EXC(jni_env);
+  create_database_id_ = jni_env->GetMethodID(fe_class, "createDatabase", "([B)V");
+  EXIT_IF_EXC(jni_env);
+  drop_table_id_ = jni_env->GetMethodID(fe_class, "dropTable", "([B)V");
+  EXIT_IF_EXC(jni_env);
+  drop_database_id_ = jni_env->GetMethodID(fe_class, "dropDatabase", "([B)V");
+  EXIT_IF_EXC(jni_env);
 
-    jboolean lazy = (FLAGS_load_catalog_at_startup ? false : true);
-    jobject fe = jni_env->NewObject(fe_class, fe_ctor, lazy);
-    EXIT_IF_EXC(jni_env);
-    EXIT_IF_ERROR(JniUtil::LocalToGlobalRef(jni_env, fe, &fe_));
+  jboolean lazy = (FLAGS_load_catalog_at_startup ? false : true);
+  jobject fe = jni_env->NewObject(fe_class, fe_ctor, lazy);
+  EXIT_IF_EXC(jni_env);
+  EXIT_IF_ERROR(JniUtil::LocalToGlobalRef(jni_env, fe, &fe_));
 
-    Status status = ValidateSettings();
-    if (!status.ok()) {
-      LOG(ERROR) << status.GetErrorMsg();
-      if (FLAGS_abort_on_config_error) {
-        LOG(ERROR) << "Impala is aborted due to improper configurations.";
-        exit(1);
-      }
+  Status status = ValidateSettings();
+  if (!status.ok()) {
+    LOG(ERROR) << status.GetErrorMsg();
+    if (FLAGS_abort_on_config_error) {
+      LOG(ERROR) << "Impala is aborted due to improper configurations.";
+      exit(1);
     }
-  } else {
-    planservice_socket_.reset(new TSocket(FLAGS_planservice_host,
-        FLAGS_planservice_port));
-    planservice_transport_.reset(new TBufferedTransport(planservice_socket_));
-    planservice_protocol_.reset(new TBinaryProtocol(planservice_transport_));
-    planservice_client_.reset(new ImpalaPlanServiceClient(planservice_protocol_));
-    planservice_transport_->open();
+  }
+
+  if (!InitProfileLogging().ok()) {
+    LOG(ERROR) << "Query profile archival is disabled";
+    FLAGS_log_query_to_file = false;
   }
 
   Webserver::PathHandlerCallback varz_callback =
@@ -675,10 +401,6 @@ ImpalaServer::ImpalaServer(ExecEnv* exec_env)
   Webserver::PathHandlerCallback catalog_callback =
       bind<void>(mem_fn(&ImpalaServer::CatalogPathHandler), this, _1, _2);
   exec_env->webserver()->RegisterPathHandler("/catalog", catalog_callback);
-
-  Webserver::PathHandlerCallback backends_callback =
-      bind<void>(mem_fn(&ImpalaServer::BackendsPathHandler), this, _1, _2);
-  exec_env->webserver()->RegisterPathHandler("/backends", backends_callback);
 
   Webserver::PathHandlerCallback profile_callback =
       bind<void>(mem_fn(&ImpalaServer::QueryProfilePathHandler), this, _1, _2);
@@ -711,41 +433,86 @@ ImpalaServer::ImpalaServer(ExecEnv* exec_env)
         bind<void>(mem_fn(&ImpalaServer::MembershipCallback), this, _1, _2);
     exec_env->subscriber()->AddTopic(SimpleScheduler::IMPALA_MEMBERSHIP_TOPIC, true, cb);
   }
+
+  EXIT_IF_ERROR(UpdateCatalogMetrics());
+}
+
+Status ImpalaServer::InitProfileLogging() {
+  if (!FLAGS_log_query_to_file) return Status::OK;
+
+  if (FLAGS_profile_log_dir.empty()) {
+    stringstream ss;
+    ss << FLAGS_log_dir << "/profiles/";
+    FLAGS_profile_log_dir = ss.str();
+  }
+
+  LOG(INFO) << "Profile log path: " << FLAGS_profile_log_dir;
+
+  if (!exists(FLAGS_profile_log_dir)) {
+    LOG(INFO) << "Profile log directory does not exist, creating: "
+              << FLAGS_profile_log_dir;
+    try {
+      create_directory(FLAGS_profile_log_dir);
+    } catch (const std::exception& e) { // Explicit std:: to distinguish from boost::
+      LOG(ERROR) << "Could not create profile log directory: "
+                 << FLAGS_profile_log_dir << ", " << e.what();
+      return Status("Failed to create profile log directory");
+    }
+  }
+
+  if (!is_directory(FLAGS_profile_log_dir)) {
+    LOG(ERROR) << "Profile log path is not a directory ("
+               << FLAGS_profile_log_dir << ")";
+    return Status("Profile log path is not a directory");
+  }
+
+  LOG(INFO) << "Profile log path is a directory ("
+            << FLAGS_profile_log_dir << ")";
+
+  Status log_file_status = OpenProfileLogFile(false);
+  if (!log_file_status.ok()) {
+    LOG(ERROR) << "Could not open query log file for writing: "
+               << log_file_status.GetErrorMsg();
+    return log_file_status;
+  }
+  profile_log_file_flush_thread_.reset(
+      new thread(&ImpalaServer::LogFileFlushThread, this));
+
+  return Status::OK;
 }
 
 void ImpalaServer::RenderHadoopConfigs(const Webserver::ArgumentMap& args,
     stringstream* output) {
-  (*output) << "<h2>Hadoop Configuration</h2>";
-  if (FLAGS_use_planservice) {
-    (*output) << "Using external PlanService, no Hadoop configs available";
-    return;
-  }
+  jboolean as_text = (args.find("raw") != args.end());
   JNIEnv* jni_env = getJNIEnv();
-  jstring java_html_string =
-      static_cast<jstring>(jni_env->CallObjectMethod(fe_, get_hadoop_config_id_));
+  JniLocalFrame jni_frame;
+  Status status = jni_frame.push(jni_env);
+  if (!status.ok()) return;
+  jstring java_string = static_cast<jstring>(jni_env->CallObjectMethod(fe_,
+      get_hadoop_config_id_, as_text));
   RETURN_IF_EXC(jni_env);
   jboolean is_copy;
-  const char *str = jni_env->GetStringUTFChars(java_html_string, &is_copy);
+  const char *str = jni_env->GetStringUTFChars(java_string, &is_copy);
   RETURN_IF_EXC(jni_env);
   (*output) << str;
-  jni_env->ReleaseStringUTFChars(java_html_string, str);
+  jni_env->ReleaseStringUTFChars(java_string, str);
   RETURN_IF_EXC(jni_env);
 }
 
 Status ImpalaServer::GetHadoopConfigValue(const string& key, string* output) {
-  if (FLAGS_use_planservice) {
-    return Status("Using external PlanService, no Hadoop configs available");
-  }
   JNIEnv* jni_env = getJNIEnv();
+  JniLocalFrame jni_frame;
+  RETURN_IF_ERROR(jni_frame.push(jni_env));
   jstring value_arg = jni_env->NewStringUTF(key.c_str());
+  RETURN_ERROR_IF_EXC(jni_env);
   jstring java_config_value = static_cast<jstring>(
       jni_env->CallObjectMethod(fe_, get_hadoop_config_value_id_, value_arg));
-  RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
+  RETURN_ERROR_IF_EXC(jni_env);
   const char *str = jni_env->GetStringUTFChars(java_config_value, NULL);
-  RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
+  RETURN_ERROR_IF_EXC(jni_env);
   *output = str;
   jni_env->ReleaseStringUTFChars(java_config_value, str);
-  RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
+  RETURN_ERROR_IF_EXC(jni_env);
 
   return Status::OK;
 }
@@ -940,7 +707,7 @@ void ImpalaServer::QueryStatePathHandler(const Webserver::ArgumentMap& args,
     lock_guard<mutex> l(query_locations_lock_);
     BOOST_FOREACH(const QueryLocations::value_type& location, query_locations_) {
       (*output) << "<tr><td>" << location.first << "<td><b>" << location.second.size()
-		<< "</b></td></tr>";
+                << "</b></td></tr>";
     }
   }
   (*output) << "</table>";
@@ -1011,80 +778,124 @@ void ImpalaServer::SessionPathHandler(const Webserver::ArgumentMap& args,
 
 void ImpalaServer::CatalogPathHandler(const Webserver::ArgumentMap& args,
     stringstream* output) {
-  (*output) << "<h2>Catalog</h2>" << endl;
   TGetDbsResult get_dbs_result;
   Status status = GetDbNames(NULL, &get_dbs_result);
-  vector<string>& db_names = get_dbs_result.dbs;
-
   if (!status.ok()) {
     (*output) << "Error: " << status.GetErrorMsg();
     return;
   }
+  vector<string>& db_names = get_dbs_result.dbs;
 
-  // Build a navigation string like [ default | tpch | ... ]
-  vector<string> links;
-  BOOST_FOREACH(const string& db, db_names) {
-    stringstream ss;
-    ss << "<a href='#" << db << "'>" << db << "</a>";
-    links.push_back(ss.str());
-  }
-  (*output) << "[ " <<  join(links, " | ") << " ] ";
+  if (args.find("raw") == args.end()) {
+    (*output) << "<h2>Catalog</h2>" << endl;
 
-  BOOST_FOREACH(const string& db, db_names) {
-    (*output) << "<a id='" << db << "'><h3>" << db << "</h3></a>";
-    TGetTablesResult get_table_results;
-    Status status = GetTableNames(&db, NULL, &get_table_results);
-    vector<string>& table_names = get_table_results.tables;
-    if (!status.ok()) {
-      (*output) << "Error: " << status.GetErrorMsg();
-      continue;
+    // Build a navigation string like [ default | tpch | ... ]
+    vector<string> links;
+    BOOST_FOREACH(const string& db, db_names) {
+      stringstream ss;
+      ss << "<a href='#" << db << "'>" << db << "</a>";
+      links.push_back(ss.str());
     }
+    (*output) << "[ " <<  join(links, " | ") << " ] ";
 
-    (*output) << "<p>" << db << " contains <b>" << table_names.size()
-              << "</b> tables</p>";
+    BOOST_FOREACH(const string& db, db_names) {
+      (*output) << "<a id='" << db << "'><h3>" << db << "</h3></a>";
+      TGetTablesResult get_table_results;
+      Status status = GetTableNames(db, NULL, &get_table_results);
+      if (!status.ok()) {
+        (*output) << "Error: " << status.GetErrorMsg();
+        continue;
+      }
+      vector<string>& table_names = get_table_results.tables;
+      (*output) << "<p>" << db << " contains <b>" << table_names.size()
+                << "</b> tables</p>";
 
-    (*output) << "<ul>" << endl;
-    BOOST_FOREACH(const string& table, table_names) {
-      (*output) << "<li>" << table << "</li>" << endl;
+      (*output) << "<ul>" << endl;
+      BOOST_FOREACH(const string& table, table_names) {
+        (*output) << "<li>" << table << "</li>" << endl;
+      }
+      (*output) << "</ul>" << endl;
     }
-    (*output) << "</ul>" << endl;
+  } else {
+    (*output) << "Catalog" << endl << endl;
+    (*output) << "List of databases:" << endl;
+    (*output) << join(db_names, "\n") << endl << endl;
+
+    BOOST_FOREACH(const string& db, db_names) {
+      TGetTablesResult get_table_results;
+      Status status = GetTableNames(db, NULL, &get_table_results);
+      if (!status.ok()) {
+        (*output) << "Error: " << status.GetErrorMsg();
+        continue;
+      }
+      vector<string>& table_names = get_table_results.tables;
+      (*output) << db << " contains " << table_names.size()
+                << " tables" << endl;
+      BOOST_FOREACH(const string& table, table_names) {
+        (*output) << "- " << table << endl;
+      }
+      (*output) << endl << endl;
+    }
   }
 }
 
-void ImpalaServer::BackendsPathHandler(const Webserver::ArgumentMap& args,
-    stringstream* output) {
-  Scheduler::HostList backends;
-  exec_env_->scheduler()->GetAllKnownHosts(&backends);
-  sort(backends.begin(), backends.end(), TNetworkAddressComparator);
-
-  (*output) << "<h2>Known Backends "
-            << "(" << backends.size() << ")"
-            << "</h2>";
-
-  (*output) << "<pre>";
-  BOOST_FOREACH(const Scheduler::HostList::value_type& host, backends) {
-    (*output) << host << endl;
+Status ImpalaServer::OpenProfileLogFile(bool reopen) {
+  if (profile_log_file_.is_open()) {
+    // flush() alone does not apparently fsync, but we actually want
+    // the results to become visible, hence the close / reopen
+    profile_log_file_.flush();
+    profile_log_file_.close();
   }
-  (*output) << "</pre>";
+  if (!reopen) {
+    stringstream ss;
+    int64_t ms_since_epoch = (microsec_clock::local_time() - EPOCH).total_milliseconds();
+    ss << FLAGS_profile_log_dir << "/" << PROFILE_LOG_FILE_PREFIX
+       << ms_since_epoch;
+    profile_log_file_name_ = ss.str();
+    profile_log_file_size_ = 0;
+  }
+  profile_log_file_.open(profile_log_file_name_.c_str(), ios_base::app | ios_base::out);
+  if (!profile_log_file_.is_open()) return Status("Could not open log file");
+  return Status::OK;
+}
+
+void ImpalaServer::LogFileFlushThread() {
+  while (true) {
+    sleep(5);
+    {
+      lock_guard<mutex> l(profile_log_file_lock_);
+      OpenProfileLogFile(true);
+    }
+  }
 }
 
 void ImpalaServer::ArchiveQuery(const QueryExecState& query) {
-  string encoded_profile_str;
+  string encoded_profile_str = query.profile().SerializeToArchiveString();
 
+  // If there was an error initialising archival (e.g. directory is
+  // not writeable), FLAGS_log_query_to_file will have been set to
+  // false
   if (FLAGS_log_query_to_file) {
-    // GLOG chops logs off past the max log len.  Output the profile to the log
-    // in parts.
-    // TODO: is there a better way?
-    int max_output_len = google::LogMessage::kMaxLogMessageLen - 1000;
-    DCHECK_GT(max_output_len, 1000);
-    encoded_profile_str = query.profile().SerializeToArchiveString();
-    int num_lines = BitUtil::Ceil(encoded_profile_str.size(), max_output_len);
-    int encoded_str_len = encoded_profile_str.size();
-    for (int i = 0; i < num_lines; ++i) {
-      int len = ::min(max_output_len, encoded_str_len - i * max_output_len);
-      LOG(INFO) << "Query " << query.query_id() << " finished ("
-                << (i + 1) << "/" << num_lines << ") "
-                << string(encoded_profile_str.c_str() + i * max_output_len, len);
+    lock_guard<mutex> l(profile_log_file_lock_);
+    if (!profile_log_file_.is_open() ||
+        profile_log_file_size_ > FLAGS_max_profile_log_file_size) {
+      // Roll the file
+      Status status = OpenProfileLogFile(false);
+      if (!status.ok()) {
+        LOG_EVERY_N(WARNING, 1000) << "Could not open new query log file ("
+                                   << google::COUNTER << " attempts failed): "
+                                   << status.GetErrorMsg();
+        LOG_EVERY_N(WARNING, 1000)
+            << "Disable query logging with --log_query_to_file=false";
+      }
+    }
+
+    if (profile_log_file_.is_open()) {
+      int64_t timestamp = (microsec_clock::local_time() - EPOCH).total_milliseconds();
+      profile_log_file_ << timestamp << " " << query.query_id() << " "
+                      << encoded_profile_str
+                      << "\n"; // Not std::endl, since that causes an implicit flush
+      ++profile_log_file_size_;
     }
   }
 
@@ -1127,38 +938,49 @@ Status ImpalaServer::ExecuteInternal(
     shared_ptr<QueryExecState>* exec_state) {
   DCHECK(session_state != NULL);
 
-  exec_state->reset(
-      new QueryExecState(exec_env_, this, session_state, query_session_state));
-  (*exec_state)->query_events()->MarkEvent("Start execution");
   *registered_exec_state = false;
+
+  exec_state->reset(new QueryExecState(
+      exec_env_, this, session_state, query_session_state, request.stmt));
+
+  (*exec_state)->query_events()->MarkEvent("Start execution");
 
   TExecRequest result;
   {
-    RETURN_IF_ERROR(GetExecRequest(request, &result));
+    // Keep a lock on exec_state so that registration and setting
+    // result_metadata are atomic.
+    //
+    // Note: this acquires the exec_state lock *before* the
+    // query_exec_state_map_ lock. This is the opposite of
+    // GetQueryExecState(..., true), and therefore looks like a
+    // candidate for deadlock. The reason this works here is that
+    // GetQueryExecState cannot find exec_state (under the exec state
+    // map lock) and take it's lock until RegisterQuery has
+    // finished. By that point, the exec state map lock will have been
+    // given up, so the classic deadlock interleaving is not possible.
+    lock_guard<mutex> l(*(*exec_state)->lock());
+
+    // register exec state as early as possible so that queries that
+    // take a long time to plan show up, and to handle incoming status
+    // reports before execution starts.
+    RETURN_IF_ERROR(RegisterQuery(session_state, *exec_state));
+    *registered_exec_state = true;
+
+    RETURN_IF_ERROR((*exec_state)->UpdateQueryStatus(GetExecRequest(request, &result)));
     (*exec_state)->query_events()->MarkEvent("Planning finished");
-  }
-
-  if (result.stmt_type == TStmtType::DDL &&
-      result.ddl_exec_request.ddl_type == TDdlType::USE) {
-    {
-      lock_guard<mutex> l(session_state->lock);
-      session_state->database = result.ddl_exec_request.use_db_params.db;
+    if (result.__isset.result_set_metadata) {
+      (*exec_state)->set_result_metadata(result.result_set_metadata);
     }
-    exec_state->reset();
-    return Status::OK;
   }
-
-  if (result.__isset.result_set_metadata) {
-    (*exec_state)->set_result_metadata(result.result_set_metadata);
-  }
-
-  // register exec state before starting execution in order to handle incoming
-  // status reports
-  RETURN_IF_ERROR(RegisterQuery(session_state, result.request_id, *exec_state));
-  *registered_exec_state = true;
 
   // start execution of query; also starts fragment status reports
   RETURN_IF_ERROR((*exec_state)->Exec(&result));
+  if (result.stmt_type == TStmtType::DDL) {
+    Status status = UpdateCatalogMetrics();
+    if (!status.ok()) {
+      VLOG_QUERY << "Couldn't update catalog metrics: " << status.GetErrorMsg();
+    }
+  }
 
   if ((*exec_state)->coord() != NULL) {
     const unordered_set<TNetworkAddress>& unique_hosts =
@@ -1175,14 +997,14 @@ Status ImpalaServer::ExecuteInternal(
 }
 
 Status ImpalaServer::RegisterQuery(shared_ptr<SessionState> session_state,
-    const TUniqueId& query_id, const shared_ptr<QueryExecState>& exec_state) {
+    const shared_ptr<QueryExecState>& exec_state) {
   lock_guard<mutex> l2(session_state->lock);
   if (session_state->closed) {
     return Status("Session has been closed, ignoring query.");
   }
 
   lock_guard<mutex> l(query_exec_state_map_lock_);
-
+  const TUniqueId& query_id = exec_state->query_id();
   QueryExecStateMap::iterator entry = query_exec_state_map_.find(query_id);
   if (entry != query_exec_state_map_.end()) {
     // There shouldn't be an active query with that same id.
@@ -1247,114 +1069,122 @@ bool ImpalaServer::UnregisterQuery(const TUniqueId& query_id) {
   return true;
 }
 
-void ImpalaServer::Wait(boost::shared_ptr<QueryExecState> exec_state) {
+void ImpalaServer::Wait(shared_ptr<QueryExecState> exec_state) {
   // block until results are ready
   Status status = exec_state->Wait();
-  exec_state->query_events()->MarkEvent("Rows available");
+  {
+    lock_guard<mutex> l(*(exec_state->lock()));
+    if (exec_state->returns_result_set()) {
+      exec_state->query_events()->MarkEvent("Rows available");
+    } else {
+      exec_state->query_events()->MarkEvent("Request finished");
+    }
+
+    exec_state->UpdateQueryStatus(status);
+  }
   if (status.ok()) {
     exec_state->UpdateQueryState(QueryState::FINISHED);
-  } else {
-    exec_state->SetErrorStatus(status);
   }
+}
+
+Status ImpalaServer::UpdateCatalogMetrics() {
+  TGetDbsResult db_names;
+  RETURN_IF_ERROR(GetDbNames(NULL, &db_names));
+  ImpaladMetrics::CATALOG_NUM_DBS->Update(db_names.dbs.size());
+  ImpaladMetrics::CATALOG_NUM_TABLES->Update(0L);
+  BOOST_FOREACH(const string& db, db_names.dbs) {
+    TGetTablesResult table_names;
+    RETURN_IF_ERROR(GetTableNames(db, NULL, &table_names));
+    ImpaladMetrics::CATALOG_NUM_TABLES->Increment(table_names.tables.size());
+  }
+
+  return Status::OK;
 }
 
 Status ImpalaServer::UpdateMetastore(const TCatalogUpdate& catalog_update) {
   VLOG_QUERY << "UpdateMetastore()";
-  if (!FLAGS_use_planservice) {
-    JNIEnv* jni_env = getJNIEnv();
-    jbyteArray request_bytes;
-    RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &catalog_update, &request_bytes));
-    jni_env->CallObjectMethod(fe_, update_metastore_id_, request_bytes);
-    RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
-  } else {
-    try {
-      planservice_client_->UpdateMetastore(catalog_update);
-    } catch (TException& e) {
-      return Status(e.what());
-    }
-  }
+  JNIEnv* jni_env = getJNIEnv();
+  jbyteArray request_bytes;
+  JniLocalFrame jni_frame;
+  RETURN_IF_ERROR(jni_frame.push(jni_env));
+  RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &catalog_update, &request_bytes));
+  jni_env->CallObjectMethod(fe_, update_metastore_id_, request_bytes);
+  RETURN_ERROR_IF_EXC(jni_env);
 
   return Status::OK;
 }
 
 Status ImpalaServer::AlterTable(const TAlterTableParams& params) {
-  if (FLAGS_use_planservice) {
-    return Status("AlterTable not supported with external planservice");
-  }
   JNIEnv* jni_env = getJNIEnv();
   jbyteArray request_bytes;
+  JniLocalFrame jni_frame;
+  RETURN_IF_ERROR(jni_frame.push(jni_env));
   RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &params, &request_bytes));
   jni_env->CallObjectMethod(fe_, alter_table_id_, request_bytes);
-  RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
+  RETURN_ERROR_IF_EXC(jni_env);
   return Status::OK;
 }
 
 Status ImpalaServer::CreateDatabase(const TCreateDbParams& params) {
-  if (FLAGS_use_planservice) {
-   return Status("CreateDatabase not supported with external planservice");
-  }
   JNIEnv* jni_env = getJNIEnv();
+  JniLocalFrame jni_frame;
+  RETURN_IF_ERROR(jni_frame.push(jni_env));
   jbyteArray request_bytes;
   RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &params, &request_bytes));
   jni_env->CallObjectMethod(fe_, create_database_id_, request_bytes);
-  RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
+  RETURN_ERROR_IF_EXC(jni_env);
   return Status::OK;
 }
 
 Status ImpalaServer::CreateTableLike(const TCreateTableLikeParams& params) {
-  if (FLAGS_use_planservice) {
-    return Status("CreateTableLike not supported with external planservice");
-  }
   JNIEnv* jni_env = getJNIEnv();
+  JniLocalFrame jni_frame;
+  RETURN_IF_ERROR(jni_frame.push(jni_env));
   jbyteArray request_bytes;
   RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &params, &request_bytes));
   jni_env->CallObjectMethod(fe_, create_table_like_id_, request_bytes);
-  RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
+  RETURN_ERROR_IF_EXC(jni_env);
   return Status::OK;
 }
 
 Status ImpalaServer::CreateTable(const TCreateTableParams& params) {
-  if (FLAGS_use_planservice) {
-    return Status("CreateTable not supported with external planservice");
-  }
   JNIEnv* jni_env = getJNIEnv();
+  JniLocalFrame jni_frame;
+  RETURN_IF_ERROR(jni_frame.push(jni_env));
   jbyteArray request_bytes;
   RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &params, &request_bytes));
   jni_env->CallObjectMethod(fe_, create_table_id_, request_bytes);
-  RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
+  RETURN_ERROR_IF_EXC(jni_env);
   return Status::OK;
 }
 
 Status ImpalaServer::DropDatabase(const TDropDbParams& params) {
-  if (FLAGS_use_planservice) {
-    return Status("DropDatabase not supported with external planservice");
-  }
   JNIEnv* jni_env = getJNIEnv();
+  JniLocalFrame jni_frame;
+  RETURN_IF_ERROR(jni_frame.push(jni_env));
   jbyteArray request_bytes;
   RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &params, &request_bytes));
   jni_env->CallObjectMethod(fe_, drop_database_id_, request_bytes);
-  RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
+  RETURN_ERROR_IF_EXC(jni_env);
   return Status::OK;
 }
 
 Status ImpalaServer::DropTable(const TDropTableParams& params) {
-  if (FLAGS_use_planservice) {
-    return Status("DropTable not supported with external planservice");
-  }
   JNIEnv* jni_env = getJNIEnv();
+  JniLocalFrame jni_frame;
+  RETURN_IF_ERROR(jni_frame.push(jni_env));
   jbyteArray request_bytes;
   RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &params, &request_bytes));
   jni_env->CallObjectMethod(fe_, drop_table_id_, request_bytes);
-  RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
+  RETURN_ERROR_IF_EXC(jni_env);
   return Status::OK;
 }
 
 Status ImpalaServer::DescribeTable(const string& db, const string& table,
     TDescribeTableResult* columns) {
- if (FLAGS_use_planservice) {
-   return Status("DescribeTable not supported with external planservice");
-  }
   JNIEnv* jni_env = getJNIEnv();
+  JniLocalFrame jni_frame;
+  RETURN_IF_ERROR(jni_frame.push(jni_env));
   jbyteArray request_bytes;
   TDescribeTableParams params;
   params.__set_db(db);
@@ -1363,25 +1193,22 @@ Status ImpalaServer::DescribeTable(const string& db, const string& table,
   RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &params, &request_bytes));
   jbyteArray result_bytes = static_cast<jbyteArray>(
       jni_env->CallObjectMethod(fe_, describe_table_id_, request_bytes));
-
-  RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
+  RETURN_ERROR_IF_EXC(jni_env);
 
   TDescribeTableResult result;
   RETURN_IF_ERROR(DeserializeThriftMsg(jni_env, result_bytes, columns));
   return Status::OK;
 }
 
-Status ImpalaServer::GetTableNames(const string* db, const string* pattern,
+Status ImpalaServer::GetTableNames(const string& db, const string* pattern,
     TGetTablesResult* table_names) {
-  if (FLAGS_use_planservice) {
-    return Status("GetTableNames not supported with external planservice");
-  }
   JNIEnv* jni_env = getJNIEnv();
+  JniLocalFrame jni_frame;
+  RETURN_IF_ERROR(jni_frame.push(jni_env));
   jbyteArray request_bytes;
   TGetTablesParams params;
-  if (db != NULL) {
-    params.__set_db(*db);
-  }
+  params.__set_db(db);
+
   if (pattern != NULL) {
     params.__set_pattern(*pattern);
   }
@@ -1389,18 +1216,16 @@ Status ImpalaServer::GetTableNames(const string* db, const string* pattern,
   RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &params, &request_bytes));
   jbyteArray result_bytes = static_cast<jbyteArray>(
       jni_env->CallObjectMethod(fe_, get_table_names_id_, request_bytes));
-
-  RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
+  RETURN_ERROR_IF_EXC(jni_env);
 
   RETURN_IF_ERROR(DeserializeThriftMsg(jni_env, result_bytes, table_names));
   return Status::OK;
 }
 
 Status ImpalaServer::GetDbNames(const string* pattern, TGetDbsResult* db_names) {
-  if (FLAGS_use_planservice) {
-    return Status("GetDbNames not supported with external planservice");
-  }
   JNIEnv* jni_env = getJNIEnv();
+  JniLocalFrame jni_frame;
+  RETURN_IF_ERROR(jni_frame.push(jni_env));
   jbyteArray request_bytes;
   TGetDbsParams params;
   if (pattern != NULL) {
@@ -1410,8 +1235,7 @@ Status ImpalaServer::GetDbNames(const string* pattern, TGetDbsResult* db_names) 
   RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &params, &request_bytes));
   jbyteArray result_bytes = static_cast<jbyteArray>(
       jni_env->CallObjectMethod(fe_, get_db_names_id_, request_bytes));
-
-  RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
+  RETURN_ERROR_IF_EXC(jni_env);
 
   RETURN_IF_ERROR(DeserializeThriftMsg(jni_env, result_bytes, db_names));
   return Status::OK;
@@ -1419,88 +1243,71 @@ Status ImpalaServer::GetDbNames(const string* pattern, TGetDbsResult* db_names) 
 
 Status ImpalaServer::GetExecRequest(
     const TClientRequest& request, TExecRequest* result) {
-  if (!FLAGS_use_planservice) {
-    // TODO: figure out if repeated calls to
-    // JNI_GetCreatedJavaVMs()/AttachCurrentThread() are too expensive
-    JNIEnv* jni_env = getJNIEnv();
-    jbyteArray request_bytes;
-    RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &request, &request_bytes));
-    jbyteArray result_bytes = static_cast<jbyteArray>(
-        jni_env->CallObjectMethod(fe_, create_exec_request_id_, request_bytes));
-    RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
-    RETURN_IF_ERROR(DeserializeThriftMsg(jni_env, result_bytes, result));
-    // TODO: dealloc result_bytes?
-    // TODO: figure out if we should detach here
-    //RETURN_IF_JNIERROR(jvm_->DetachCurrentThread());
-    return Status::OK;
-  } else {
-    planservice_client_->CreateExecRequest(*result, request);
-    return Status::OK;
-  }
+  // TODO: figure out if repeated calls to
+  // JNI_GetCreatedJavaVMs()/AttachCurrentThread() are too expensive
+  JNIEnv* jni_env = getJNIEnv();
+  JniLocalFrame jni_frame;
+  RETURN_IF_ERROR(jni_frame.push(jni_env));
+  jbyteArray request_bytes;
+  RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &request, &request_bytes));
+  jbyteArray result_bytes = static_cast<jbyteArray>(
+      jni_env->CallObjectMethod(fe_, create_exec_request_id_, request_bytes));
+  RETURN_ERROR_IF_EXC(jni_env);
+  RETURN_IF_ERROR(DeserializeThriftMsg(jni_env, result_bytes, result));
+  // TODO: figure out if we should detach here
+  //RETURN_IF_JNIERROR(jvm_->DetachCurrentThread());
+  return Status::OK;
 }
 
 Status ImpalaServer::GetExplainPlan(
     const TClientRequest& query_request, string* explain_string) {
-  if (!FLAGS_use_planservice) {
-    // TODO: figure out if repeated calls to
-    // JNI_GetCreatedJavaVMs()/AttachCurrentThread() are too expensive
-    JNIEnv* jni_env = getJNIEnv();
-    jbyteArray query_request_bytes;
-    RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &query_request, &query_request_bytes));
-    jstring java_explain_string = static_cast<jstring>(
-        jni_env->CallObjectMethod(fe_, get_explain_plan_id_, query_request_bytes));
-    RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
-    jboolean is_copy;
-    const char *str = jni_env->GetStringUTFChars(java_explain_string, &is_copy);
-    RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
-    *explain_string = str;
-    jni_env->ReleaseStringUTFChars(java_explain_string, str);
-    RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
-    return Status::OK;
-  } else {
-    try {
-      planservice_client_->GetExplainString(*explain_string, query_request);
-    } catch (TException& e) {
-      return Status(e.what());
-    }
-    return Status::OK;
-  }
+  // TODO: figure out if repeated calls to
+  // JNI_GetCreatedJavaVMs()/AttachCurrentThread() are too expensive
+  JNIEnv* jni_env = getJNIEnv();
+  JniLocalFrame jni_frame;
+  RETURN_IF_ERROR(jni_frame.push(jni_env));
+  jbyteArray query_request_bytes;
+  RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &query_request, &query_request_bytes));
+  jstring java_explain_string = static_cast<jstring>(
+      jni_env->CallObjectMethod(fe_, get_explain_plan_id_, query_request_bytes));
+  RETURN_ERROR_IF_EXC(jni_env);
+  jboolean is_copy;
+  const char *str = jni_env->GetStringUTFChars(java_explain_string, &is_copy);
+  RETURN_ERROR_IF_EXC(jni_env);
+  *explain_string = str;
+  jni_env->ReleaseStringUTFChars(java_explain_string, str);
+  RETURN_ERROR_IF_EXC(jni_env);
+  return Status::OK;
 }
 
 Status ImpalaServer::ResetCatalogInternal() {
   LOG(INFO) << "Refreshing catalog";
-  if (!FLAGS_use_planservice) {
-    JNIEnv* jni_env = getJNIEnv();
-    jni_env->CallObjectMethod(fe_, reset_catalog_id_);
-    RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
-  } else {
-    try {
-      planservice_client_->RefreshMetadata();
-    } catch (TTransportException& e) {
-      stringstream msg;
-      msg << "RefreshMetadata rpc failed: " << e.what();
-      LOG(ERROR) << msg.str();
-      // TODO: different error code here?
-      return Status(msg.str());
-    }
-  }
+  JNIEnv* jni_env = getJNIEnv();
+  jni_env->CallObjectMethod(fe_, reset_catalog_id_);
+  RETURN_ERROR_IF_EXC(jni_env);
 
   ImpaladMetrics::IMPALA_SERVER_LAST_REFRESH_TIME->Update(
       TimestampValue::local_time().DebugString());
+
+  Status status = UpdateCatalogMetrics();
+  if (!status.ok()) {
+    VLOG_QUERY << "Couldn't update catalog metrics: " << status.GetErrorMsg();
+  }
 
   return Status::OK;
 }
 
 Status ImpalaServer::ResetTableInternal(const string& db_name, const string& table_name) {
-  if (FLAGS_use_planservice) {
-    return Status("ResetTable not supported with external planservice");
-  }
   LOG(INFO) << "Resetting table: " << db_name << "." << table_name;
   JNIEnv* jni_env = getJNIEnv();
+  JniLocalFrame jni_frame;
+  RETURN_IF_ERROR(jni_frame.push(jni_env));
   jstring db_name_arg = jni_env->NewStringUTF(db_name.c_str());
+  RETURN_ERROR_IF_EXC(jni_env);
   jstring table_name_arg = jni_env->NewStringUTF(table_name.c_str());
+  RETURN_ERROR_IF_EXC(jni_env);
   jni_env->CallObjectMethod(fe_, reset_table_id_, db_name_arg, table_name_arg);
-  RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
+  RETURN_ERROR_IF_EXC(jni_env);
   return Status::OK;
 }
 
@@ -1828,15 +1635,17 @@ Status ImpalaServer::ValidateSettings() {
   // TODO: check OS setting
   stringstream ss;
   JNIEnv* jni_env = getJNIEnv();
+  JniLocalFrame jni_frame;
+  RETURN_IF_ERROR(jni_frame.push(jni_env));
   jstring error_string =
       static_cast<jstring>(jni_env->CallObjectMethod(fe_, check_hadoop_config_id_));
-  RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
+  RETURN_ERROR_IF_EXC(jni_env);
   jboolean is_copy;
   const char *str = jni_env->GetStringUTFChars(error_string, &is_copy);
-  RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
+  RETURN_ERROR_IF_EXC(jni_env);
   ss << str;
   jni_env->ReleaseStringUTFChars(error_string, str);
-  RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
+  RETURN_ERROR_IF_EXC(jni_env);
 
   if (ss.str().size() > 0) {
     return Status(ss.str());
@@ -1973,7 +1782,7 @@ ImpalaServer::QueryStateRecord::QueryStateRecord(const QueryExecState& exec_stat
   id = exec_state.query_id();
   const TExecRequest& request = exec_state.exec_request();
 
-  stmt = request.__isset.sql_stmt ? request.sql_stmt : "N/A";
+  stmt = exec_state.sql_stmt();
   stmt_type = request.stmt_type;
   user = exec_state.user();
   default_db = exec_state.default_db();
@@ -2096,5 +1905,18 @@ Status CreateImpalaServer(ExecEnv* exec_env, int beeswax_port, int hs2_port,
 
   return Status::OK;
 }
+
+shared_ptr<ImpalaServer::QueryExecState> ImpalaServer::GetQueryExecState(
+    const TUniqueId& query_id, bool lock) {
+  lock_guard<mutex> l(query_exec_state_map_lock_);
+  QueryExecStateMap::iterator i = query_exec_state_map_.find(query_id);
+  if (i == query_exec_state_map_.end()) {
+    return shared_ptr<QueryExecState>();
+  } else {
+    if (lock) i->second->lock()->lock();
+    return i->second;
+  }
+}
+
 
 }

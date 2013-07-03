@@ -26,8 +26,6 @@ DEFINE_string(hostname, "", "Hostname to use for this daemon, also used as part 
               "the Kerberos principal, if enabled. If not set, the system default will be"
               " used");
 
-DEFINE_string(planservice_host, "localhost", "Host on which planservice is running");
-DEFINE_int32(planservice_port, 20000, "Port on which planservice is running");
 DEFINE_int32(be_port, 22000, "port on which ImpalaInternalService is exported");
 
 // Kerberos is enabled if and only if principal is set.
@@ -38,3 +36,11 @@ DEFINE_string(mem_limit, "80%", "Process memory limit specified as number of byt
               "('<int>[bB]?'), megabytes ('<float>[mM]'), gigabytes ('<float>[gG]'), "
               "or percentage of the physical memory ('<int>%'). "
               "Defaults to bytes if no unit is given");
+
+DEFINE_bool(enable_process_lifetime_heap_profiling, false, "(Advanced) Enables heap "
+    "profiling for the lifetime of the process. Profile output will be stored in the "
+    "directory specified by -heap_profile_dir. Enabling this option will disable the "
+    "on-demand/remote server profile handlers.");
+
+DEFINE_string(heap_profile_dir, "", "Output directory to store heap profiles. If not set "
+    " profiles are stored in the current working directory.");

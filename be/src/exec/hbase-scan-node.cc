@@ -39,10 +39,9 @@ HBaseScanNode::HBaseScanNode(ObjectPool* pool, const TPlanNode& tnode,
       tuple_idx_(0),
       filters_(tnode.hbase_scan_node.filters),
       num_errors_(0),
-      tuple_pool_(new MemPool()),
       hbase_scanner_(NULL),
       row_key_slot_(NULL),
-      text_converter_(new TextConverter('\\')) {
+      text_converter_(new TextConverter('\\', "", false)) {
 }
 
 HBaseScanNode::~HBaseScanNode() {
@@ -55,8 +54,8 @@ bool HBaseScanNode::CmpColPos(const SlotDescriptor* a, const SlotDescriptor* b) 
 Status HBaseScanNode::Prepare(RuntimeState* state) {
   RETURN_IF_ERROR(ScanNode::Prepare(state));
 
+  tuple_pool_.reset(new MemPool(state->mem_limits())),
   hbase_scanner_.reset(new HBaseTableScanner(this, state->htable_factory(), state));
-  tuple_pool_->set_limits(*state->mem_limits());
 
   tuple_desc_ = state->desc_tbl().GetTupleDescriptor(tuple_id_);
   if (tuple_desc_ == NULL) {
@@ -179,7 +178,7 @@ Status HBaseScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eo
     if (row_key_slot_ != NULL) {
       void* key;
       int key_length;
-      hbase_scanner_->GetRowKey(env, &key, &key_length);
+      RETURN_IF_ERROR(hbase_scanner_->GetRowKey(env, &key, &key_length));
       if (key == NULL) {
         tuple_->SetNull(row_key_slot_->null_indicator_offset());
       } else {
@@ -192,8 +191,8 @@ Status HBaseScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eo
     for (int i = 0; i < sorted_non_key_slots_.size(); ++i) {
       void* value;
       int value_length;
-      hbase_scanner_->GetValue(env, sorted_cols_[i]->first, sorted_cols_[i]->second,
-          &value, &value_length);
+      RETURN_IF_ERROR(hbase_scanner_->GetValue(env, sorted_cols_[i]->first,
+          sorted_cols_[i]->second, &value, &value_length));
       if (value == NULL) {
         tuple_->SetNull(sorted_non_key_slots_[i]->null_indicator_offset());
       } else {

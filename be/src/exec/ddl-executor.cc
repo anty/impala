@@ -38,7 +38,7 @@ Status DdlExecutor::Exec(TDdlExecRequest* exec_request) {
       string* table_name = params->__isset.show_pattern ? &(params->show_pattern) : NULL;
       // TODO: refactor ImpalaServer->GetXXX outside of impala-server.
       TGetTablesResult table_names;
-      RETURN_IF_ERROR(impala_server_->GetTableNames(&params->db, table_name,
+      RETURN_IF_ERROR(impala_server_->GetTableNames(params->db, table_name,
           &table_names));
 
       // Set the result set
@@ -110,7 +110,6 @@ Status DdlExecutor::Exec(const TMetadataOpRequest& exec_request) {
   TMetadataOpResponse metdata_op_result_;
   RETURN_IF_ERROR(impala_server_->ExecHiveServer2MetadataOp(exec_request,
       &metdata_op_result_));
-  request_id_ = metdata_op_result_.request_id;
   result_set_metadata_ = metdata_op_result_.result_set_metadata;
   result_set_ = metdata_op_result_.results;
   return Status::OK;

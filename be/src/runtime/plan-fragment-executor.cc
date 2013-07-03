@@ -38,7 +38,6 @@
 #include "util/container-util.h"
 #include "util/parse-util.h"
 #include "util/mem-info.h"
-#include "gen-cpp/ImpalaPlanService_types.h"
 
 DEFINE_bool(serialize_batch, false, "serialize and deserialize each returned row batch");
 DEFINE_int32(status_report_interval, 5, "interval between profile reports; in seconds");
@@ -85,7 +84,7 @@ Status PlanFragmentExecutor::Prepare(const TExecPlanFragmentParams& request) {
   has_thread_token_ = true;
 
   average_thread_tokens_ = profile()->AddSamplingCounter("AverageThreadTokens",
-      bind<int64_t>(mem_fn(&ThreadResourceMgr::ResourcePool::num_threads), 
+      bind<int64_t>(mem_fn(&ThreadResourceMgr::ResourcePool::num_threads),
           runtime_state_->resource_pool()));
 
   if (exec_env_->mem_limit() != NULL) {
@@ -172,23 +171,21 @@ Status PlanFragmentExecutor::Prepare(const TExecPlanFragmentParams& request) {
   profile()->AddChild(plan_->runtime_profile());
   rows_produced_counter_ = ADD_COUNTER(profile(), "RowsProduced", TCounterType::UNIT);
 
-  // After preparing the plan and initializing the output sink, all functions should
-  // have been code-generated.  At this point we optimize all the functions.
-  if (runtime_state_->llvm_codegen() != NULL) {
-    Status status = runtime_state_->llvm_codegen()->OptimizeModule();
-    if (!status.ok()) {
-      LOG(ERROR) << "Error with codegen for this query: " << status.GetErrorMsg();
-      // TODO: propagate this to the coordinator and user?  Not really actionable
-      // for them but we'd like them to let us know.
-    }
-    // If codegen failed, we automatically fall back to not using codegen.
-  }
-
-  row_batch_.reset(new RowBatch(plan_->row_desc(), runtime_state_->batch_size()));
-  row_batch_->tuple_data_pool()->set_limits(*runtime_state_->mem_limits());
+  row_batch_.reset(new RowBatch(
+      plan_->row_desc(), runtime_state_->batch_size(), *runtime_state_->mem_limits()));
   VLOG(3) << "plan_root=\n" << plan_->DebugString();
   prepared_ = true;
   return Status::OK;
+}
+
+void PlanFragmentExecutor::OptimizeLlvmModule() {
+  if (runtime_state_->llvm_codegen() == NULL) return;
+  Status status = runtime_state_->llvm_codegen()->OptimizeModule();
+  if (!status.ok()) {
+    LOG(ERROR) << "Error with codegen for this query: " << status.GetErrorMsg();
+    // TODO: propagate this to the coordinator and user?  Not really actionable
+    // for them but we'd like them to let us know.
+  }
 }
 
 void PlanFragmentExecutor::PrintVolumeIds(
@@ -277,9 +274,9 @@ Status PlanFragmentExecutor::OpenInternal() {
   // Setting to NULL ensures that the d'tor won't double-close the sink.
   sink_.reset(NULL);
   done_ = true;
-    
+
   ReleaseThreadToken();
-    
+
   StopReportThread();
   SendReport(true);
 

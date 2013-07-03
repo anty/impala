@@ -45,6 +45,7 @@
 #include "runtime/exec-env.h"
 #include "runtime/raw-value.h"
 #include "runtime/timestamp-value.h"
+#include "service/query-exec-state.h"
 #include "statestore/simple-scheduler.h"
 #include "util/container-util.h"
 #include "util/debug-util.h"
@@ -61,8 +62,6 @@
 #include "gen-cpp/ImpalaService.h"
 #include "gen-cpp/ImpalaService_types.h"
 #include "gen-cpp/ImpalaInternalService.h"
-#include "gen-cpp/ImpalaPlanService.h"
-#include "gen-cpp/ImpalaPlanService_types.h"
 #include "gen-cpp/Frontend_types.h"
 
 using namespace std;
@@ -77,9 +76,6 @@ using namespace apache::hive::service::cli::thrift;
 using namespace beeswax;
 
 namespace impala {
-
-// Used for queries that execute instantly and always succeed
-const string NO_QUERY_HANDLE = "no_query_handle";
 
 // Ascii result set for Beeswax.
 // Beeswax returns rows in ascii, using "\t" as column delimiter.
@@ -164,13 +160,6 @@ void ImpalaServer::query(QueryHandle& query_handle, const Query& query) {
         status.GetErrorMsg(), SQLSTATE_SYNTAX_ERROR_OR_ACCESS_VIOLATION);
   }
 
-  if (exec_state.get() == NULL) {
-    // No execution required for this query (USE)
-    query_handle.id = NO_QUERY_HANDLE;
-    query_handle.log_context = NO_QUERY_HANDLE;
-    return;
-  }
-
   exec_state->UpdateQueryState(QueryState::RUNNING);
   TUniqueIdToQueryHandle(exec_state->query_id(), &query_handle);
 
@@ -208,13 +197,6 @@ void ImpalaServer::executeAndWait(QueryHandle& query_handle, const Query& query,
     // TODO: that may not be true; fix this
     RaiseBeeswaxException(
         status.GetErrorMsg(), SQLSTATE_SYNTAX_ERROR_OR_ACCESS_VIOLATION);
-  }
-
-  if (exec_state.get() == NULL) {
-    // No execution required for this query (USE)
-    query_handle.id = NO_QUERY_HANDLE;
-    query_handle.log_context = NO_QUERY_HANDLE;
-    return;
   }
 
   exec_state->UpdateQueryState(QueryState::RUNNING);
@@ -261,12 +243,6 @@ void ImpalaServer::fetch(Results& query_results, const QueryHandle& query_handle
     // We can't start over. Raise "Optional feature not implemented"
     RaiseBeeswaxException(
         "Does not support start over", SQLSTATE_OPTIONAL_FEATURE_NOT_IMPLEMENTED);
-  }
-
-  if (query_handle.id == NO_QUERY_HANDLE) {
-    query_results.ready = true;
-    query_results.has_more = false;
-    return;
   }
 
   TUniqueId query_id;
@@ -320,10 +296,6 @@ void ImpalaServer::get_results_metadata(ResultsMetadata& results_metadata,
 }
 
 void ImpalaServer::close(const QueryHandle& handle) {
-  if (handle.id == NO_QUERY_HANDLE) {
-    return;
-  }
-
   TUniqueId query_id;
   QueryHandleToTUniqueId(handle, &query_id);
   VLOG_QUERY << "close(): query_id=" << PrintId(query_id);
@@ -337,10 +309,6 @@ void ImpalaServer::close(const QueryHandle& handle) {
 }
 
 QueryState::type ImpalaServer::get_state(const QueryHandle& handle) {
-  if (handle.id == NO_QUERY_HANDLE) {
-    return QueryState::FINISHED;
-  }
-
   TUniqueId query_id;
   QueryHandleToTUniqueId(handle, &query_id);
   VLOG_ROW << "get_state(): query_id=" << PrintId(query_id);
@@ -422,9 +390,6 @@ void ImpalaServer::CloseInsert(TInsertResult& insert_result,
 // the profile_output parameter. Raises a BeeswaxException if there are any errors
 // getting the profile, such as no matching queries found.
 void ImpalaServer::GetRuntimeProfile(string& profile_output, const QueryHandle& handle) {
-  if (handle.id == NO_QUERY_HANDLE) {
-    return;
-  }
   TUniqueId query_id;
   QueryHandleToTUniqueId(handle, &query_id);
   VLOG_RPC << "GetRuntimeProfile(): query_id=" << PrintId(query_id);
@@ -502,7 +467,6 @@ inline void ImpalaServer::TUniqueIdToQueryHandle(const TUniqueId& query_id,
 
 inline void ImpalaServer::QueryHandleToTUniqueId(const QueryHandle& handle,
     TUniqueId* query_id) {
-  DCHECK_NE(handle.id, NO_QUERY_HANDLE);
   char_separator<char> sep(" ");
   tokenizer< char_separator<char> > tokens(handle.id, sep);
   int i = 0;
@@ -531,12 +495,12 @@ Status ImpalaServer::FetchInternal(const TUniqueId& query_id,
   shared_ptr<QueryExecState> exec_state = GetQueryExecState(query_id, true);
   if (exec_state == NULL) return Status("Invalid query handle");
 
+  // make sure we release the lock on exec_state if we see any error
+  lock_guard<mutex> l(*exec_state->lock(), adopt_lock_t());
+
   if (exec_state->num_rows_fetched() == 0) {
     exec_state->query_events()->MarkEvent("First row fetched");
   }
-
-  // make sure we release the lock on exec_state if we see any error
-  lock_guard<mutex> l(*exec_state->lock(), adopt_lock_t());
 
   if (exec_state->query_state() == QueryState::EXCEPTION) {
     // we got cancelled or saw an error; either way, return now

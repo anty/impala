@@ -31,6 +31,7 @@
 #include "common/version.h"
 #include "exprs/expr.h"
 #include "runtime/raw-value.h"
+#include "service/query-exec-state.h"
 #include "util/debug-util.h"
 #include "util/thrift-util.h"
 #include "util/jni-util.h"
@@ -42,8 +43,6 @@ using namespace boost::uuids;
 using namespace apache::thrift;
 using namespace apache::hive::service::cli::thrift;
 using namespace beeswax; // Converting QueryState
-
-DECLARE_bool(use_planservice);
 
 // HiveServer2 error returning macro
 #define HS2_RETURN_ERROR(return_val, error_msg, error_state) \
@@ -124,7 +123,19 @@ void ImpalaServer::ExecuteMetadataOp(const ThriftServer::SessionKey& session_key
   }
 
   shared_ptr<QueryExecState> exec_state;
-  exec_state.reset(new QueryExecState(exec_env_, this, session, TSessionState()));
+  // There is no query text available because this metadata operation
+  // comes from an RPC which does not provide the query text.
+  // TODO: Consider reconstructing the query text from the metadata operation.
+  exec_state.reset(new QueryExecState(exec_env_, this, session, TSessionState(), "N/A"));
+  Status register_status = RegisterQuery(session, exec_state);
+  if (!register_status.ok()) {
+    status->__set_statusCode(
+        apache::hive::service::cli::thrift::TStatusCode::ERROR_STATUS);
+    status->__set_errorMessage(register_status.GetErrorMsg());
+    status->__set_sqlState(SQLSTATE_GENERAL_ERROR);
+    return;
+  }
+
   // start execution of metadata first;
   Status exec_status = exec_state->Exec(request);
   if (!exec_status.ok()) {
@@ -137,17 +148,6 @@ void ImpalaServer::ExecuteMetadataOp(const ThriftServer::SessionKey& session_key
 
   exec_state->UpdateQueryState(QueryState::FINISHED);
 
-  // register exec state after execution is success
-  Status register_status = RegisterQuery(session, exec_state->query_id(), exec_state);
-  if (!register_status.ok())
-  {
-    status->__set_statusCode(
-        apache::hive::service::cli::thrift::TStatusCode::ERROR_STATUS);
-    status->__set_errorMessage(register_status.GetErrorMsg());
-    status->__set_sqlState(SQLSTATE_GENERAL_ERROR);
-    return;
-  }
-
   handle->__set_hasResultSet(true);
   // TODO: create secret for operationId
   TUniqueId operation_id = exec_state->query_id();
@@ -158,20 +158,16 @@ void ImpalaServer::ExecuteMetadataOp(const ThriftServer::SessionKey& session_key
 
 Status ImpalaServer::ExecHiveServer2MetadataOp(const TMetadataOpRequest& request,
     TMetadataOpResponse* result) {
-  if (!FLAGS_use_planservice) {
-    JNIEnv* jni_env = getJNIEnv();
-    jbyteArray request_bytes;
-    RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &request, &request_bytes));
-    jbyteArray result_bytes = static_cast<jbyteArray>(
-        jni_env->CallObjectMethod(fe_, exec_hs2_metadata_op_id_,
-            request_bytes));
-    RETURN_ERROR_IF_EXC(jni_env, JniUtil::throwable_to_string_id());
-    RETURN_IF_ERROR(DeserializeThriftMsg(jni_env, result_bytes, result));
-    return Status::OK;
-  } else {
-    return Status("HiveServer2 metadata operations are not supported with external"
-        " planservice");
-  }
+  JNIEnv* jni_env = getJNIEnv();
+  JniLocalFrame jni_frame;
+  RETURN_IF_ERROR(jni_frame.push(jni_env));
+  jbyteArray request_bytes;
+  RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &request, &request_bytes));
+  jbyteArray result_bytes = static_cast<jbyteArray>(
+      jni_env->CallObjectMethod(fe_, exec_hs2_metadata_op_id_, request_bytes));
+  RETURN_ERROR_IF_EXC(jni_env);
+  RETURN_IF_ERROR(DeserializeThriftMsg(jni_env, result_bytes, result));
+  return Status::OK;
 }
 
 Status ImpalaServer::FetchInternal(const TUniqueId& query_id, int32_t fetch_size,
@@ -231,14 +227,17 @@ void ImpalaServer::OpenSession(TOpenSessionResp& return_val,
   VLOG_QUERY << "OpenSession(): request=" << ThriftDebugString(request);
 
   // Generate session id and the secret
-  uuid sessionid = uuid_generator_();
-  uuid secret = uuid_generator_();
-  return_val.sessionHandle.sessionId.guid.assign(sessionid.begin(), sessionid.end());
-  return_val.sessionHandle.sessionId.secret.assign(secret.begin(), secret.end());
-  DCHECK_EQ(return_val.sessionHandle.sessionId.guid.size(), 16);
-  DCHECK_EQ(return_val.sessionHandle.sessionId.secret.size(), 16);
-  return_val.__isset.sessionHandle = true;
 
+  {
+    lock_guard<mutex> l(uuid_lock_);
+    uuid sessionid = uuid_generator_();
+    uuid secret = uuid_generator_();
+    return_val.sessionHandle.sessionId.guid.assign(sessionid.begin(), sessionid.end());
+    return_val.sessionHandle.sessionId.secret.assign(secret.begin(), secret.end());
+    DCHECK_EQ(return_val.sessionHandle.sessionId.guid.size(), 16);
+    DCHECK_EQ(return_val.sessionHandle.sessionId.secret.size(), 16);
+    return_val.__isset.sessionHandle = true;
+  }
   // create a session state: initialize start time, session type, database and default
   // query options.
   // TODO: put secret in session state map and check it
@@ -328,18 +327,12 @@ void ImpalaServer::ExecuteStatement(
 
   return_val.__isset.operationHandle = true;
   return_val.operationHandle.__set_operationType(TOperationType::EXECUTE_STATEMENT);
-  if (exec_state.get() == NULL) {
-    // No execution required for this query (USE)
-    // Leave operation handle identifier empty
-    return_val.operationHandle.__set_hasResultSet(false);
-    return;
-  }
 
   exec_state->UpdateQueryState(QueryState::RUNNING);
-  return_val.operationHandle.__set_hasResultSet(true);
+  return_val.operationHandle.__set_hasResultSet(exec_state->returns_result_set());
   // TODO: create secret for operationId and store the secret in exec_state
   TUniqueIdToTHandleIdentifier(exec_state->query_id(), exec_state->query_id(),
-      &return_val.operationHandle.operationId);
+                               &return_val.operationHandle.operationId);
 
   // start thread to wait for results to become available, which will allow
   // us to advance query state to FINISHED or EXCEPTION
@@ -534,14 +527,6 @@ void ImpalaServer::CancelOperation(
 void ImpalaServer::CloseOperation(
     TCloseOperationResp& return_val,
     const TCloseOperationReq& request) {
-  if (request.operationHandle.operationId.guid.size() == 0) {
-    // An empty operation handle identifier means no execution and no result for this
-    // query (USE <database>).
-    return_val.status.__set_statusCode(
-        apache::hive::service::cli::thrift::TStatusCode::SUCCESS_STATUS);
-    return;
-  }
-
   TUniqueId query_id;
   TUniqueId secret;
   THandleIdentifierToTUniqueId(request.operationHandle.operationId, &query_id, &secret);
@@ -608,15 +593,6 @@ void ImpalaServer::FetchResults(TFetchResultsResp& return_val,
         SQLSTATE_OPTIONAL_FEATURE_NOT_IMPLEMENTED);
   }
 
-  if (request.operationHandle.operationId.guid.size() == 0) {
-    // An empty operation handle identifier means no execution and no result for this
-    // query (USE <database>).
-    return_val.__set_hasMoreRows(false);
-    return_val.status.__set_statusCode(
-        apache::hive::service::cli::thrift::TStatusCode::SUCCESS_STATUS);
-    return;
-  }
-
   // Convert Operation id to TUniqueId and get the query exec state.
   // TODO: check secret
   TUniqueId query_id;
@@ -634,6 +610,29 @@ void ImpalaServer::FetchResults(TFetchResultsResp& return_val,
   }
   return_val.status.__set_statusCode(
       apache::hive::service::cli::thrift::TStatusCode::SUCCESS_STATUS);
+}
+
+void ImpalaServer::GetLog(TGetLogResp& return_val, const TGetLogReq& request) {
+  // Convert Operation id to TUniqueId and get the query exec state.
+  TUniqueId query_id;
+  TUniqueId secret;
+  THandleIdentifierToTUniqueId(request.operationHandle.operationId, &query_id, &secret);
+
+  shared_ptr<QueryExecState> exec_state = GetQueryExecState(query_id, false);
+  if (exec_state.get() == NULL) {
+    // No handle was found
+    HS2_RETURN_ERROR(return_val, "Invalid query handle", SQLSTATE_GENERAL_ERROR);
+  }
+  if (exec_state->coord() != NULL) {
+    // Report progress and all errors
+    // Hue parses the progress string to do progress indication.
+    stringstream ss;
+    ss << exec_state->coord()->progress().ToString() << "\n";
+    ss << exec_state->coord()->GetErrorLog();
+    return_val.log = ss.str();
+    return_val.status.__set_statusCode(
+        apache::hive::service::cli::thrift::TStatusCode::SUCCESS_STATUS);
+  }
 }
 
 void ImpalaServer::ResetCatalog(TResetCatalogResp& return_val) {

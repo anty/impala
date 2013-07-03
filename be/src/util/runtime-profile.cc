@@ -95,6 +95,14 @@ RuntimeProfile* RuntimeProfile::CreateFromThrift(ObjectPool* pool,
     profile->counter_map_[counter.name] =
       pool->Add(new Counter(counter.type, counter.value));
   }
+
+  if (node.__isset.event_sequences) {
+    BOOST_FOREACH(const TEventSequence& sequence, node.event_sequences) {
+      profile->event_sequence_map_[sequence.name] =
+          pool->Add(new EventSequence(sequence.timestamps, sequence.labels));
+    }
+  }
+
   profile->child_counter_map_ = node.child_counters_map;
   profile->info_strings_ = node.info_strings;
   profile->info_strings_display_order_ = node.info_strings_display_order;
@@ -409,6 +417,14 @@ void RuntimeProfile::GetCounters(const string& name, vector<Counter*>* counters)
   }
 }
 
+RuntimeProfile::EventSequence* RuntimeProfile::GetEventSequence(const string& name) const
+{
+  lock_guard<mutex> l(event_sequence_lock_);
+  EventSequenceMap::const_iterator it = event_sequence_map_.find(name);
+  if (it == event_sequence_map_.end()) return NULL;
+  return it->second;
+}
+
 // Print the profile:
 //  1. Profile Name
 //  2. Info Strings
@@ -456,7 +472,7 @@ void RuntimeProfile::PrettyPrint(ostream* s, const string& prefix) const {
     //     - Event 2: 2s288ms (2s288ms)
     //     - Event 3: 2s410ms (121.138ms)
     // The times in parentheses are the time elapsed since the last event.
-    lock_guard<mutex> l(event_sequences_lock_);
+    lock_guard<mutex> l(event_sequence_lock_);
     BOOST_FOREACH(
         const EventSequenceMap::value_type& event_sequence, event_sequence_map_) {
       stream << prefix << "  " << event_sequence.first << ": "
@@ -512,10 +528,11 @@ void RuntimeProfile::SerializeToArchiveString(stringstream* out) const {
   // easy to compress.
   GzipCompressor compressor(GzipCompressor::ZLIB);
   vector<uint8_t> compressed_buffer;
-  compressed_buffer.resize(compressor.MaxCompressedLen(serialized_buffer.size()));
+  compressed_buffer.resize(compressor.MaxOutputLen(serialized_buffer.size()));
   int result_len = compressed_buffer.size();
-  compressor.Compress(serialized_buffer.size(), &serialized_buffer[0], &result_len,
-      &compressed_buffer[0]);
+  uint8_t* compressed_buffer_ptr = &compressed_buffer[0];
+  compressor.ProcessBlock(serialized_buffer.size(), &serialized_buffer[0],
+      &result_len, &compressed_buffer_ptr);
   compressed_buffer.resize(result_len);
 
   Base64Encode(compressed_buffer, out);
@@ -557,6 +574,23 @@ void RuntimeProfile::ToThrift(vector<TRuntimeProfileNode>* nodes) {
     node.info_strings = info_strings_;
     node.info_strings_display_order = info_strings_display_order_;
   }
+
+  {
+    lock_guard<mutex> l(event_sequence_lock_);
+    if (event_sequence_map_.size() != 0) {
+      node.__set_event_sequences(vector<TEventSequence>());
+      BOOST_FOREACH(const EventSequenceMap::value_type& val, event_sequence_map_) {
+        TEventSequence seq;
+        seq.name = val.first;
+        BOOST_FOREACH(const EventSequence::Event& ev, val.second->events()) {
+          seq.labels.push_back(ev.first);
+          seq.timestamps.push_back(ev.second);
+        }
+        node.event_sequences.push_back(seq);
+      }
+    }
+  }
+
 
   ChildVector children;
   {
@@ -632,18 +666,11 @@ RuntimeProfile::Counter* RuntimeProfile::AddSamplingCounter(
   return dst_counter;
 }
 
-void RuntimeProfile::AddBucketingCounters(const string& name,
-    const string& parent_counter_name, Counter* src_counter,
-    int num_buckets, vector<Counter*>* buckets) {
+void RuntimeProfile::RegisterBucketingCounters(Counter* src_counter,
+    vector<Counter*>* buckets) {
   {
     lock_guard<mutex> l(counter_map_lock_);
     bucketing_counters_.insert(buckets);
-  }
-  for (int i = 0; i < num_buckets; ++i) {
-    stringstream counter_name;
-    counter_name << name << "=" << i;
-    buckets->push_back(AddCounter(counter_name.str(), TCounterType::DOUBLE_VALUE,
-        parent_counter_name));
   }
 
   lock_guard<mutex> l(periodic_counter_update_state_.lock);
@@ -658,7 +685,7 @@ void RuntimeProfile::AddBucketingCounters(const string& name,
 }
 
 RuntimeProfile::EventSequence* RuntimeProfile::AddEventSequence(const string& name) {
-  lock_guard<mutex> l(event_sequences_lock_);
+  lock_guard<mutex> l(event_sequence_lock_);
   EventSequenceMap::iterator timer_it = event_sequence_map_.find(name);
   if (timer_it != event_sequence_map_.end()) return timer_it->second;
 

@@ -38,7 +38,7 @@ HdfsTextScanner::HdfsTextScanner(HdfsScanNode* scan_node, RuntimeState* state)
       byte_buffer_ptr_(NULL),
       byte_buffer_end_(NULL),
       byte_buffer_read_size_(0),
-      boundary_mem_pool_(new MemPool()),
+      boundary_mem_pool_(new MemPool(state->mem_limits())),
       boundary_row_(boundary_mem_pool_.get()),
       boundary_column_(boundary_mem_pool_.get()),
       slot_idx_(0),
@@ -109,7 +109,8 @@ void HdfsTextScanner::InitNewRange(ScannerContext* context) {
   delimited_text_parser_.reset(new DelimitedTextParser(scan_node_,
       hdfs_partition->line_delim(), field_delim, collection_delim,
       hdfs_partition->escape_char()));
-  text_converter_.reset(new TextConverter(hdfs_partition->escape_char()));
+  text_converter_.reset(new TextConverter(hdfs_partition->escape_char(),
+      scan_node_->hdfs_table()->null_column_value()));
 
   ResetScanner();
 }

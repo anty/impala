@@ -46,9 +46,6 @@
 
 #include "gen-cpp/PlanNodes_types.h"
 
-// TODO: temp change to validate we don't have an incast problem for joins with big tables
-DEFINE_bool(randomize_splits, false, 
-    "if true, randomizes the order of splits");
 DEFINE_int32(max_row_batches, 0, "the maximum size of materialized_row_batches_");
 
 using namespace boost;
@@ -68,7 +65,6 @@ HdfsScanNode::HdfsScanNode(ObjectPool* pool, const TPlanNode& tnode,
       reader_context_(NULL),
       tuple_desc_(NULL),
       unknown_disk_id_warned_(false),
-      tuple_pool_(new MemPool()),
       num_unqueued_files_(0),
       scanner_pool_(new ObjectPool()),
       num_partition_keys_(0),
@@ -79,7 +75,6 @@ HdfsScanNode::HdfsScanNode(ObjectPool* pool, const TPlanNode& tnode,
       num_queued_io_buffers_(0),
       max_queued_io_buffers_(0),
       num_blocked_scanners_(0),
-      partition_key_pool_(new MemPool()),
       counters_reported_(false),
       disks_accessed_bitmap_(TCounterType::UNIT, 0) {
   max_materialized_row_batches_ = FLAGS_max_row_batches;
@@ -345,8 +340,8 @@ Status HdfsScanNode::Prepare(RuntimeState* state) {
   // One-time initialisation of state that is constant across scan ranges
   DCHECK(tuple_desc_->table_desc() != NULL);
   hdfs_table_ = static_cast<const HdfsTableDescriptor*>(tuple_desc_->table_desc());
-  tuple_pool_->set_limits(*state->mem_limits());
-  partition_key_pool_->set_limits(*state->mem_limits());
+  tuple_pool_.reset(new MemPool(state->mem_limits()));
+  partition_key_pool_.reset(new MemPool(state->mem_limits()));
   compact_data_ |= tuple_desc_->string_slots().empty();
 
   // Create mapping from column index in table to slot index in output tuple.
@@ -478,9 +473,14 @@ Status HdfsScanNode::Open(RuntimeState* state) {
       AVERAGE_SCANNER_THREAD_CONCURRENCY, &active_scanner_thread_counter_);
   average_hdfs_read_thread_concurrency_ = runtime_profile()->AddSamplingCounter(
       AVERAGE_HDFS_READ_THREAD_CONCURRENCY, &active_hdfs_read_thread_counter_);
-  runtime_profile()->AddBucketingCounters(HDFS_READ_THREAD_CONCURRENCY_BUCKET,
-      AVERAGE_HDFS_READ_THREAD_CONCURRENCY, &active_hdfs_read_thread_counter_,
-      state->io_mgr()->num_disks() + 1, &hdfs_read_thread_concurrency_bucket_);
+
+  // Create num_disks+1 bucket counters
+  for (int i = 0; i < state->io_mgr()->num_disks() + 1; ++i) {
+    hdfs_read_thread_concurrency_bucket_.push_back(
+        pool_->Add(new RuntimeProfile::Counter(TCounterType::DOUBLE_VALUE, 0)));
+  }
+  runtime_profile()->RegisterBucketingCounters(&active_hdfs_read_thread_counter_,
+      &hdfs_read_thread_concurrency_bucket_);
 
   int total_splits = 0;
   // Walk all the files on this node and coalesce all the files with the same
@@ -517,20 +517,6 @@ Status HdfsScanNode::Open(RuntimeState* state) {
   stringstream ss;
   ss << "Splits complete (node=" << id() << "):";
   progress_ = ProgressUpdater(ss.str(), total_splits);
-
-  if (FLAGS_randomize_splits) {
-    unsigned int seed = time(NULL);
-    srand(seed);
-    VLOG_QUERY << "Randomizing scan range order with seed=" << seed;
-    map<THdfsFileFormat::type, vector<HdfsFileDesc*> >::iterator it;
-    for (it = per_type_files.begin(); it != per_type_files.end(); ++it) {
-      vector<HdfsFileDesc*>& file_descs = it->second;
-      for (int i = 0; i < file_descs.size(); ++i) {
-        random_shuffle(file_descs[i]->splits.begin(), file_descs[i]->splits.end());
-      }
-      random_shuffle(file_descs.begin(), file_descs.end());
-    }
-  }
 
   // Issue initial ranges for all file types.
   HdfsTextScanner::IssueInitialRanges(this, per_type_files[THdfsFileFormat::TEXT]);
@@ -911,6 +897,14 @@ void HdfsScanNode::UpdateCounters() {
   runtime_profile()->StopBucketingCountersUpdates(&hdfs_read_thread_concurrency_bucket_,
       true);
 
+  // Output hdfs read thread concurrency into info string
+  stringstream ss;
+  for (int i = 0; i < hdfs_read_thread_concurrency_bucket_.size(); ++i) {
+    ss << i << ":" << setprecision(4) 
+       << hdfs_read_thread_concurrency_bucket_[i]->double_value() << "% ";
+  }
+  runtime_profile_->AddInfoString("Hdfs Read Thread Concurrency Bucket", ss.str());
+
   // Convert disk access bitmap to num of disk accessed
   uint64_t num_disk_bitmap = disks_accessed_bitmap_.value();
   int64_t num_disk_accessed = BitUtil::Popcount(num_disk_bitmap);
@@ -929,7 +923,7 @@ void HdfsScanNode::UpdateCounters() {
   }
   
   // Output fraction of scanners with codegen enabled
-  stringstream ss;
+  ss.str(std::string()); 
   ss << "Codegen enabled: " << num_scanners_codegen_enabled_ << " out of "
      << (num_scanners_codegen_enabled_ + num_scanners_codegen_disabled_);
   AddRuntimeExecOption(ss.str());

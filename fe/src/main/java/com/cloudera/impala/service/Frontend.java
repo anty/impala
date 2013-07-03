@@ -19,7 +19,6 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 
 import org.apache.hadoop.hive.metastore.api.AlreadyExistsException;
 import org.apache.hadoop.hive.metastore.api.InvalidObjectException;
@@ -38,6 +37,7 @@ import com.cloudera.impala.analysis.InsertStmt;
 import com.cloudera.impala.analysis.QueryStmt;
 import com.cloudera.impala.analysis.TableName;
 import com.cloudera.impala.catalog.Catalog;
+import com.cloudera.impala.catalog.Catalog.DatabaseNotFoundException;
 import com.cloudera.impala.catalog.Column;
 import com.cloudera.impala.catalog.Db;
 import com.cloudera.impala.catalog.Db.TableLoadingException;
@@ -57,10 +57,12 @@ import com.cloudera.impala.thrift.TCatalogUpdate;
 import com.cloudera.impala.thrift.TClientRequest;
 import com.cloudera.impala.thrift.TColumnDef;
 import com.cloudera.impala.thrift.TColumnDesc;
+import com.cloudera.impala.thrift.TColumnValue;
 import com.cloudera.impala.thrift.TDdlExecRequest;
 import com.cloudera.impala.thrift.TDdlType;
 import com.cloudera.impala.thrift.TExecRequest;
 import com.cloudera.impala.thrift.TExplainLevel;
+import com.cloudera.impala.thrift.TExplainResult;
 import com.cloudera.impala.thrift.TFinalizeParams;
 import com.cloudera.impala.thrift.TMetadataOpRequest;
 import com.cloudera.impala.thrift.TMetadataOpResponse;
@@ -68,9 +70,9 @@ import com.cloudera.impala.thrift.TPartitionKeyValue;
 import com.cloudera.impala.thrift.TPlanFragment;
 import com.cloudera.impala.thrift.TPrimitiveType;
 import com.cloudera.impala.thrift.TQueryExecRequest;
+import com.cloudera.impala.thrift.TResultRow;
 import com.cloudera.impala.thrift.TResultSetMetadata;
 import com.cloudera.impala.thrift.TStmtType;
-import com.cloudera.impala.thrift.TUniqueId;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -391,24 +393,11 @@ public class Frontend {
         request.sessionState.database, request.sessionState.user);
     AnalysisContext.AnalysisResult analysisResult = null;
     LOG.info("analyze query " + request.stmt);
-    try {
-      analysisResult = analysisCtxt.analyze(request.stmt);
-    } catch (AnalysisException e) {
-      // Write the entire stack trace of e to the log (first param is an empty message).
-      LOG.info("", e);
-      throw e;
-    }
+    analysisResult = analysisCtxt.analyze(request.stmt);
     Preconditions.checkNotNull(analysisResult.getStmt());
 
     TExecRequest result = new TExecRequest();
-    result.setSql_stmt(request.stmt);
     result.setQuery_options(request.getQueryOptions());
-
-    // assign request_id
-    UUID requestId = UUID.randomUUID();
-    result.setRequest_id(
-        new TUniqueId(requestId.getMostSignificantBits(),
-                      requestId.getLeastSignificantBits()));
 
     if (analysisResult.isDdlStmt()) {
       result.stmt_type = TStmtType.DDL;
@@ -420,7 +409,6 @@ public class Frontend {
     Preconditions.checkState(
         analysisResult.isQueryStmt() || analysisResult.isDmlStmt());
     TQueryExecRequest queryExecRequest = new TQueryExecRequest();
-    result.setQuery_exec_request(queryExecRequest);
 
     // create plan
     LOG.info("create plan");
@@ -434,18 +422,21 @@ public class Frontend {
     for (PlanFragment fragment: fragments) {
       TPlanFragment thriftFragment = fragment.toThrift();
       queryExecRequest.addToFragments(thriftFragment);
-      if (fragment.getPlanRoot() != null) {
-        fragment.getPlanRoot().collectSubclasses(ScanNode.class, scanNodes);
-      }
+      Preconditions.checkNotNull(fragment.getPlanRoot());
+      fragment.getPlanRoot().collectSubclasses(ScanNode.class, scanNodes);
       fragmentIdx.put(fragment, queryExecRequest.fragments.size() - 1);
     }
     explainString.append(planner.getExplainString(fragments, TExplainLevel.VERBOSE));
     queryExecRequest.setQuery_plan(explainString.toString());
-    if (fragments.get(0).getPlanRoot() != null) {
-      // a SELECT without FROM clause will only have a single fragment, which won't
-      // have a plan tree
-      queryExecRequest.setDesc_tbl(analysisResult.getAnalyzer().getDescTbl().toThrift());
+    queryExecRequest.setDesc_tbl(analysisResult.getAnalyzer().getDescTbl().toThrift());
+
+    if (analysisResult.isExplainStmt()) {
+      // Return the EXPLAIN request
+      createExplainRequest(explainString.toString(), result);
+      return result;
     }
+
+    result.setQuery_exec_request(queryExecRequest);
 
     // set fragment destinations
     for (int i = 1; i < fragments.size(); ++i) {
@@ -506,6 +497,29 @@ public class Frontend {
   }
 
   /**
+   * Attaches the explain result to the TExecRequest.
+   */
+  private void createExplainRequest(String explainString, TExecRequest result) {
+    // update the metadata - one string column
+    TColumnDesc colDesc = new TColumnDesc("Explain String", TPrimitiveType.STRING);
+    TResultSetMetadata metadata = new TResultSetMetadata(Lists.newArrayList(colDesc));
+    result.setResult_set_metadata(metadata);
+
+    // create the explain result set - split the explain string into one line per row
+    String[] explainStringArray = explainString.toString().split("\n");
+    TExplainResult explainResult = new TExplainResult();
+    explainResult.results = Lists.newArrayList();
+    for (int i = 0; i < explainStringArray.length; ++i) {
+      TColumnValue col = new TColumnValue();
+      col.setStringVal(explainStringArray[i]);
+      TResultRow row = new TResultRow(Lists.newArrayList(col));
+      explainResult.results.add(row);
+    }
+    result.setExplain_result(explainResult);
+    result.stmt_type = TStmtType.EXPLAIN;
+  }
+
+  /**
    * Executes a HiveServer2 metadata operation and returns a TMetadataOpResponse
    */
   public TMetadataOpResponse execHiveServer2MetadataOp(TMetadataOpRequest request)
@@ -543,11 +557,12 @@ public class Frontend {
   }
 
   /**
-   * Create any new partitions required as a result of an INSERT statement
+   * Create any new partitions required as a result of an INSERT statement.
+   * Updates the lastDdlTime of the table if new partitions were created.
    */
   public void updateMetastore(TCatalogUpdate update) throws ImpalaException {
     // Only update metastore for Hdfs tables.
-    Table table = catalog.getDb(update.getDb_name()).getTable(update.getTarget_table());
+    Table table = catalog.getTable(update.getDb_name(), update.getTarget_table());
     if (!(table instanceof HdfsTable)) {
       LOG.warn("Unexpected table type in updateMetastore: "
           + update.getTarget_table());
@@ -556,14 +571,16 @@ public class Frontend {
 
     String dbName = table.getDb().getName();
     String tblName = table.getName();
-    if (table.getNumClusteringCols() > 0) {
-      MetaStoreClient msClient = catalog.getMetaStoreClient();
-      try {
+    MetaStoreClient msClient = catalog.getMetaStoreClient();
+    try {
+      boolean addedNewPartition = false;
+      if (table.getNumClusteringCols() > 0) {
         // Add all partitions to metastore.
         for (String partName: update.getCreated_partitions()) {
           try {
             LOG.info("Creating partition: " + partName + " in table: " + tblName);
             msClient.getHiveClient().appendPartitionByName(dbName, tblName, partName);
+            addedNewPartition = true;
           } catch (AlreadyExistsException e) {
             LOG.info("Ignoring partition " + partName + ", since it already exists");
             // Ignore since partition already exists.
@@ -571,10 +588,21 @@ public class Frontend {
             throw new InternalException("Error updating metastore", e);
           }
         }
-      } finally {
-        msClient.release();
       }
+      if (addedNewPartition) {
+        try {
+          // Update the last DDL time of the table.
+          org.apache.hadoop.hive.metastore.api.Table msTbl =
+              table.getMetaStoreTable().deepCopy();
+          Catalog.updateLastDdlTime(msTbl, msClient);
+        } catch (Exception e) {
+          throw new InternalException("Error updating lastDdlTime", e);
+        }
+      }
+    } finally {
+      msClient.release();
     }
+
     // Mark the table metadata as invalid so it will be reloaded on the next access.
     LOG.info("Invalidating table metadata: " + dbName + "." + tblName);
     catalog.invalidateTable(dbName, tblName, true);

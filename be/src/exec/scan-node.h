@@ -44,7 +44,7 @@ class TScanRange;
 //
 //   NumDisksAccessed - number of disks accessed.
 //
-//   AverageIoMgrQueueCapcity - the average queue capacity in the io mgr for this node.
+//   AverageIoMgrQueueCapacity - the average queue capacity in the io mgr for this node.
 //   AverageIoMgrQueueSize - the average queue size (for ready buffers) in the io mgr
 //     for this node.
 //
@@ -62,8 +62,8 @@ class TScanRange;
 //     reading for this scan node. For IO bound queries, this should be close to the
 //     number of disk.
 //
-//     HdfsReadThreadConcurrencyCount=<i> - the number of samples taken when the hdfs read
-//       thread concurrency is <i>.
+//   Hdfs Read Thread Concurrency Bucket - the bucket counting (%) of hdfs read thread
+//     concurrency.
 //
 //   ScanRangesComplete - number of scan ranges completed
 //
@@ -132,7 +132,6 @@ class ScanNode : public ExecNode {
   static const std::string AVERAGE_IO_MGR_QUEUE_CAPACITY;
   static const std::string AVERAGE_IO_MGR_QUEUE_SIZE;
   static const std::string AVERAGE_HDFS_READ_THREAD_CONCURRENCY;
-  static const std::string HDFS_READ_THREAD_CONCURRENCY_BUCKET;
 
  protected:
   RuntimeProfile::Counter* bytes_read_counter_; // # bytes read from the scanner

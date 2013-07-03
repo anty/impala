@@ -44,6 +44,8 @@ std::ostream& operator<<(std::ostream& os, const THdfsCompression::type& type);
 std::ostream& operator<<(std::ostream& os, const TStmtType::type& type);
 std::ostream& operator<<(std::ostream& os, const beeswax::QueryState::type& type);
 std::ostream& operator<<(std::ostream& os, const parquet::Encoding::type& type);
+std::ostream& operator<<(std::ostream& os, const parquet::CompressionCodec::type& type);
+std::ostream& operator<<(std::ostream& os, const parquet::Type::type& type);
 
 std::string PrintTuple(const Tuple* t, const TupleDescriptor& d);
 std::string PrintRow(TupleRow* row, const RowDescriptor& d);
@@ -52,6 +54,7 @@ std::string PrintId(const TUniqueId& id);
 std::string PrintPlanNodeType(const TPlanNodeType::type& type);
 std::string PrintTStmtType(const TStmtType::type& type);
 std::string PrintQueryState(const beeswax::QueryState::type& type);
+std::string PrintEncoding(const parquet::Encoding::type& type);
 
 // Parse 's' into a TUniqueId object.  The format of s needs to be the output format
 // from PrintId.  (<hi_part>:<low_part>)

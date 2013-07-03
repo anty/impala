@@ -82,7 +82,13 @@ import com.google.common.collect.Sets;
  * This class is not thread-safe due to the static counter variable inside HdfsPartition.
  */
 public class HdfsTable extends Table {
-  // Hive uses this string for NULL partition keys. Set in load().
+  // hive's default value for table property 'serialization.null.format'
+  private static final String DEFAULT_NULL_COLUMN_VALUE = "\\N";
+
+  // string to indicate NULL. set in load() from table properties
+  private String nullColumnValue;
+
+  // hive uses this string for NULL partition keys. Set in load().
   private String nullPartitionKeyValue;
 
   private static boolean hasLoggedDiskIdFormatWarning = false;
@@ -458,6 +464,10 @@ public class HdfsTable extends Table {
     return nullPartitionKeyValue;
   }
 
+  public String getNullColumnValue() {
+    return nullColumnValue;
+  }
+
   /**
    * Gets the HdfsPartition matching the given partition spec. Returns null if no match
    * was found.
@@ -706,9 +716,8 @@ List<org.apache.hadoop.hive.metastore.api.Partition> msPartitions,
         HdfsStorageDescriptor.fromStorageDescriptor(this.name, storageDescriptor);
     Path path = new Path(storageDescriptor.getLocation());
     List<FileDescriptor> fileDescriptors = Lists.newArrayList();
-    FileSystem fs = path.getFileSystem(new Configuration());
-    if (fs.exists(path)) {
-      for (FileStatus fileStatus: fs.listStatus(path)) {
+    if (DFS.exists(path)) {
+      for (FileStatus fileStatus: DFS.listStatus(path)) {
         String fileName = fileStatus.getPath().getName().toString();
         if (fileName.startsWith(".") || fileName.startsWith("_")) {
           // Ignore hidden file starting with . or _
@@ -789,6 +798,11 @@ List<org.apache.hadoop.hive.metastore.api.Partition> msPartitions,
           client.getConfigValue("hive.exec.default.partition.name",
           "__HIVE_DEFAULT_PARTITION__");
 
+      // set NULL indicator string from table properties
+      nullColumnValue =
+          msTbl.getParameters().get(serdeConstants.SERIALIZATION_NULL_FORMAT);
+      if (nullColumnValue == null) nullColumnValue = DEFAULT_NULL_COLUMN_VALUE;
+
       // populate with both partition keys and regular columns
       List<FieldSchema> partKeys = msTbl.getPartitionKeys();
       List<FieldSchema> tblFields = client.getFields(db.getName(), name);
@@ -831,7 +845,7 @@ List<org.apache.hadoop.hive.metastore.api.Partition> msPartitions,
       idToValue.put(partition.getId(), partition.toThrift());
     }
     THdfsTable tHdfsTable = new THdfsTable(hdfsBaseDir,
-        colNames, nullPartitionKeyValue, idToValue,colTypes);
+        colNames, nullPartitionKeyValue, nullColumnValue, idToValue,colTypes);
     if(!keyColNames.isEmpty()){
         tHdfsTable.setKeyColNames(keyColNames);
     }

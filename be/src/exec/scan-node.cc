@@ -36,13 +36,11 @@ const string ScanNode::SCANNER_THREAD_TOTAL_WALLCLOCK_TIME =
 const string ScanNode::AVERAGE_SCANNER_THREAD_CONCURRENCY =
     "AverageScannerThreadConcurrency";
 const string ScanNode::AVERAGE_IO_MGR_QUEUE_CAPACITY =
-    "AverageIoMgrQueueCapcity";
+    "AverageIoMgrQueueCapacity";
 const string ScanNode::AVERAGE_IO_MGR_QUEUE_SIZE =
     "AverageIoMgrQueueSize";
 const string ScanNode::AVERAGE_HDFS_READ_THREAD_CONCURRENCY =
     "AverageHdfsReadThreadConcurrency";
-const string ScanNode::HDFS_READ_THREAD_CONCURRENCY_BUCKET =
-    "HdfsReadThreadConcurrencyCountPercentage";
 
 Status ScanNode::Prepare(RuntimeState* state) {
   RETURN_IF_ERROR(ExecNode::Prepare(state));

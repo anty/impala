@@ -33,6 +33,7 @@
 #include <boost/algorithm/string.hpp>
 
 #include "common/logging.h"
+#include "exprs/expr.h"
 #include "exec/data-sink.h"
 #include "runtime/client-cache.h"
 #include "runtime/data-stream-sender.h"
@@ -277,7 +278,7 @@ static void ProcessQueryOptions(
 
 Status Coordinator::Exec(
     const TUniqueId& query_id, TQueryExecRequest* request,
-    const TQueryOptions& query_options) {
+    const TQueryOptions& query_options, vector<Expr*>* output_exprs) {
   DCHECK_GT(request->fragments.size(), 0);
   needs_finalization_ = request->__isset.finalize_params;
   if (needs_finalization_) {
@@ -317,11 +318,24 @@ Status Coordinator::Exec(
     // will be the case, the exception is parallel INSERT queries), start
     // this before starting any more plan fragments in backend threads,
     // otherwise they start sending data before the local exchange node
-    // had a chance to register with the stream mgr
+    // had a chance to register with the stream mgr.
     TExecPlanFragmentParams rpc_params;
     SetExecPlanFragmentParams(
         0, request->fragments[0], 0, fragment_exec_params_[0], 0, coord, &rpc_params);
     RETURN_IF_ERROR(executor_->Prepare(rpc_params));
+
+    // Prepare output_exprs before optimizing the LLVM module. The other exprs of this
+    // coordinator fragment have been prepared in executor_->Prepare().
+    DCHECK(output_exprs != NULL);
+    RETURN_IF_ERROR(Expr::CreateExprTrees(
+        runtime_state()->obj_pool(), request->fragments[0].output_exprs, output_exprs));
+    for (int i = 0; i < output_exprs->size(); ++i) {
+      RETURN_IF_ERROR(
+          Expr::Prepare((*output_exprs)[i], runtime_state(), row_desc(), false));
+    }
+
+    // Run optimization only after preparing the executor and the output exprs.
+    executor_->OptimizeLlvmModule();
   } else {
     executor_.reset(NULL);
   }
@@ -351,12 +365,15 @@ Status Coordinator::Exec(
     ss << "Averaged Fragment " << i;
     fragment_profiles_[i].averaged_profile =
         obj_pool()->Add(new RuntimeProfile(obj_pool(), ss.str()));
-    // Insert the avg profile after the coordinator one or the aggregate
-    // profile if there is no coordinator.
-    if (executor_.get() != NULL) {
-      query_profile_->AddChild(
-          fragment_profiles_[i].averaged_profile, true, executor_->profile());
-    }
+    // Insert the avg profiles in ascending fragment number order. If
+    // there is a coordinator fragment, it's been placed in
+    // fragment_profiles_[0].averaged_profile, ensuring that this code
+    // will put the first averaged profile immediately after it. If
+    // there is no coordinator fragment, the first averaged profile
+    // will be inserted as the first child of query_profile_, and then
+    // all other averaged fragments will follow.
+    query_profile_->AddChild(fragment_profiles_[i].averaged_profile, true,
+        (i > 0) ? fragment_profiles_[i-1].averaged_profile : NULL);
 
     ss.str("");
     ss << "Fragment " << i;
@@ -1222,7 +1239,7 @@ void Coordinator::ComputeFragmentExecParams(const TQueryExecRequest& exec_reques
     for (int j = 0; j < dest_params.hosts.size(); ++j) {
       TPlanFragmentDestination& dest = params.destinations[j];
       dest.fragment_instance_id = dest_params.instance_ids[j];
-      dest.server = TNetworkAddress(dest_params.hosts[j]);
+      dest.server = dest_params.hosts[j];
       VLOG_RPC  << "dest for fragment " << i << ":"
                 << " instance_id=" << dest.fragment_instance_id
                 << " server=" << dest.server;
@@ -1378,7 +1395,8 @@ Status Coordinator::ComputeScanRangeAssignment(
     int volume_id = -1;
     BOOST_FOREACH(const TScanRangeLocation& location, scan_range_locations.locations) {
       // Deprioritize non-collocated datanodes by assigning a very high initial bytes
-      uint64_t initial_bytes = (!exec_env_->scheduler()->HasLocalHost(location.server)) ?
+      uint64_t initial_bytes =
+          (!exec_env_->scheduler()->HasLocalBackend(location.server)) ?
           numeric_limits<int64_t>::max() : 0L;
       uint64_t* assigned_bytes =
           FindOrInsert(&assigned_bytes_per_host, location.server, initial_bytes);
@@ -1404,7 +1422,9 @@ Status Coordinator::ComputeScanRangeAssignment(
 
     TNetworkAddress exec_hostport;
     if (!exec_at_coord) {
-      RETURN_IF_ERROR(exec_env_->scheduler()->GetHost(*data_host, &exec_hostport));
+      TBackendDescriptor backend;
+      RETURN_IF_ERROR(exec_env_->scheduler()->GetBackend(*data_host, &backend));
+      exec_hostport = backend.address;
     } else {
       exec_hostport = MakeNetworkAddress(FLAGS_hostname, FLAGS_be_port);
     }

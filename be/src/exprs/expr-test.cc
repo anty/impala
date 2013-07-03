@@ -63,6 +63,7 @@ using namespace Apache::Hadoop::Hive;
 
 namespace impala {
 ImpaladQueryExecutor* executor_;
+bool disable_codegen_;
 
 class ExprTest : public testing::Test {
  protected:
@@ -453,12 +454,9 @@ class ExprTest : public testing::Test {
   template <typename T> void TestFixedPointLimits(PrimitiveType type) {
     // cast to non-char type first, otherwise we might end up interpreting
     // the min/max as an ascii value
-    // We need to add 1 to t_min because there are no negative integer literals.
-    // The reason is that whether a minus belongs to an
-    // arithmetic expr or a literal must be decided by the parser, not the lexer.
-    int64_t t_min = numeric_limits<T>::min() + 1;
+    int64_t t_min = numeric_limits<T>::min();
     int64_t t_max = numeric_limits<T>::max();
-    TestValue(lexical_cast<string>(t_min), type, numeric_limits<T>::min() + 1);
+    TestValue(lexical_cast<string>(t_min), type, numeric_limits<T>::min());
     TestValue(lexical_cast<string>(t_max), type, numeric_limits<T>::max());
   }
 
@@ -494,7 +492,7 @@ class ExprTest : public testing::Test {
 
   // Test int ops that promote to assignment compatible type: BITAND, BITOR, BITXOR,
   // BITNOT, INT_DIVIDE, MOD.
-  // As a convention we use RightOp should denote the higher resolution type.
+  // As a convention we use RightOp as the higher resolution type.
   template <typename LeftOp, typename RightOp>
   void TestVariableResultTypeIntOps(LeftOp a, RightOp b, PrimitiveType expected_type) {
     RightOp cast_a = static_cast<RightOp>(a);
@@ -590,27 +588,6 @@ class ExprTest : public testing::Test {
   }
 };
 
-// TODO: Remove this specialization once the parser supports
-// int literals with value numeric_limits<int64_t>::min().
-// Currently the parser can handle negative int literals up to
-// numeric_limits<int64_t>::min()+1.
-template <>
-void ExprTest::TestFixedPointComparisons<int64_t>(bool test_boundaries) {
-  int64_t t_min = numeric_limits<int64_t>::min() + 1;
-  int64_t t_max = numeric_limits<int64_t>::max();
-  TestComparison(lexical_cast<string>(t_min), lexical_cast<string>(t_max), true);
-  TestEqual(lexical_cast<string>(t_min), true);
-  TestEqual(lexical_cast<string>(t_max), true);
-  if (test_boundaries) {
-    // this requires a cast of the second operand to a higher-resolution type
-    TestComparison(lexical_cast<string>(t_min - 1),
-                 lexical_cast<string>(t_max), true);
-    // this requires a cast of the first operand to a higher-resolution type
-    TestComparison(lexical_cast<string>(t_min),
-                 lexical_cast<string>(t_max + 1), true);
-  }
-}
-
 // Test casting 'stmt' to each of the native types.  The result should be 'val'
 // 'stmt' is a partial stmt that could be of any valid type.
 template<>
@@ -637,32 +614,27 @@ void ExprTest::TestCast(const string& stmt, const char* val) {
   }
 }
 
-void TestSingleLiteralConstruction(PrimitiveType type, void* value, const string& string_val) {
+void TestSingleLiteralConstruction(PrimitiveType type, void* value,
+    const string& string_val) {
   ObjectPool pool;
   RowDescriptor desc;
+  RuntimeState state(TUniqueId(), TQueryOptions(), "", NULL);
 
   Expr* expr = Expr::CreateLiteral(&pool, type, value);
   EXPECT_TRUE(expr != NULL);
-  Expr::Prepare(expr, NULL, desc);
-  EXPECT_EQ(RawValue::Compare(expr->GetValue(NULL), value, type), 0);
-
-  expr = Expr::CreateLiteral(&pool, type, string_val);
-  EXPECT_TRUE(expr != NULL);
-  Expr::Prepare(expr, NULL, desc);
+  Expr::Prepare(expr, &state, desc, disable_codegen_);
   EXPECT_EQ(RawValue::Compare(expr->GetValue(NULL), value, type), 0);
 }
 
 TEST_F(ExprTest, NullLiteral) {
-  // TODO: how do we get the planner to use null literal vs literal predicate?
-  // For now, just make it manually.  It is used by the partition creation code.
   for (int type = TYPE_BOOLEAN; type != TYPE_DATE; ++type) {
     NullLiteral expr(static_cast<PrimitiveType>(type));
-    Status status = Expr::Prepare(&expr, NULL, RowDescriptor());
+    RuntimeState state(TUniqueId(), TQueryOptions(), "", NULL);
+    Status status = Expr::Prepare(&expr, &state, RowDescriptor(), disable_codegen_);
     EXPECT_TRUE(status.ok());
     EXPECT_TRUE(expr.GetValue(NULL) == NULL);
   }
 }
-
 
 TEST_F(ExprTest, LiteralConstruction) {
   bool b_val = true;
@@ -831,6 +803,15 @@ TEST_F(ExprTest, ArithmeticExprs) {
       min_int_values_[TYPE_BIGINT], TYPE_BIGINT);
   TestVariableResultTypeIntOps<int64_t, int64_t>(min_int_values_[TYPE_BIGINT],
       min_int_values_[TYPE_BIGINT], TYPE_BIGINT);
+
+  // Test behavior of INT_DIVIDE and MOD with zero as second argument.
+  unordered_map<int, int64_t>::iterator int_iter;
+  for(int_iter = min_int_values_.begin(); int_iter != min_int_values_.end();
+      ++int_iter) {
+    string& val = default_type_strs_[int_iter->first];
+    TestIsNull(val + " DIV 0", static_cast<PrimitiveType>(int_iter->first));
+    TestIsNull(val + " % 0", static_cast<PrimitiveType>(int_iter->first));
+  }
 
   // Test behavior with NULLs.
   TestNullOperandVariableResultTypeIntOps<int8_t>(min_int_values_[TYPE_TINYINT],
@@ -1152,17 +1133,19 @@ TEST_F(ExprTest, InPredicate) {
 TEST_F(ExprTest, StringFunctions) {
   TestStringValue("substring('Hello', 1)", "Hello");
   TestStringValue("substring('Hello', -2)", "lo");
-  TestStringValue("substring('Hello', 0)", "");
+  TestStringValue("substring('Hello', cast(0 as bigint))", "");
   TestStringValue("substring('Hello', -5)", "Hello");
-  TestStringValue("substring('Hello', -6)", "");
+  TestStringValue("substring('Hello', cast(-6 as bigint))", "");
   TestStringValue("substring('Hello', 100)", "");
   TestIsNull("substring(NULL, 100)", TYPE_STRING);
   TestIsNull("substring('Hello', NULL)", TYPE_STRING);
   TestIsNull("substring(NULL, NULL)", TYPE_STRING);
 
   TestStringValue("substring('Hello', 1, 1)", "H");
-  TestStringValue("substring('Hello', 2, 100)", "ello");
-  TestStringValue("substring('Hello', -3, 2)", "ll");
+  TestStringValue("substring('Hello', cast(2 as bigint), 100)", "ello");
+  TestStringValue("substring('Hello', -3, cast(2 as bigint))", "ll");
+  TestStringValue("substring('Hello', 1, 0)", "");
+  TestStringValue("substring('Hello', cast(1 as bigint), cast(-1 as bigint))", "");
   TestIsNull("substring(NULL, 1, 100)", TYPE_STRING);
   TestIsNull("substring('Hello', NULL, 100)", TYPE_STRING);
   TestIsNull("substring('Hello', 1, NULL)", TYPE_STRING);
@@ -1193,12 +1176,12 @@ TEST_F(ExprTest, StringFunctions) {
   TestStringValue("reverse('')", "");
   TestIsNull("reverse(NULL)", TYPE_STRING);
   TestStringValue("strleft('abcdefg', 3)", "abc");
-  TestStringValue("strleft('abcdefg', 10)", "abcdefg");
+  TestStringValue("strleft('abcdefg', cast(10 as bigint))", "abcdefg");
   TestIsNull("strleft(NULL, 3)", TYPE_STRING);
   TestIsNull("strleft('abcdefg', NULL)", TYPE_STRING);
   TestIsNull("strleft(NULL, NULL)", TYPE_STRING);
   TestStringValue("strright('abcdefg', 3)", "efg");
-  TestStringValue("strright('abcdefg', 10)", "abcdefg");
+  TestStringValue("strright('abcdefg', cast(10 as bigint))", "abcdefg");
   TestIsNull("strright(NULL, 3)", TYPE_STRING);
   TestIsNull("strright('abcdefg', NULL)", TYPE_STRING);
   TestIsNull("strright(NULL, NULL)", TYPE_STRING);
@@ -1227,16 +1210,16 @@ TEST_F(ExprTest, StringFunctions) {
 
   TestStringValue("space(0)", "");
   TestStringValue("space(-1)", "");
-  TestStringValue("space(1)", " ");
+  TestStringValue("space(cast(1 as bigint))", " ");
   TestStringValue("space(6)", "      ");
   TestIsNull("space(NULL)", TYPE_STRING);
 
   TestStringValue("repeat('', 0)", "");
-  TestStringValue("repeat('', 6)", "");
+  TestStringValue("repeat('', cast(6 as bigint))", "");
   TestStringValue("repeat('ab', 0)", "");
   TestStringValue("repeat('ab', -1)", "");
   TestStringValue("repeat('ab', 1)", "ab");
-  TestStringValue("repeat('ab', 6)", "abababababab");
+  TestStringValue("repeat('ab', cast(6 as bigint))", "abababababab");
   TestIsNull("repeat(NULL, 6)", TYPE_STRING);
   TestIsNull("repeat('ab', NULL)", TYPE_STRING);
   TestIsNull("repeat(NULL, NULL)", TYPE_STRING);
@@ -1250,22 +1233,24 @@ TEST_F(ExprTest, StringFunctions) {
 
   TestStringValue("lpad('', 0, '')", "");
   TestStringValue("lpad('abc', 0, '')", "");
-  TestStringValue("lpad('abc', 3, '')", "abc");
+  TestStringValue("lpad('abc', cast(3 as bigint), '')", "abc");
   TestStringValue("lpad('abc', 2, 'xyz')", "ab");
   TestStringValue("lpad('abc', 6, 'xyz')", "xyzabc");
-  TestStringValue("lpad('abc', 5, 'xyz')", "xyabc");
+  TestStringValue("lpad('abc', cast(5 as bigint), 'xyz')", "xyabc");
   TestStringValue("lpad('abc', 10, 'xyz')", "xyzxyzxabc");
+  TestIsNull("lpad('abc', -10, 'xyz')", TYPE_STRING);
   TestIsNull("lpad(NULL, 10, 'xyz')", TYPE_STRING);
   TestIsNull("lpad('abc', NULL, 'xyz')", TYPE_STRING);
   TestIsNull("lpad('abc', 10, NULL)", TYPE_STRING);
   TestIsNull("lpad(NULL, NULL, NULL)", TYPE_STRING);
   TestStringValue("rpad('', 0, '')", "");
   TestStringValue("rpad('abc', 0, '')", "");
-  TestStringValue("rpad('abc', 3, '')", "abc");
+  TestStringValue("rpad('abc', cast(3 as bigint), '')", "abc");
   TestStringValue("rpad('abc', 2, 'xyz')", "ab");
   TestStringValue("rpad('abc', 6, 'xyz')", "abcxyz");
-  TestStringValue("rpad('abc', 5, 'xyz')", "abcxy");
+  TestStringValue("rpad('abc', cast(5 as bigint), 'xyz')", "abcxy");
   TestStringValue("rpad('abc', 10, 'xyz')", "abcxyzxyzx");
+  TestIsNull("rpad('abc', -10, 'xyz')", TYPE_STRING);
   TestIsNull("rpad(NULL, 10, 'xyz')", TYPE_STRING);
   TestIsNull("rpad('abc', NULL, 'xyz')", TYPE_STRING);
   TestIsNull("rpad('abc', 10, NULL)", TYPE_STRING);
@@ -1295,18 +1280,18 @@ TEST_F(ExprTest, StringFunctions) {
   // Test locate with starting pos param.
   // Note that Hive expects positions starting from 1 as input.
   TestValue("locate('', '', 0)", TYPE_INT, 0);
-  TestValue("locate('abc', '', 0)", TYPE_INT, 0);
+  TestValue("locate('abc', '', cast(0 as bigint))", TYPE_INT, 0);
   TestValue("locate('', 'abc', 0)", TYPE_INT, 0);
   TestValue("locate('', 'abc', -1)", TYPE_INT, 0);
   TestValue("locate('', '', 1)", TYPE_INT, 0);
-  TestValue("locate('', 'abcde', 10)", TYPE_INT, 0);
+  TestValue("locate('', 'abcde', cast(10 as bigint))", TYPE_INT, 0);
   TestValue("locate('abcde', 'abcde', -1)", TYPE_INT, 0);
   TestValue("locate('abcde', 'abcde', 10)", TYPE_INT, 0);
   TestValue("locate('abc', 'abcdef', 0)", TYPE_INT, 0);
   TestValue("locate('abc', 'abcdef', 1)", TYPE_INT, 1);
   TestValue("locate('abc', 'xyzabcdef', 3)", TYPE_INT, 4);
   TestValue("locate('abc', 'xyzabcdef', 4)", TYPE_INT, 4);
-  TestValue("locate('abc', 'abcabcabc', 5)", TYPE_INT, 7);
+  TestValue("locate('abc', 'abcabcabc', cast(5 as bigint))", TYPE_INT, 7);
   TestIsNull("locate(NULL, 'abcabcabc', 5)", TYPE_INT);
   TestIsNull("locate('abc', NULL, 5)", TYPE_INT);
   TestIsNull("locate('abc', 'abcabcabc', NULL)", TYPE_INT);
@@ -1358,19 +1343,21 @@ TEST_F(ExprTest, StringRegexpFunctions) {
   TestStringValue("regexp_extract('abxcy1234a', 'a.x.y.*a', 0)", "abxcy1234a");
   TestStringValue("regexp_extract('a.x.y.*a',"
       "'a\\\\.x\\\\.y\\\\.\\\\*a', 0)", "a.x.y.*a");
-  TestStringValue("regexp_extract('abxcy1234a', 'abczy', 0)", "");
+  TestStringValue("regexp_extract('abxcy1234a', 'abczy', cast(0 as bigint))", "");
   TestStringValue("regexp_extract('abxcy1234a', 'a\\\\.x\\\\.y\\\\.\\\\*a', 0)", "");
   TestStringValue("regexp_extract('axcy1234a', 'a.x.y.*a', 0)","");
   // Accessing non-existant group should return empty string.
-  TestStringValue("regexp_extract('abxcy1234a', 'a.x', 2)", "");
+  TestStringValue("regexp_extract('abxcy1234a', 'a.x', cast(2 as bigint))", "");
   TestStringValue("regexp_extract('abxcy1234a', 'a.x.*a', 1)", "");
   TestStringValue("regexp_extract('abxcy1234a', 'a.x.y.*a', 5)", "");
   // Multiple groups enclosed in ().
   TestStringValue("regexp_extract('abxcy1234a', '(a.x)(.y.*)(3.*a)', 0)", "abxcy1234a");
   TestStringValue("regexp_extract('abxcy1234a', '(a.x)(.y.*)(3.*a)', 1)", "abx");
   TestStringValue("regexp_extract('abxcy1234a', '(a.x)(.y.*)(3.*a)', 2)", "cy12");
-  TestStringValue("regexp_extract('abxcy1234a', '(a.x)(.y.*)(3.*a)', 3)", "34a");
-  TestStringValue("regexp_extract('abxcy1234a', '(a.x)(.y.*)(3.*a)', 4)", "");
+  TestStringValue("regexp_extract('abxcy1234a', '(a.x)(.y.*)(3.*a)',"
+      "cast(3 as bigint))", "34a");
+  TestStringValue("regexp_extract('abxcy1234a', '(a.x)(.y.*)(3.*a)',"
+      "cast(4 as bigint))", "");
   // Empty strings.
   TestStringValue("regexp_extract('', '', 0)", "");
   TestStringValue("regexp_extract('abxcy1234a', '', 0)", "");
@@ -1875,6 +1862,15 @@ TEST_F(ExprTest, MathFunctions) {
   TestValue("negative(3.14159265)", TYPE_DOUBLE, -3.14159265);
   TestValue("negative(-3.14159265)", TYPE_DOUBLE, 3.14159265);
 
+  // Test bigint param.
+  TestValue("quotient(12, 6)", TYPE_BIGINT, 2);
+  TestValue("quotient(-12, 6)", TYPE_BIGINT, -2);
+  TestIsNull("quotient(-12, 0)", TYPE_BIGINT);
+  // Test double param.
+  TestValue("quotient(30.5, 2.5)", TYPE_BIGINT, 15);
+  TestValue("quotient(-30.5, 2.5)", TYPE_BIGINT, -15);
+  TestIsNull("quotient(-30.5, 0.000999)", TYPE_BIGINT);
+
   // NULL arguments.
   TestIsNull("abs(NULL)", TYPE_DOUBLE);
   TestIsNull("sign(NULL)", TYPE_FLOAT);
@@ -1898,7 +1894,9 @@ TEST_F(ExprTest, MathFunctions) {
   TestIsNull("pmod(NULL, NULL)", TYPE_BIGINT);
   TestIsNull("positive(NULL)", TYPE_BIGINT);
   TestIsNull("negative(NULL)", TYPE_BIGINT);
-
+  TestIsNull("quotient(NULL, 1.0)", TYPE_BIGINT);
+  TestIsNull("quotient(1.0, NULL)", TYPE_BIGINT);
+  TestIsNull("quotient(NULL, NULL)", TYPE_BIGINT);
 }
 
 TEST_F(ExprTest, MathRoundingFunctions) {
@@ -1964,6 +1962,12 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestStringValue("cast(date_sub(cast('2012-01-01 09:10:11.123456789' "
       "as timestamp), interval 10 years) as string)",
       "2002-01-01 09:10:11.123456789");
+  TestStringValue("cast(date_add(cast('2012-01-01 09:10:11.123456789' "
+      "as timestamp), interval cast(10 as bigint) years) as string)",
+      "2022-01-01 09:10:11.123456789");
+  TestStringValue("cast(date_sub(cast('2012-01-01 09:10:11.123456789' "
+      "as timestamp), interval cast(10 as bigint) years) as string)",
+      "2002-01-01 09:10:11.123456789");
   // Add/sub months.
   TestStringValue("cast(date_add(cast('2012-01-01 09:10:11.123456789' "
       "as timestamp), interval 13 months) as string)",
@@ -1972,10 +1976,10 @@ TEST_F(ExprTest, TimestampFunctions) {
       "as timestamp), interval 13 months) as string)",
       "2012-01-01 09:10:11.123456789");
   TestStringValue("cast(date_add(cast('2012-01-31 09:10:11.123456789' "
-      "as timestamp), interval 1 month) as string)",
+      "as timestamp), interval cast(1 as bigint) month) as string)",
       "2012-02-29 09:10:11.123456789");
   TestStringValue("cast(date_sub(cast('2012-02-29 09:10:11.123456789' "
-      "as timestamp), interval 1 month) as string)",
+      "as timestamp), interval cast(1 as bigint) month) as string)",
       "2012-01-31 09:10:11.123456789");
   // Add/sub weeks.
   TestStringValue("cast(date_add(cast('2012-01-01 09:10:11.123456789' "
@@ -1985,10 +1989,10 @@ TEST_F(ExprTest, TimestampFunctions) {
       "as timestamp), interval 2 weeks) as string)",
       "2012-01-01 09:10:11.123456789");
   TestStringValue("cast(date_add(cast('2012-01-01 09:10:11.123456789' "
-      "as timestamp), interval 53 weeks) as string)",
+      "as timestamp), interval cast(53 as bigint) weeks) as string)",
       "2013-01-06 09:10:11.123456789");
   TestStringValue("cast(date_sub(cast('2013-01-06 09:10:11.123456789' "
-      "as timestamp), interval 53 weeks) as string)",
+      "as timestamp), interval cast(53 as bigint) weeks) as string)",
       "2012-01-01 09:10:11.123456789");
   // Add/sub days.
   TestStringValue("cast(date_add(cast('2012-01-01 09:10:11.123456789' "
@@ -1998,10 +2002,10 @@ TEST_F(ExprTest, TimestampFunctions) {
       "as timestamp), interval 10 days) as string)",
       "2011-12-22 09:10:11.123456789");
   TestStringValue("cast(date_add(cast('2011-12-22 09:10:11.12345678' "
-      "as timestamp), interval 10 days) as string)",
+      "as timestamp), interval cast(10 as bigint) days) as string)",
       "2012-01-01 09:10:11.123456780");
   TestStringValue("cast(date_sub(cast('2011-12-22 09:10:11.12345678' "
-      "as timestamp), interval 365 days) as string)",
+      "as timestamp), interval cast(365 as bigint) days) as string)",
       "2010-12-22 09:10:11.123456780");
   // Add/sub days (HIVE's date_add/sub variant).
   TestStringValue("cast(date_add(cast('2012-01-01 09:10:11.123456789' "
@@ -2011,17 +2015,23 @@ TEST_F(ExprTest, TimestampFunctions) {
       "cast(date_sub(cast('2012-01-01 09:10:11.123456789' as timestamp), 10) as string)",
       "2011-12-22 09:10:11.123456789");
   TestStringValue(
-      "cast(date_add(cast('2011-12-22 09:10:11.12345678' as timestamp), 10) as string)",
-      "2012-01-01 09:10:11.123456780");
+      "cast(date_add(cast('2011-12-22 09:10:11.12345678' as timestamp),"
+      "cast(10 as bigint)) as string)", "2012-01-01 09:10:11.123456780");
   TestStringValue(
-      "cast(date_sub(cast('2011-12-22 09:10:11.12345678' as timestamp), 365) as string)",
-      "2010-12-22 09:10:11.123456780");
+      "cast(date_sub(cast('2011-12-22 09:10:11.12345678' as timestamp),"
+      "cast(365 as bigint)) as string)", "2010-12-22 09:10:11.123456780");
   // Add/sub hours.
   TestStringValue("cast(date_add(cast('2012-01-01 00:00:00.123456789' "
       "as timestamp), interval 25 hours) as string)",
       "2012-01-02 01:00:00.123456789");
   TestStringValue("cast(date_sub(cast('2012-01-02 01:00:00.123456789' "
       "as timestamp), interval 25 hours) as string)",
+      "2012-01-01 00:00:00.123456789");
+  TestStringValue("cast(date_add(cast('2012-01-01 00:00:00.123456789' "
+      "as timestamp), interval cast(25 as bigint) hours) as string)",
+      "2012-01-02 01:00:00.123456789");
+  TestStringValue("cast(date_sub(cast('2012-01-02 01:00:00.123456789' "
+      "as timestamp), interval cast(25 as bigint) hours) as string)",
       "2012-01-01 00:00:00.123456789");
   // Add/sub minutes.
   TestStringValue("cast(date_add(cast('2012-01-01 00:00:00.123456789' "
@@ -2030,12 +2040,24 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestStringValue("cast(date_sub(cast('2012-01-02 01:33:00.123456789' "
       "as timestamp), interval 1533 minutes) as string)",
       "2012-01-01 00:00:00.123456789");
+  TestStringValue("cast(date_add(cast('2012-01-01 00:00:00.123456789' "
+      "as timestamp), interval cast(1533 as bigint) minutes) as string)",
+      "2012-01-02 01:33:00.123456789");
+  TestStringValue("cast(date_sub(cast('2012-01-02 01:33:00.123456789' "
+      "as timestamp), interval cast(1533 as bigint) minutes) as string)",
+      "2012-01-01 00:00:00.123456789");
   // Add/sub seconds.
   TestStringValue("cast(date_add(cast('2012-01-01 00:00:00.123456789' "
       "as timestamp), interval 90033 seconds) as string)",
       "2012-01-02 01:00:33.123456789");
   TestStringValue("cast(date_sub(cast('2012-01-02 01:00:33.123456789' "
       "as timestamp), interval 90033 seconds) as string)",
+      "2012-01-01 00:00:00.123456789");
+  TestStringValue("cast(date_add(cast('2012-01-01 00:00:00.123456789' "
+      "as timestamp), interval cast(90033 as bigint) seconds) as string)",
+      "2012-01-02 01:00:33.123456789");
+  TestStringValue("cast(date_sub(cast('2012-01-02 01:00:33.123456789' "
+      "as timestamp), interval cast(90033 as bigint) seconds) as string)",
       "2012-01-01 00:00:00.123456789");
   // Add/sub milliseconds.
   TestStringValue("cast(date_add(cast('2012-01-01 00:00:00.000000001' "
@@ -2044,6 +2066,12 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestStringValue("cast(date_sub(cast('2012-01-02 01:00:00.033000001' "
       "as timestamp), interval 90000033 milliseconds) as string)",
       "2012-01-01 00:00:00.000000001");
+  TestStringValue("cast(date_add(cast('2012-01-01 00:00:00.000000001' "
+      "as timestamp), interval cast(90000033 as bigint) milliseconds) as string)",
+      "2012-01-02 01:00:00.033000001");
+  TestStringValue("cast(date_sub(cast('2012-01-02 01:00:00.033000001' "
+      "as timestamp), interval cast(90000033 as bigint) milliseconds) as string)",
+      "2012-01-01 00:00:00.000000001");
   // Add/sub microseconds.
   TestStringValue("cast(date_add(cast('2012-01-01 00:00:00.000000001' "
       "as timestamp), interval 1033 microseconds) as string)",
@@ -2051,12 +2079,24 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestStringValue("cast(date_sub(cast('2012-01-01 00:00:00.001033001' "
       "as timestamp), interval 1033 microseconds) as string)",
       "2012-01-01 00:00:00.000000001");
+  TestStringValue("cast(date_add(cast('2012-01-01 00:00:00.000000001' "
+      "as timestamp), interval cast(1033 as bigint) microseconds) as string)",
+      "2012-01-01 00:00:00.001033001");
+  TestStringValue("cast(date_sub(cast('2012-01-01 00:00:00.001033001' "
+      "as timestamp), interval cast(1033 as bigint) microseconds) as string)",
+      "2012-01-01 00:00:00.000000001");
   // Add/sub nanoseconds.
   TestStringValue("cast(date_add(cast('2012-01-01 00:00:00.000000001' "
       "as timestamp), interval 1033 nanoseconds) as string)",
       "2012-01-01 00:00:00.000001034");
   TestStringValue("cast(date_sub(cast('2012-01-01 00:00:00.000001034' "
       "as timestamp), interval 1033 nanoseconds) as string)",
+      "2012-01-01 00:00:00.000000001");
+  TestStringValue("cast(date_add(cast('2012-01-01 00:00:00.000000001' "
+      "as timestamp), interval cast(1033 as bigint) nanoseconds) as string)",
+      "2012-01-01 00:00:00.000001034");
+  TestStringValue("cast(date_sub(cast('2012-01-01 00:00:00.000001034' "
+      "as timestamp), interval cast(1033 as bigint) nanoseconds) as string)",
       "2012-01-01 00:00:00.000000001");
 
   // NULL arguments.
@@ -2071,13 +2111,22 @@ TEST_F(ExprTest, TimestampFunctions) {
 
   // Test add/sub behavior with very large time values.
   string max_int = lexical_cast<string>(numeric_limits<int32_t>::max());
+  string max_long = lexical_cast<string>(numeric_limits<int32_t>::max());
   TestStringValue(
         "cast(years_add(cast('2000-01-01 00:00:00' "
         "as timestamp), " + max_int + ") as string)",
         "1999-01-01 00:00:00");
   TestStringValue(
       "cast(years_sub(cast('2000-01-01 00:00:00' "
+      "as timestamp), " + max_long + ") as string)",
+      "2001-01-01 00:00:00");
+  TestStringValue(
+      "cast(years_add(cast('2000-01-01 00:00:00' "
       "as timestamp), " + max_int + ") as string)",
+      "1999-01-01 00:00:00");
+  TestStringValue(
+      "cast(years_sub(cast('2000-01-01 00:00:00' "
+      "as timestamp), " + max_long + ") as string)",
       "2001-01-01 00:00:00");
 
   TestValue("unix_timestamp(cast('1970-01-01 00:00:00' as timestamp))", TYPE_INT, 0);
@@ -2089,7 +2138,9 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestValue("unix_timestamp('1970-01-01 00:00:00 extra text', 'yyyy-MM-dd HH:mm:ss')",
             TYPE_INT, 0);
   TestIsNull("unix_timestamp(NULL)", TYPE_INT);
+  TestIsNull("unix_timestamp('00:00:00')", TYPE_INT);
   TestIsNull("unix_timestamp(NULL, 'yyyy-MM-dd')", TYPE_INT);
+  TestIsNull("unix_timestamp('00:00:00', 'yyyy-MM-dd HH:mm:ss')", TYPE_INT);
   TestIsNull("unix_timestamp('1970-01-01 10:10:10', NULL)", TYPE_INT);
   TestIsNull("unix_timestamp(NULL, NULL)", TYPE_INT);
   TestStringValue("cast(cast(0 as timestamp) as string)", "1970-01-01 00:00:00");
@@ -2234,6 +2285,25 @@ TEST_F(ExprTest, ConditionalFunctions) {
       "cast('1999-06-14 19:07:25' as timestamp))", then_val);
   TestTimestampValue("if(FALSE, cast('2011-01-01 09:01:01' as timestamp), "
       "cast('1999-06-14 19:07:25' as timestamp))", else_val);
+
+  // Test IsNull() function on all applicable types and NULL.
+  TestValue("isnull(true, NULL)", TYPE_BOOLEAN, true);
+  TestValue("isnull(1, NULL)", TYPE_INT, 1);
+  TestValue("isnull(1 + 1, NULL)", TYPE_BIGINT, 2);
+  TestValue("isnull(10.0, NULL)", TYPE_DOUBLE, 10.0);
+  TestStringValue("isnull('abc', NULL)", "abc");
+  TestTimestampValue("isnull(" + default_timestamp_str_ + ", NULL)",
+      default_timestamp_val_);
+  // Test first argument is NULL.
+  TestValue("isnull(NULL, true)", TYPE_BOOLEAN, true);
+  TestValue("isnull(NULL, 1)", TYPE_INT, 1);
+  TestValue("isnull(NULL, 1 + 1)", TYPE_BIGINT, 2);
+  TestValue("isnull(NULL, 10.0)", TYPE_DOUBLE, 10.0);
+  TestStringValue("isnull(NULL, 'abc')", "abc");
+  TestTimestampValue("isnull(NULL, " + default_timestamp_str_ + ")",
+      default_timestamp_val_);
+  // Test NULL. The return type is boolean to avoid a special NULL function signature.
+  TestIsNull("isnull(NULL, NULL)", TYPE_BOOLEAN);
 
   TestIsNull("coalesce(NULL)", TYPE_DOUBLE);
   TestIsNull("coalesce(NULL, NULL)", TYPE_DOUBLE);
@@ -2505,6 +2575,7 @@ int main(int argc, char **argv) {
 
   vector<string> options;
   options.push_back("DISABLE_CODEGEN=1");
+  disable_codegen_ = true;
   executor_->setExecOptions(options);
 
   cout << "Running without codegen" << endl;
@@ -2512,8 +2583,8 @@ int main(int argc, char **argv) {
   if (ret != 0) return ret;
   
   options.push_back("DISABLE_CODEGEN=0");
+  disable_codegen_ = false;
   executor_->setExecOptions(options);
-  impala_server->impala_server()->EnableCodegenForSelectExprs();
   cout << endl << "Running with codegen" << endl;
   return RUN_ALL_TESTS();
 }

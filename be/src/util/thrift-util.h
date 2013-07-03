@@ -111,9 +111,10 @@ Status SerializeThriftMsg(JNIEnv* env, T* msg, jbyteArray* serialized_msg) {
 
   // create jbyteArray given buffer
   *serialized_msg = env->NewByteArray(size);
+  RETURN_ERROR_IF_EXC(env);
   if (*serialized_msg == NULL) return Status("couldn't construct jbyteArray");
   env->SetByteArrayRegion(*serialized_msg, 0, size, reinterpret_cast<jbyte*>(buffer));
-  RETURN_ERROR_IF_EXC(env, JniUtil::throwable_to_string_id());
+  RETURN_ERROR_IF_EXC(env);
   return Status::OK;
 }
 
@@ -176,12 +177,6 @@ Status WaitForLocalServer(const ThriftServer& server, int num_retries,
 // Wait for a server to start accepting connections, up to a maximum timeout
 Status WaitForServer(const std::string& host, int port, int num_retries,
    int retry_interval_ms);
-
-// Utility method to print address as address:port
-void TNetworkAddressToString(const TNetworkAddress& address, std::string* out);
-
-// Prints a hostport as ipaddress:port
-std::ostream& operator<<(std::ostream& out, const TNetworkAddress& hostport);
 
 // Print a TColumnValue. If null, print "NULL".
 std::ostream& operator<<(std::ostream& out, const TColumnValue& colval);

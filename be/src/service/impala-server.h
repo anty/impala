@@ -64,7 +64,6 @@ class TClientRequest;
 class TExecRequest;
 class TSessionState;
 class TQueryOptions;
-class ImpalaPlanServiceClient;
 
 class ThriftServer;
 
@@ -185,6 +184,8 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   virtual void FetchResults(
       apache::hive::service::cli::thrift::TFetchResultsResp& return_val,
       const apache::hive::service::cli::thrift::TFetchResultsReq& request);
+  virtual void GetLog(apache::hive::service::cli::thrift::TGetLogResp& return_val,
+      const apache::hive::service::cli::thrift::TGetLogReq& request);
   virtual void ResetCatalog(TResetCatalogResp& return_val);
   virtual void ResetTable(TResetTableResp& return_val, const TResetTableReq& request);
 
@@ -228,18 +229,13 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   //  - topic_deltas: all changes to registered state-store topics
   //  - topic_updates: output parameter to publish any topic updates to. Unused.
   void MembershipCallback(const StateStoreSubscriber::TopicDeltaMap& topic_deltas,
-      vector<TTopicUpdate>* topic_updates);
+      std::vector<TTopicUpdate>* topic_updates);
 
   // Reads a configuration value from Hadoop's configuration in the
   // front-end. If the configuration key is not found, returns the
   // empty string.
   // Returns Status::OK unless there is a JNI error.
   Status GetHadoopConfigValue(const std::string& key, std::string* output);
-
-  // Enables codegen for queries with no from clause.  This is normally disabled
-  // since evaluating a expr tree once is cheaper than doing codegen.
-  // This is only exposed for debugging purposes.
-  void EnableCodegenForSelectExprs();
 
  private:
   class FragmentExecState;
@@ -256,7 +252,8 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
     // comes from a select query, the row is in the form of expr values (void*). 'scales'
     // contains the values' scales (# of digits after decimal), with -1 indicating no
     // scale specified.
-    virtual Status AddOneRow(const vector<void*>& row, const vector<int>& scales) = 0;
+    virtual Status AddOneRow(
+        const std::vector<void*>& row, const std::vector<int>& scales) = 0;
 
     // Add the TResultRow to this result set. When a row comes from a DDL/metadata
     // operation, the row in the form of TResultRow.
@@ -268,172 +265,8 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
 
   struct SessionState;
 
-  // Execution state of a query. This captures everything necessary
-  // to convert row batches received by the coordinator into results
-  // we can return to the client. It also captures all state required for
-  // servicing query-related requests from the client.
-  // Thread safety: this class is generally not thread-safe, callers need to
-  // synchronize access explicitly via lock().
-  // To avoid deadlocks, the caller must *not* acquire query_exec_state_map_lock_
-  // while holding the exec state's lock.
-  // TODO: Consider renaming to RequestExecState for consistency.
-  class QueryExecState {
-   public:
-    QueryExecState(ExecEnv* exec_env, ImpalaServer* server,
-        boost::shared_ptr<SessionState> session,
-        const TSessionState& query_session_state)
-      : exec_env_(exec_env),
-        parent_session_(session),
-        query_session_state_(query_session_state),
-        coord_(NULL),
-        profile_(&profile_pool_, "Query"),  // assign name w/ id after planning
-        server_profile_(&profile_pool_, "ImpalaServer"),
-        summary_profile_(&profile_pool_, "Summary"),
-        eos_(false),
-        query_state_(beeswax::QueryState::CREATED),
-        current_batch_(NULL),
-        current_batch_row_(0),
-        num_rows_fetched_(0),
-        impala_server_(server),
-        start_time_(TimestampValue::local_time()) {
-      row_materialization_timer_ = ADD_TIMER(&server_profile_, "RowMaterializationTimer");
-      query_events_ = summary_profile_.AddEventSequence("Query Timeline");
-      query_events_->Start();
-      profile_.AddChild(&summary_profile_);
-      profile_.AddChild(&server_profile_);
-    }
-
-    ~QueryExecState() {
-    }
-
-    // Initiates execution of plan fragments, if there are any, and sets
-    // up the output exprs for subsequent calls to FetchRows().
-    // Also sets up profile and pre-execution counters.
-    // Non-blocking.
-    Status Exec(TExecRequest* exec_request);
-
-    // Execute a HiveServer2 metadata operation
-    Status Exec(const TMetadataOpRequest& exec_request);
-
-    // Call this to ensure that rows are ready when calling FetchRows().
-    // Must be preceded by call to Exec().
-    Status Wait();
-
-    // Return at most max_rows from the current batch. If the entire current batch has
-    // been returned, fetch another batch first.
-    // Caller should verify that EOS has not be reached before calling.
-    // Always calls coord()->Wait() prior to getting a batch.
-    // Also updates query_state_/status_ in case of error.
-    Status FetchRows(const int32_t max_rows, QueryResultSet* fetched_rows);
-
-    // Update query state if the requested state isn't already obsolete.
-    void UpdateQueryState(beeswax::QueryState::type query_state);
-
-    void SetErrorStatus(const Status& status);
-
-    // Sets state to EXCEPTION and cancels coordinator.
-    // Caller needs to hold lock().
-    // Does nothing if the query has reached EOS.
-    void Cancel();
-
-    // This is called when the query is done (finished, cancelled, or failed).
-    void Done();
-
-    SessionState* parent_session() { return parent_session_.get(); }
-    const std::string user() const { return parent_session_->user; }
-    const std::string default_db() const { return query_session_state_.database; }
-    bool eos() { return eos_; }
-    Coordinator* coord() const { return coord_.get(); }
-    int num_rows_fetched() const { return num_rows_fetched_; }
-    const TResultSetMetadata* result_metadata() { return &result_metadata_; }
-    const TUniqueId& query_id() const { return query_id_; }
-    const TExecRequest& exec_request() const { return exec_request_; }
-    TStmtType::type stmt_type() const { return exec_request_.stmt_type; }
-    boost::mutex* lock() { return &lock_; }
-    const beeswax::QueryState::type query_state() const { return query_state_; }
-    void set_query_state(beeswax::QueryState::type state) { query_state_ = state; }
-    const Status& query_status() const { return query_status_; }
-    void set_result_metadata(const TResultSetMetadata& md) { result_metadata_ = md; }
-    const RuntimeProfile& profile() const { return profile_; }
-    const TimestampValue& start_time() const { return start_time_; }
-    const TimestampValue& end_time() const { return end_time_; }
-
-    RuntimeProfile::EventSequence* query_events() { return query_events_; }
-
-   private:
-    TUniqueId query_id_;
-    boost::mutex lock_;  // protects all following fields
-    ExecEnv* exec_env_;
-
-    // Session that this query is from
-    boost::shared_ptr<SessionState> parent_session_;
-
-    // Snapshot of state in session_ that is not constant (and can change from
-    // QueryExecState to QueryExecState).
-    const TSessionState query_session_state_;
-
-    // not set for queries w/o FROM, ddl queries, or short-circuited (i.e. queries with
-    // "limit 0")
-    boost::scoped_ptr<Coordinator> coord_;
-
-    boost::scoped_ptr<DdlExecutor> ddl_executor_; // Runs DDL queries, instead of coord_
-    // local runtime_state_ in case we don't have a coord_
-    boost::scoped_ptr<RuntimeState> local_runtime_state_;
-    ObjectPool profile_pool_;
-
-    // The QueryExecState builds three separate profiles.
-    // * profile_ is the top-level profile which houses the other
-    //   profiles, plus the query timeline
-    // * summary_profile_ contains mostly static information about the
-    //   query, including the query statement, the plan and the user who submitted it.
-    // * server_profile_ tracks time spent inside the ImpalaServer,
-    //   but not inside fragment execution, i.e. the time taken to
-    //   register and set-up the query and for rows to be fetched.
-    //
-    // There's a fourth profile which is not built here (but is a
-    // child of profile_); the execution profile which tracks the
-    // actual fragment execution.
-    RuntimeProfile profile_;
-    RuntimeProfile server_profile_;
-    RuntimeProfile summary_profile_;
-    RuntimeProfile::Counter* row_materialization_timer_;
-    RuntimeProfile::EventSequence* query_events_;
-    vector<Expr*> output_exprs_;
-    bool eos_;  // if true, there are no more rows to return
-    beeswax::QueryState::type query_state_;
-    Status query_status_;
-    TExecRequest exec_request_;
-
-    TResultSetMetadata result_metadata_; // metadata for select query
-    RowBatch* current_batch_; // the current row batch; only applicable if coord is set
-    int current_batch_row_; // number of rows fetched within the current batch
-    int num_rows_fetched_; // number of rows fetched by client for the entire query
-
-    // To get access to UpdateMetastore
-    ImpalaServer* impala_server_;
-
-    // Start/end time of the query
-    TimestampValue start_time_, end_time_;
-
-    // Core logic of FetchRows(). Does not update query_state_/status_.
-    Status FetchRowsInternal(const int32_t max_rows, QueryResultSet* fetched_rows);
-
-    // Fetch the next row batch and store the results in current_batch_. Only
-    // called for non-DDL / DML queries.
-    Status FetchNextBatch();
-
-    // Evaluates 'output_exprs_' against 'row' and output the evaluated row in
-    // 'result'. The values' scales (# of digits after decimal) are stored in 'scales'.
-    // result and scales must have been resized to the number of columns before call.
-    Status GetRowValue(TupleRow* row, vector<void*>* result, vector<int>* scales);
-
-    // Set output_exprs_, based on exprs.
-    Status PrepareSelectListExprs(RuntimeState* runtime_state,
-        const vector<TExpr>& exprs, const RowDescriptor& row_desc);
-
-    // Gather and publish all required updates to the metastore
-    Status UpdateMetastore();
-  };
+  // Execution state of a query.
+  class QueryExecState;
 
   // Relevant ODBC SQL State code; for more info,
   // goto http://msdn.microsoft.com/en-us/library/ms714687.aspx
@@ -467,17 +300,8 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   // Return exec state for given query_id, or NULL if not found.
   // If 'lock' is true, the returned exec state's lock() will be acquired before
   // the query_exec_state_map_lock_ is released.
-  inline boost::shared_ptr<QueryExecState> GetQueryExecState(
-      const TUniqueId& query_id, bool lock) {
-    boost::lock_guard<boost::mutex> l(query_exec_state_map_lock_);
-    QueryExecStateMap::iterator i = query_exec_state_map_.find(query_id);
-    if (i == query_exec_state_map_.end()) {
-      return boost::shared_ptr<QueryExecState>();
-    } else {
-      if (lock) i->second->lock()->lock();
-      return i->second;
-    }
-  }
+  boost::shared_ptr<QueryExecState> GetQueryExecState(
+      const TUniqueId& query_id, bool lock);
 
   // Return exec state for given fragment_instance_id, or NULL if not found.
   boost::shared_ptr<FragmentExecState> GetFragmentExecState(
@@ -485,6 +309,9 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
 
   // Call FE to get TClientRequestResult.
   Status GetExecRequest(const TClientRequest& request, TExecRequest* result);
+
+  // Updates the number of databases / tables metrics from the FE catalog
+  Status UpdateCatalogMetrics();
 
   // Make any changes required to the metastore as a result of an
   // INSERT query, e.g. newly created partitions.
@@ -515,7 +342,7 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   // Registers the query exec state with query_exec_state_map_ using the globally
   // unique query_id and add the query id to session state's open query list.
   Status RegisterQuery(boost::shared_ptr<SessionState> session_state,
-      const TUniqueId& query_id, const boost::shared_ptr<QueryExecState>& exec_state);
+      const boost::shared_ptr<QueryExecState>& exec_state);
 
   // Cancel the query execution if the query is still running. Removes exec_state from
   // query_exec_state_map_, and removes the query id from session state's open query list
@@ -575,10 +402,8 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   // Webserver callback that prints a list of all known databases and tables
   void CatalogPathHandler(const Webserver::ArgumentMap& args, std::stringstream* output);
 
-  // Webserver callback that prints a list of known backends
-  void BackendsPathHandler(const Webserver::ArgumentMap& args, std::stringstream* output);
-
   // Wrapper around Coordinator::Wait(); suitable for execution inside thread.
+  // Must not be called with exec_state->lock() already taken.
   void Wait(boost::shared_ptr<QueryExecState> exec_state);
 
   // Initialize "default_configs_" to show the default values for ImpalaQueryOptions and
@@ -591,12 +416,10 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
 
   // Returns all matching table names, per Hive's "SHOW TABLES <pattern>". Each
   // table name returned is unqualified.
-  // If db is NULL, match table names from all databases, otherwise restrict the
-  // search to the named database.
   // If pattern is NULL, match all tables otherwise match only those tables that
   // match the pattern string. Patterns are "p1|p2|p3" where | denotes choice,
   // and each pN may contain wildcards denoted by '*' which match all strings.
-  Status GetTableNames(const std::string* db, const std::string* pattern,
+  Status GetTableNames(const std::string& db, const std::string* pattern,
       TGetTablesResult* table_names);
 
   // Return all databases matching the optional argument 'pattern'.
@@ -641,8 +464,24 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   // successful, otherwise CANCELLED is returned.
   Status DropTable(const TDropTableParams& drop_table_params);
 
+  // Checks settings for profile logging, including whether the output
+  // directory exists and is writeable. Calls OpenProfileLogFile to
+  // initialise the first log file. Returns OK unless there is some
+  // problem preventing profile log files from being written.
+  // If an error is returned, the constructor will disable profile logging.
+  Status InitProfileLogging();
+
+  // Opens a profile log file for profile archival. If reopen is true,
+  // reopens the current file (causing a flush to disk), otherwise
+  // closes the current file and creates a new one.
+  // Must be called with profile_log_file_lock_ held.
+  Status OpenProfileLogFile(bool reopen);
+
+  // Runs once every 5s to flush the profile log file to disk.
+  void LogFileFlushThread();
+
   // Copies a query's state into the query log. Called immediately prior to a
-  // QueryExecState's deletion.
+  // QueryExecState's deletion. Also writes the query profile to the profile log on disk.
   // Must be called with query_exec_state_map_lock_ held
   void ArchiveQuery(const QueryExecState& query);
 
@@ -779,11 +618,29 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   typedef boost::unordered_map<TUniqueId, QueryLog::iterator> QueryLogIndex;
   QueryLogIndex query_log_index_;
 
+  // Protects profile_log_file_, log_file_size and profile_log_file_name_
+  boost::mutex profile_log_file_lock_;
+
+  // Encoded query profiles are written to this stream, one per line
+  // with the following format:
+  // <ms-since-epoch> <query-id> <thrift query profile URL encoded and gzipped>
+  std::ofstream profile_log_file_;
+
+  // Counts the number of queries written to profile_log_file_; used to
+  // decide when to close the file and start a new one.
+  uint64_t profile_log_file_size_;
+
+  // Current query log file name.
+  std::string profile_log_file_name_;
+
+  // If profile logging is enabled, wakes once every 5s to flush query profiles to disk
+  boost::scoped_ptr<boost::thread> profile_log_file_flush_thread_;
+
   // global, per-server state
   jobject fe_;  // instance of com.cloudera.impala.service.JniFrontend
   jmethodID create_exec_request_id_;  // JniFrontend.createExecRequest()
   jmethodID get_explain_plan_id_;  // JniFrontend.getExplainPlan()
-  jmethodID get_hadoop_config_id_;  // JniFrontend.getHadoopConfigAsHtml()
+  jmethodID get_hadoop_config_id_;  // JniFrontend.getHadoopConfig()
   jmethodID get_hadoop_config_value_id_; // JniFrontend.getHadoopConfigValue
   jmethodID check_hadoop_config_id_; // JniFrontend.checkHadoopConfig()
   jmethodID reset_catalog_id_; // JniFrontend.resetCatalog()
@@ -800,16 +657,6 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   jmethodID drop_database_id_; // JniFrontend.dropDatabase
   jmethodID drop_table_id_; // JniFrontend.dropTable
   ExecEnv* exec_env_;  // not owned
-
-  // If true, codegen exprs for queries without from clause
-  bool select_exprs_codegen_enabled_;
-
-  // plan service-related - impalad optionally uses a standalone
-  // plan service (see FLAGS_use_planservice etc)
-  boost::shared_ptr<apache::thrift::transport::TTransport> planservice_socket_;
-  boost::shared_ptr<apache::thrift::transport::TTransport> planservice_transport_;
-  boost::shared_ptr<apache::thrift::protocol::TProtocol> planservice_protocol_;
-  boost::scoped_ptr<ImpalaPlanServiceClient> planservice_client_;
 
   // map from query id to exec state; QueryExecState is owned by us and referenced
   // as a shared_ptr to allow asynchronous deletion
@@ -905,6 +752,9 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
 
   // Generate unique session id for HiveServer2 session
   boost::uuids::random_generator uuid_generator_;
+
+  // Lock to protect uuid_generator
+  boost::mutex uuid_lock_;
 };
 
 // Create an ImpalaServer and Thrift servers.

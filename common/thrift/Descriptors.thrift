@@ -52,7 +52,8 @@ enum THdfsCompression {
   DEFLATE,
   BZIP2,
   SNAPPY,
-  SNAPPY_BLOCKED // Used by sequence and rc files but not stored in the metadata.
+  SNAPPY_BLOCKED, // Used by sequence and rc files but not stored in the metadata.
+  LZO
 }
 
 // Mapping from names defined by Avro to the enum.
@@ -92,8 +93,12 @@ struct THdfsTable {
 
   // map from partition id to partition metadata
   4: required map<i64, THdfsPartition> partitions
-  5: required list<Types.TPrimitiveType> colTypes
-  6: optional list<string> keyColNames
+
+  // String to indicate a NULL column value in text files
+  5: required string nullColumnValue
+
+  6: required list<Types.TPrimitiveType> colTypes
+  7: optional list<string> keyColNames
 }
 
 struct THBaseTable {
