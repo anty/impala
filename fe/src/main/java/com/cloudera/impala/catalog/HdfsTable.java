@@ -738,7 +738,8 @@ List<org.apache.hadoop.hive.metastore.api.Partition> msPartitions,
                 conf.set(HorizonConstants.HIVE_TABLE_PARTITION_INFO_CONF_KEY,
                         parameters.get(HorizonConstants.HIVE_TABLE_PARTITION_INFO_CONF_KEY));
                 conf.set(HugetableInputFormatProxy.HIVE_TABLE_NAME, msTbl.getTableName());
-                conf = HBaseConfiguration.addHbaseResources(conf);
+		   conf.set(HugetableInputFormatProxy.HIVE_DATABASE_NAME,msTbl.getDbName());
+                conf = HBaseConfiguration.addHbaseResources(conf);	
                 Path rootDir = FSUtils.getRootDir(conf);
                 LOG.info("hive table name is "+msTbl.getTableName(),", HBase root directory is "+rootDir.toString());
 
