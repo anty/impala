@@ -24,7 +24,8 @@ if [ ! -d $JAVA_HOME ] ; then
 fi
 
 if [ -z $IMPALA_HOME ]; then
-    this=${0/-/} # login-shells often have leading '-' chars
+    #this=${0/-/} # login-shells often have leading '-' chars
+    this=${BASH_SOURCE-$0}
     shell_exec=`basename $SHELL`
     if [ "$this" = "$shell_exec" ]; then
         # Assume we're already in IMPALA_HOME
