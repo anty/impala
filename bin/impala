@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+
+usage="Usage: impala <command> \
+       Where <command> an option from one of these categories:\
+       statestore     run the state store\
+       impalaserver   run the impala backend server\
+"
+
+this=${BASH_SOURCE-$0}
+bin=`dirname $this`
+bin=`cd $bin;pwd -P`
+
+. $bin/impala-config.sh
+. $bin/impala-args.sh
+. $bin/set-classpath.sh
+#get arguments
+
+COMMAND=$1
+shift
+
+if [ "x$IMPALA_BUILD_TYPE" = "x" ];then
+   
+   echo "built type must be sepcified in impala-args.sh"
+   exit 1
+fi
+  
+
+if [ "$COMMAND" = "statestore" ];then
+
+  exec $IMPALA_HOME/be/$IMPALA_BUILD_TYPE/statestore/statestored $IMPALA_STATESTORE_ARGS
+
+elif [ "$COMMAND" = "impalaserver" ];then
+
+  exec $IMPALA_HOME/be/build/${IMPALA_BUILD_TYPE}/service/impalad $IMPALA_SERVER_ARGS
+
+else
+  echo "unrecognized command $COMMAND "
+  
+fi
+ 

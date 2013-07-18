@@ -15,6 +15,14 @@
 
 
 # This script runs the impala shell from a dev environment.
+
+this=${BASH_SOURCE-$0}
+bin=`dirname $this`
+bin=`cd $bin;pwd -P`
+
+. $bin/impala-config.sh
+
+
 . ${IMPALA_HOME}/bin/set-pythonpath.sh
 SHELL_HOME=${IMPALA_SHELL_HOME:-${IMPALA_HOME}/shell}
 python ${SHELL_HOME}/impala_shell.py "$@"
