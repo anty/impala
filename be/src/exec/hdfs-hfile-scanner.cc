@@ -27,6 +27,7 @@
 #include <snappy.h>
 #include "util/codec.h"
 #include <boost/scoped_ptr.hpp>
+#include <math.h>
 
 using namespace std;
 using namespace impala;
@@ -35,6 +36,7 @@ using namespace hfile;
 
 namespace
 {
+
 class Deserializer
 {
 public:
@@ -225,7 +227,40 @@ bool LazyBinaryDeserializer::Write_Field(MemPool* pool,Tuple*tuple,uint8_t** dat
         *data+=len;
         break;
     }
-
+    case TYPE_TIMESTAMP:
+    {
+        int32_t tmp =  ReadWriteUtil::GetInt(*data);
+        *data+=4;
+        bool has_decimal = tmp & 0x80000000;
+        int32_t time = tmp & 0x7FFFFFFF;
+        int32_t nano = 0;
+        if(has_decimal)
+        {
+            *data += ReadWriteUtil::GetVInt(*data,&nano);
+        }
+        if(slot)
+        {
+            if(nano != 0)
+            {
+                int len = static_cast<int32_t>(floor(log10(nano))) + 1;
+                int tmp = 0;
+                while(nano != 0)
+                {
+                    tmp *= 10;
+                    tmp+=nano %10;
+                    nano /=10;
+                }
+                nano = tmp;
+                if(len < 9)
+                {
+                    nano *= pow(10,9-len);
+                }
+            }
+            *reinterpret_cast<TimestampValue*>(slot) = TimestampValue(static_cast<int64_t>(time)
+                    ,static_cast<int64_t>(nano));
+        }
+        break;
+    }
     default:
         DCHECK(false);
     }
@@ -441,6 +476,17 @@ bool BinarySortableDeserializer::Write_Field(MemPool * pool, Tuple * tuple, uint
         }
         break;
 
+    }
+    case TYPE_TIMESTAMP:
+    {
+        //serialized sortable timestamp always contains both time and fractional part.
+        int32_t time = ReadWriteUtil::GetInt(*data) & 0x7FFFFFFF;
+        *data+=4;
+        int32_t nano = ReadWriteUtil::GetInt(*data);
+        *data+=4;
+        *reinterpret_cast<TimestampValue*>(slot) = TimestampValue(static_cast<int64_t>(time)
+                ,static_cast<int64_t>(nano));
+        break;
     }
     default:
         DCHECK(false);
