@@ -17,6 +17,7 @@ package com.cloudera.impala.analysis;
 import java.util.ArrayList;
 import java.util.List;
 
+import com.cloudera.impala.authorization.Privilege;
 import com.cloudera.impala.catalog.Table;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.common.InternalException;
@@ -29,12 +30,12 @@ import com.google.common.collect.Lists;
  * an inline view, or a base table, such as Hive table or HBase table. This abstract
  * representation of table also contains the JOIN specification.
  */
-public abstract class TableRef extends ParseNodeBase {
+public abstract class TableRef implements ParseNode {
   // Table alias
   protected final String alias;
 
   protected JoinOperator joinOp;
-  private ArrayList<String> joinHints;
+  protected ArrayList<String> joinHints;
   protected Expr onClause;
   protected List<String> usingColNames;
 
@@ -58,13 +59,36 @@ public abstract class TableRef extends ParseNodeBase {
     isAnalyzed = false;
   }
 
+  /**
+   * C'tor for cloning.
+   */
+  protected TableRef(TableRef other) {
+    super();
+    this.alias = other.alias;
+    this.joinOp = other.joinOp;
+    this.joinHints =
+        (other.joinHints != null) ? Lists.newArrayList(other.joinHints) : null;
+    this.usingColNames =
+        (other.usingColNames != null) ? Lists.newArrayList(other.usingColNames) : null;
+    this.onClause = (other.onClause != null) ? other.onClause.clone(null) : null;
+    isAnalyzed = false;
+  }
+
   public JoinOperator getJoinOp() {
     // if it's not explicitly set, we're doing an inner join
     return (joinOp == null ? JoinOperator.INNER_JOIN : joinOp);
   }
 
+  public ArrayList<String> getJoinHints() {
+    return joinHints;
+  }
+
   public Expr getOnClause() {
     return onClause;
+  }
+
+  public List<String> getUsingClause() {
+    return usingColNames;
   }
 
   /**
@@ -109,7 +133,7 @@ public abstract class TableRef extends ParseNodeBase {
   }
 
   public String getExplicitAlias() { return alias; }
-  public Table getTable() { return desc.getTable(); }
+  public Table getTable() { return getDesc().getTable(); }
   public void setJoinOp(JoinOperator op) { this.joinOp = op; }
   public void setOnClause(Expr e) { this.onClause = e; }
   public void setUsingClause(List<String> colNames) { this.usingColNames = colNames; }
@@ -279,4 +303,14 @@ public abstract class TableRef extends ParseNodeBase {
   abstract public String getAlias();
 
   abstract public TableName getAliasAsName();
+
+  @Override
+  public abstract TableRef clone();
+
+  /*
+   * Gets the privilege requirement. This is always SELECT for TableRefs.
+   */
+  public Privilege getPrivilegeRequirement() {
+    return Privilege.SELECT;
+  }
 }

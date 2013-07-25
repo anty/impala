@@ -30,9 +30,11 @@ class TScanRange;
 // Includes ScanNode common counters:
 //   BytesRead - total bytes read by this scan node
 //
-//   TotalRawHdfsReadTime - it measures the total time spent in the disk-io-mgr's reading
-//     threads for this node. For example, if we have 3 reading threads and each spent
+//   TotalRawReadTime - it measures the total time spent in underlying reads.
+//     For HDFS files, this is the time in the disk-io-mgr's reading threads for 
+//     this node. For example, if we have 3 reading threads and each spent
 //     1 sec, this counter will report 3 sec.
+//     For HBase, this is the time spent in the region server.
 //
 //   TotalReadThroughput - BytesRead divided by the total time spent in this node
 //     (from Open to Close). For IO bounded queries, this should be very close to the
@@ -43,10 +45,6 @@ class TScanRange;
 //     query is IO bounded or not.
 //
 //   NumDisksAccessed - number of disks accessed.
-//
-//   AverageIoMgrQueueCapacity - the average queue capacity in the io mgr for this node.
-//   AverageIoMgrQueueSize - the average queue size (for ready buffers) in the io mgr
-//     for this node.
 //
 //   AverageScannerThreadConcurrency - the average number of active scanner threads. A
 //     scanner thread is considered active if it is not blocked by IO. This number would
@@ -64,6 +62,10 @@ class TScanRange;
 //
 //   Hdfs Read Thread Concurrency Bucket - the bucket counting (%) of hdfs read thread
 //     concurrency.
+//
+//   NumScannerThreadsStarted - the number of scanner threads started for the duration
+//     of the ScanNode. This is at most the number of scan ranges but should be much
+//     less since a single scanner thread will likely process multiple scan ranges.
 //
 //   ScanRangesComplete - number of scan ranges completed
 //
@@ -120,7 +122,8 @@ class ScanNode : public ExecNode {
   // names of ScanNode common counters
   static const std::string BYTES_READ_COUNTER;
   static const std::string ROWS_READ_COUNTER;
-  static const std::string TOTAL_READ_TIMER;
+  static const std::string TOTAL_HDFS_READ_TIMER;
+  static const std::string TOTAL_HBASE_READ_TIMER;
   static const std::string TOTAL_THROUGHPUT_COUNTER;
   static const std::string PER_READ_THREAD_THROUGHPUT_COUNTER;
   static const std::string NUM_DISKS_ACCESSED_COUNTER;
@@ -129,9 +132,8 @@ class ScanNode : public ExecNode {
   static const std::string SCANNER_THREAD_COUNTERS_PREFIX;
   static const std::string SCANNER_THREAD_TOTAL_WALLCLOCK_TIME;
   static const std::string AVERAGE_SCANNER_THREAD_CONCURRENCY;
-  static const std::string AVERAGE_IO_MGR_QUEUE_CAPACITY;
-  static const std::string AVERAGE_IO_MGR_QUEUE_SIZE;
   static const std::string AVERAGE_HDFS_READ_THREAD_CONCURRENCY;
+  static const std::string NUM_SCANNER_THREADS_STARTED;
 
  protected:
   RuntimeProfile::Counter* bytes_read_counter_; // # bytes read from the scanner
@@ -161,6 +163,8 @@ class ScanNode : public ExecNode {
   // Average number of active hdfs reading threads
   // This should be created in Open and stopped when all the scanner threads are done.
   RuntimeProfile::Counter* average_hdfs_read_thread_concurrency_;
+
+  RuntimeProfile::Counter* num_scanner_threads_started_counter_;
 
   // HDFS read thread concurrency bucket: bucket[i] refers to the number of sample
   // taken where there are i concurrent hdfs read thread running

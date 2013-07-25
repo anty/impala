@@ -17,6 +17,7 @@ package com.cloudera.impala.analysis;
 import java.util.ArrayList;
 import java.util.List;
 
+import com.cloudera.impala.catalog.AuthorizationException;
 import com.cloudera.impala.common.AnalysisException;
 import com.google.common.collect.Lists;
 
@@ -30,7 +31,9 @@ import com.google.common.collect.Lists;
  * analysis of the ORDER BY and LIMIT clauses.
  *
  */
-public abstract class QueryStmt extends ParseNodeBase {
+public abstract class QueryStmt extends StatementBase {
+  protected WithClause withClause;
+
   protected ArrayList<OrderByElement> orderByElements;
   protected final long limit;
 
@@ -60,12 +63,23 @@ public abstract class QueryStmt extends ParseNodeBase {
   protected SortInfo sortInfo;
 
   // True if this QueryStmt is the top level query from an EXPLAIN <query>
-  private boolean isExplain = false;
+  protected boolean isExplain = false;
+
+  // Analyzer that was used to analyze this query statement.
+  protected Analyzer analyzer;
 
   QueryStmt(ArrayList<OrderByElement> orderByElements, long limit) {
     this.orderByElements = orderByElements;
     this.limit = limit;
     this.sortInfo = null;
+  }
+
+  @Override
+  public void analyze(Analyzer analyzer) throws AnalysisException,
+      AuthorizationException {
+    this.analyzer = analyzer;
+    if (hasWithClause()) withClause.analyze(analyzer);
+    analyzer.setIsExplain(isExplain);
   }
 
   /**
@@ -84,7 +98,7 @@ public abstract class QueryStmt extends ParseNodeBase {
     for (OrderByElement orderByElement: orderByElements) {
       // create copies, we don't want to modify the original parse node, in case
       // we need to print it
-      orderingExprs.add(orderByElement.getExpr().clone());
+      orderingExprs.add(orderByElement.getExpr().clone(null));
       isAscOrder.add(Boolean.valueOf(orderByElement.getIsAsc()));
     }
     substituteOrdinals(orderingExprs, "ORDER BY");
@@ -134,6 +148,18 @@ public abstract class QueryStmt extends ParseNodeBase {
    */
   public abstract void getMaterializedTupleIds(ArrayList<TupleId> tupleIdList);
 
+  public void setWithClause(WithClause withClause) {
+    this.withClause = withClause;
+  }
+
+  public boolean hasWithClause() {
+    return withClause != null;
+  }
+
+  public WithClause getWithClause() {
+    return withClause;
+  }
+
   public ArrayList<OrderByElement> getOrderByElements() {
     return orderByElements;
   }
@@ -162,6 +188,11 @@ public abstract class QueryStmt extends ParseNodeBase {
     return resultExprs;
   }
 
+  public void setResultExprs(List<Expr> resultExprs) {
+    this.resultExprs.clear();
+    this.resultExprs.addAll(resultExprs);
+  }
+
   public void setIsExplain(boolean isExplain) {
     this.isExplain = isExplain;
   }
@@ -169,4 +200,15 @@ public abstract class QueryStmt extends ParseNodeBase {
   public boolean isExplain() {
     return isExplain;
   }
+
+  public ArrayList<OrderByElement> cloneOrderByElements() {
+    return orderByElements != null ? Lists.newArrayList(orderByElements) : null;
+  }
+
+  public WithClause cloneWithClause() {
+    return withClause != null ? withClause.clone() : null;
+  }
+
+  @Override
+  public abstract QueryStmt clone();
 }

@@ -48,6 +48,8 @@ struct TQueryOptions {
   4: optional i32 batch_size = 0
   5: optional i32 num_nodes = NUM_NODES_ALL
   6: optional i64 max_scan_range_length = 0
+
+  // Deprecated in Impala 1.1
   7: optional i32 num_scanner_threads = 0
   8: optional i32 max_io_buffers = 0
   9: optional bool allow_unsupported_formats = 0
@@ -55,6 +57,10 @@ struct TQueryOptions {
   11: optional string debug_action = ""
   12: optional i64 mem_limit = 0
   13: optional bool abort_on_default_limit_exceeded = 0
+  14: optional Descriptors.THdfsCompression parquet_compression_codec =
+      Descriptors.THdfsCompression.SNAPPY
+  15: optional i32 hbase_caching = 0
+  16: optional bool hbase_cache_blocks = 0
 }
 
 // A scan range plus the parameters needed to execute that scan.
@@ -105,6 +111,9 @@ struct TPlanFragmentExecParams {
 struct TQueryGlobals {
   // String containing a timestamp set as the current time.
   1: required string now_string
+  
+  // Name of the user executing this query. 
+  2: optional string user
 }
 
 

@@ -48,6 +48,8 @@ class HBaseScanNode : public ScanNode {
 
   virtual Status SetScanRanges(const std::vector<TScanRangeParams>& scan_ranges);
 
+  const int suggested_max_caching() const { return suggested_max_caching_; }
+
  protected:
   // Write debug string of this into out.
   virtual void DebugString(int indentation_level, std::stringstream* out) const;
@@ -90,14 +92,18 @@ class HBaseScanNode : public ScanNode {
   // List of non-row-key slots sorted by col_pos(). Populated in Prepare().
   std::vector<SlotDescriptor*> sorted_non_key_slots_;
 
-  // List of pointers to family/qualifier in same sort order as sorted_non_key_slots_.
+  // List of pointers to family/qualifier/binary encoding in same sort order as
+  // sorted_non_key_slots_.
   // The memory pointed to by the list-elements is owned by the corresponding 
   // HBaseTableDescriptor.
-  std::vector<const std::pair<std::string, std::string>* > sorted_cols_;
+  std::vector<const HBaseTableDescriptor::HBaseColumnDescriptor* > sorted_cols_;
 
   // Slot into which the HBase row key is written.
   // NULL if row key is not requested.
   SlotDescriptor* row_key_slot_;
+
+  // True, if row key is binary encoded
+  bool row_key_binary_encoded_;
 
   // Size of tuple buffer determined by size of tuples and capacity of row batches.
   int tuple_buffer_size_;
@@ -111,6 +117,10 @@ class HBaseScanNode : public ScanNode {
 
   // Helper class for converting text to other types;
   boost::scoped_ptr<TextConverter> text_converter_;
+
+  // Max value for "setCaching" suggested by FE. If no value was suggested by the FE, this
+  // will be 0.
+  int suggested_max_caching_;
 
   // Writes a slot in tuple_ from an HBase value containing text data.
   // The HBase value is converted into the appropriate target type.

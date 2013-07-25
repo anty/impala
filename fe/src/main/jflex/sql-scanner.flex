@@ -39,10 +39,12 @@ import com.cloudera.impala.analysis.SqlParserSymbols;
 %line
 %column
 %{
-  // map from keyword string to token id
-  // we use a linked hash map because the insertion order is important.
+  // Map from keyword string to token id.
+  // We use a linked hash map because the insertion order is important.
   // for example, we want "and" to come after "&&" to make sure error reporting
-  // uses "and" as a display name and not "&&"
+  // uses "and" as a display name and not "&&".
+  // Please keep the puts sorted alphabetically by keyword (where the order
+  // does not affect the desired error reporting)
   private static final Map<String, Integer> keywordMap =
       new LinkedHashMap<String, Integer>();
   static {
@@ -58,10 +60,6 @@ import com.cloudera.impala.analysis.SqlParserSymbols;
     keywordMap.put("bigint", new Integer(SqlParserSymbols.KW_BIGINT));
     keywordMap.put("boolean", new Integer(SqlParserSymbols.KW_BOOLEAN));
     keywordMap.put("by", new Integer(SqlParserSymbols.KW_BY));
-    keywordMap.put("distinctpc",
-       new Integer(SqlParserSymbols.KW_DISTINCTPC));
-    keywordMap.put("distinctpcsa",
-       new Integer(SqlParserSymbols.KW_DISTINCTPCSA));
     keywordMap.put("case", new Integer(SqlParserSymbols.KW_CASE));
     keywordMap.put("cast", new Integer(SqlParserSymbols.KW_CAST));    
     keywordMap.put("change", new Integer(SqlParserSymbols.KW_CHANGE));
@@ -70,6 +68,7 @@ import com.cloudera.impala.analysis.SqlParserSymbols;
     keywordMap.put("comment", new Integer(SqlParserSymbols.KW_COMMENT));
     keywordMap.put("count", new Integer(SqlParserSymbols.KW_COUNT));
     keywordMap.put("create", new Integer(SqlParserSymbols.KW_CREATE));
+    keywordMap.put("data", new Integer(SqlParserSymbols.KW_DATA));
     keywordMap.put("database", new Integer(SqlParserSymbols.KW_DATABASE));
     keywordMap.put("databases", new Integer(SqlParserSymbols.KW_DATABASES));
     keywordMap.put("date", new Integer(SqlParserSymbols.KW_DATE));
@@ -78,6 +77,8 @@ import com.cloudera.impala.analysis.SqlParserSymbols;
     keywordMap.put("desc", new Integer(SqlParserSymbols.KW_DESC));
     keywordMap.put("describe", new Integer(SqlParserSymbols.KW_DESCRIBE));		
     keywordMap.put("distinct", new Integer(SqlParserSymbols.KW_DISTINCT));
+    keywordMap.put("distinctpc", new Integer(SqlParserSymbols.KW_DISTINCTPC));
+    keywordMap.put("distinctpcsa", new Integer(SqlParserSymbols.KW_DISTINCTPCSA));
     keywordMap.put("div", new Integer(SqlParserSymbols.KW_DIV));
     keywordMap.put("double", new Integer(SqlParserSymbols.KW_DOUBLE));
     keywordMap.put("drop", new Integer(SqlParserSymbols.KW_DROP));
@@ -92,27 +93,32 @@ import com.cloudera.impala.analysis.SqlParserSymbols;
     keywordMap.put("fileformat", new Integer(SqlParserSymbols.KW_FILEFORMAT));
     keywordMap.put("float", new Integer(SqlParserSymbols.KW_FLOAT));
     keywordMap.put("format", new Integer(SqlParserSymbols.KW_FORMAT));
+    keywordMap.put("formatted", new Integer(SqlParserSymbols.KW_FORMATTED));
     keywordMap.put("from", new Integer(SqlParserSymbols.KW_FROM));
     keywordMap.put("full", new Integer(SqlParserSymbols.KW_FULL));
     keywordMap.put("group", new Integer(SqlParserSymbols.KW_GROUP));
     keywordMap.put("having", new Integer(SqlParserSymbols.KW_HAVING));
     keywordMap.put("if", new Integer(SqlParserSymbols.KW_IF));
-    keywordMap.put("is", new Integer(SqlParserSymbols.KW_IS));
     keywordMap.put("in", new Integer(SqlParserSymbols.KW_IN));
     keywordMap.put("inner", new Integer(SqlParserSymbols.KW_INNER));
+    keywordMap.put("inpath", new Integer(SqlParserSymbols.KW_INPATH));
     keywordMap.put("insert", new Integer(SqlParserSymbols.KW_INSERT));
+    keywordMap.put("int", new Integer(SqlParserSymbols.KW_INT));
+    keywordMap.put("integer", new Integer(SqlParserSymbols.KW_INT));
     keywordMap.put("interval", new Integer(SqlParserSymbols.KW_INTERVAL));
     keywordMap.put("into", new Integer(SqlParserSymbols.KW_INTO)); 
-    keywordMap.put("int", new Integer(SqlParserSymbols.KW_INT));    
-    keywordMap.put("integer", new Integer(SqlParserSymbols.KW_INT));
+    keywordMap.put("invalidate", new Integer(SqlParserSymbols.KW_INVALIDATE));
+    keywordMap.put("is", new Integer(SqlParserSymbols.KW_IS));
     keywordMap.put("join", new Integer(SqlParserSymbols.KW_JOIN));
     keywordMap.put("left", new Integer(SqlParserSymbols.KW_LEFT));
     keywordMap.put("like", new Integer(SqlParserSymbols.KW_LIKE));
     keywordMap.put("limit", new Integer(SqlParserSymbols.KW_LIMIT));
     keywordMap.put("lines", new Integer(SqlParserSymbols.KW_LINES));
+    keywordMap.put("load", new Integer(SqlParserSymbols.KW_LOAD));
     keywordMap.put("location", new Integer(SqlParserSymbols.KW_LOCATION));
-    keywordMap.put("min", new Integer(SqlParserSymbols.KW_MIN));    
     keywordMap.put("max", new Integer(SqlParserSymbols.KW_MAX));
+    keywordMap.put("metadata", new Integer(SqlParserSymbols.KW_METADATA));
+    keywordMap.put("min", new Integer(SqlParserSymbols.KW_MIN));    
     keywordMap.put("not", new Integer(SqlParserSymbols.KW_NOT));
     keywordMap.put("null", new Integer(SqlParserSymbols.KW_NULL));
     keywordMap.put("on", new Integer(SqlParserSymbols.KW_ON));    
@@ -126,38 +132,41 @@ import com.cloudera.impala.analysis.SqlParserSymbols;
     keywordMap.put("partitioned", new Integer(SqlParserSymbols.KW_PARTITIONED));
     keywordMap.put("rcfile", new Integer(SqlParserSymbols.KW_RCFILE));   
     keywordMap.put("real", new Integer(SqlParserSymbols.KW_DOUBLE));
+    keywordMap.put("refresh", new Integer(SqlParserSymbols.KW_REFRESH));
     keywordMap.put("regexp", new Integer(SqlParserSymbols.KW_REGEXP));
     keywordMap.put("rename", new Integer(SqlParserSymbols.KW_RENAME));
     keywordMap.put("replace", new Integer(SqlParserSymbols.KW_REPLACE));
-    keywordMap.put("rlike", new Integer(SqlParserSymbols.KW_RLIKE));
     keywordMap.put("right", new Integer(SqlParserSymbols.KW_RIGHT));
+    keywordMap.put("rlike", new Integer(SqlParserSymbols.KW_RLIKE));
     keywordMap.put("row", new Integer(SqlParserSymbols.KW_ROW));
     keywordMap.put("schema", new Integer(SqlParserSymbols.KW_SCHEMA));
     keywordMap.put("schemas", new Integer(SqlParserSymbols.KW_SCHEMAS));
     keywordMap.put("select", new Integer(SqlParserSymbols.KW_SELECT));
     keywordMap.put("semi", new Integer(SqlParserSymbols.KW_SEMI));
+    keywordMap.put("sequencefile", new Integer(SqlParserSymbols.KW_SEQUENCEFILE));
     keywordMap.put("set", new Integer(SqlParserSymbols.KW_SET));
     keywordMap.put("show", new Integer(SqlParserSymbols.KW_SHOW));
     keywordMap.put("smallint", new Integer(SqlParserSymbols.KW_SMALLINT));
     keywordMap.put("stored", new Integer(SqlParserSymbols.KW_STORED));
     keywordMap.put("string", new Integer(SqlParserSymbols.KW_STRING));
     keywordMap.put("sum", new Integer(SqlParserSymbols.KW_SUM));
-    keywordMap.put("sequencefile", new Integer(SqlParserSymbols.KW_SEQUENCEFILE));
     keywordMap.put("table", new Integer(SqlParserSymbols.KW_TABLE));
     keywordMap.put("tables", new Integer(SqlParserSymbols.KW_TABLES));
     keywordMap.put("terminated", new Integer(SqlParserSymbols.KW_TERMINATED)); 
-    keywordMap.put("textfile", new Integer(SqlParserSymbols.KW_TEXTFILE)); 
+    keywordMap.put("textfile", new Integer(SqlParserSymbols.KW_TEXTFILE));
+    keywordMap.put("then", new Integer(SqlParserSymbols.KW_THEN));
+    keywordMap.put("timestamp", new Integer(SqlParserSymbols.KW_TIMESTAMP));
     keywordMap.put("tinyint", new Integer(SqlParserSymbols.KW_TINYINT));
     keywordMap.put("to", new Integer(SqlParserSymbols.KW_TO));
+    keywordMap.put("true", new Integer(SqlParserSymbols.KW_TRUE));
+    keywordMap.put("union", new Integer(SqlParserSymbols.KW_UNION));
     keywordMap.put("use", new Integer(SqlParserSymbols.KW_USE));
     keywordMap.put("using", new Integer(SqlParserSymbols.KW_USING));
-    keywordMap.put("union", new Integer(SqlParserSymbols.KW_UNION));
+    keywordMap.put("values", new Integer(SqlParserSymbols.KW_VALUES));
+    keywordMap.put("view", new Integer(SqlParserSymbols.KW_VIEW));
     keywordMap.put("when", new Integer(SqlParserSymbols.KW_WHEN));
     keywordMap.put("where", new Integer(SqlParserSymbols.KW_WHERE));
-    keywordMap.put("then", new Integer(SqlParserSymbols.KW_THEN));
-    keywordMap.put("true", new Integer(SqlParserSymbols.KW_TRUE));
-    keywordMap.put("timestamp", new Integer(SqlParserSymbols.KW_TIMESTAMP));
-    keywordMap.put("values", new Integer(SqlParserSymbols.KW_VALUES)); 
+    keywordMap.put("with", new Integer(SqlParserSymbols.KW_WITH));
   }
     
   // map from token id to token description
@@ -216,18 +225,22 @@ LineTerminator = \r|\n|\r\n
 NonTerminator = [^\r\n]
 Whitespace = {LineTerminator} | [ \t\f]
 
-IdentifierOrKwContents = [:digit:]*[:jletter:][:jletterdigit:]* | "&&" | "||"
-
-IdentifierOrKw = \`{IdentifierOrKwContents}\` | {IdentifierOrKwContents}
+// Order of rules to resolve ambiguity:
+// The rule for recognizing integer literals must come before the rule for
+// double literals to, e.g., recognize "1234" as an integer literal.
+// The rule for recognizing double literals must come before the rule for
+// identifiers to, e.g., recognize "1e6" as a double literal.
 IntegerLiteral = [:digit:][:digit:]*
-SingleQuoteStringLiteral = \'(\\.|[^\\\'])*\'
-DoubleQuoteStringLiteral = \"(\\.|[^\\\"])*\"
-
 FLit1 = [0-9]+ \. [0-9]*
 FLit2 = \. [0-9]+
 FLit3 = [0-9]+
 Exponent = [eE] [+-]? [0-9]+
 DoubleLiteral = ({FLit1}|{FLit2}|{FLit3}) {Exponent}?
+
+IdentifierOrKw = [:digit:]*[:jletter:][:jletterdigit:]* | "&&" | "||"
+QuotedIdentifier = \`(\\.|[^\\\`])*\`
+SingleQuoteStringLiteral = \'(\\.|[^\\\'])*\'
+DoubleQuoteStringLiteral = \"(\\.|[^\\\"])*\"
 
 Comment = {TraditionalComment} | {EndOfLineComment}
 TraditionalComment = "/*" [^*] ~"*/" | "/*" "*"+ "/"
@@ -259,28 +272,6 @@ EndOfLineComment = "--" {NonTerminator}* {LineTerminator}?
 "'" { return newToken(SqlParserSymbols.UNMATCHED_STRING_LITERAL, null); }
 "`" { return newToken(SqlParserSymbols.UNMATCHED_STRING_LITERAL, null); }
 
-{IdentifierOrKw} {
-  if (yytext().startsWith("`")) {
-    return newToken(SqlParserSymbols.IDENT, yytext().substring(1, yytext().length() - 1));
-  }
-
-  String text = yytext();
-  Integer kw_id = keywordMap.get(text.toLowerCase());
-  if (kw_id != null) {
-    return newToken(kw_id.intValue(), text);
-  } else {
-    return newToken(SqlParserSymbols.IDENT, text);
-  }
-}
-
-{SingleQuoteStringLiteral} {
-  return newToken(SqlParserSymbols.STRING_LITERAL, yytext().substring(1, yytext().length()-1));
-}
-
-{DoubleQuoteStringLiteral} {
-  return newToken(SqlParserSymbols.STRING_LITERAL, yytext().substring(1, yytext().length()-1));
-}
-
 {IntegerLiteral} {
   BigInteger val = null;
   try {
@@ -303,6 +294,34 @@ EndOfLineComment = "--" {NonTerminator}* {LineTerminator}?
    return newToken(SqlParserSymbols.NUMERIC_OVERFLOW, yytext());
   }
   return newToken(SqlParserSymbols.FLOATINGPOINT_LITERAL, val);
+}
+
+{QuotedIdentifier} {
+  // Remove the quotes and trim whitespace.
+  String trimmedIdent = yytext().substring(1, yytext().length() - 1).trim();
+  if (trimmedIdent.isEmpty()) {
+    throw new java.io.IOException(
+        "Identifier consisting of only whitespace not allowed.");
+  }
+  return newToken(SqlParserSymbols.IDENT, trimmedIdent);
+}
+
+{IdentifierOrKw} {  
+  String text = yytext();
+  Integer kw_id = keywordMap.get(text.toLowerCase());
+  if (kw_id != null) {
+    return newToken(kw_id.intValue(), text);
+  } else {
+    return newToken(SqlParserSymbols.IDENT, text);
+  }
+}
+
+{SingleQuoteStringLiteral} {
+  return newToken(SqlParserSymbols.STRING_LITERAL, yytext().substring(1, yytext().length()-1));
+}
+
+{DoubleQuoteStringLiteral} {
+  return newToken(SqlParserSymbols.STRING_LITERAL, yytext().substring(1, yytext().length()-1));
 }
 
 {Comment} { /* ignore */ }

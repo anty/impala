@@ -99,12 +99,18 @@ struct THdfsTable {
 
   6: required list<Types.TPrimitiveType> colTypes
   7: optional list<string> keyColNames
+  // Set to the table's Avro schema if this is an Avro table
+  8: optional string avroSchema
 }
 
 struct THBaseTable {
   1: required string tableName
   2: required list<string> families
   3: required list<string> qualifiers
+  
+  // Column i is binary encoded if binary_encoded[i] is true. Otherwise, column i is
+  // text encoded.
+  4: optional list<bool> binary_encoded
 }
 
 // "Union" of all table types.

@@ -63,12 +63,17 @@ double Benchmark::Measure(BenchmarkFunction function, void* args,
 
 Benchmark::Benchmark(const string& name) : name_(name) {}
 
-void Benchmark::AddBenchmark(const string& name, BenchmarkFunction fn, void* args) {
+int Benchmark::AddBenchmark(const string& name, BenchmarkFunction fn, void* args,
+    int baseline_idx) {
+  if (baseline_idx == -1) baseline_idx = benchmarks_.size();
+  CHECK_LE(baseline_idx, benchmarks_.size());
   BenchmarkResult benchmark;
   benchmark.name = name;
   benchmark.fn = fn;
   benchmark.args = args;
+  benchmark.baseline_idx = baseline_idx;
   benchmarks_.push_back(benchmark);
+  return benchmarks_.size() - 1;
 }
 
 string Benchmark::Measure() {
@@ -88,22 +93,24 @@ string Benchmark::Measure() {
   int padding = 0;
   int total_width = function_out_width + rate_out_width + comparison_out_width + padding;
 
-  double base_line = benchmarks_[0].rate;
-  
   ss << name_ << ":"
-     << setw(function_out_width - name_.size() - 1) << "Function" 
-     << setw(rate_out_width) << "Rate" 
+     << setw(function_out_width - name_.size() - 1) << "Function"
+     << setw(rate_out_width) << "Rate (iters/ms)"
      << setw(comparison_out_width) << "Comparison" << endl;
   for (int i = 0; i < total_width; ++i) {
     ss << '-';
   }
   ss << endl;
 
+  int previous_baseline_idx = -1;
   for (int i = 0; i < benchmarks_.size(); ++i) {
+    double base_line = benchmarks_[benchmarks_[i].baseline_idx].rate;
+    if (previous_baseline_idx != benchmarks_[i].baseline_idx && i > 0) ss << endl;
     ss << setw(function_out_width) << benchmarks_[i].name 
        << setw(rate_out_width) << setprecision(4) << benchmarks_[i].rate 
        << setw(comparison_out_width - 1) << setprecision(4) 
        << (benchmarks_[i].rate / base_line) << "X" << endl;
+    previous_baseline_idx = benchmarks_[i].baseline_idx;
   }
   
   return ss.str();

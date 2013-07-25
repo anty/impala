@@ -18,6 +18,7 @@
 
 #include <vector>
 #include <boost/scoped_ptr.hpp>
+#include <boost/shared_ptr.hpp>
 #include <boost/function.hpp>
 
 #include "common/status.h"
@@ -132,11 +133,14 @@ class PlanFragmentExecutor {
   // Profile information for plan and output sink.
   RuntimeProfile* profile();
 
+  // Name for peak memory usage counter
+  static const std::string PEAK_MEMORY_USAGE;
+
  private:
   ExecEnv* exec_env_;  // not owned
   ExecNode* plan_;  // lives in runtime_state_->obj_pool()
   TUniqueId query_id_;
-  boost::scoped_ptr<MemLimit> mem_limit_;
+  boost::shared_ptr<MemLimit> mem_limit_;
 
   // profile reporting-related
   ReportStatusCallback report_status_cb_;
@@ -193,6 +197,9 @@ class PlanFragmentExecutor {
   // This is a measure of how much CPU resources this fragment used during the course
   // of the execution.
   RuntimeProfile::Counter* average_thread_tokens_;
+
+  // Peak memory consumed
+  RuntimeProfile::Counter* peak_mem_usage_;
 
   ObjectPool* obj_pool() { return runtime_state_->obj_pool(); }
 

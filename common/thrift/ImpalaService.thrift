@@ -24,7 +24,6 @@ include "cli_service.thrift"
 //     "num_nodes:1", "abort_on_error:false"
 // The valid keys are listed in this enum. They map to TQueryOptions.
 // Note: If you add an option or change the default, you also need to update:
-// - ImpalaService.DEFAULT_QUERY_OPTIONS
 // - ImpalaInternalService.thrift: TQueryOptions
 // - ImpaladClientExecutor.getBeeswaxQueryConfigurations()
 // - ImpalaServer::SetQueryOptions()
@@ -91,22 +90,27 @@ enum TImpalaQueryOptions {
   
   // If true, raise an error when the DEFAULT_ORDER_BY_LIMIT has been reached.
   ABORT_ON_DEFAULT_LIMIT_EXCEEDED,
-}
 
-// Default values for each query option in ImpalaService.TImpalaQueryOptions
-const map<TImpalaQueryOptions, string> DEFAULT_QUERY_OPTIONS = {
-  TImpalaQueryOptions.ABORT_ON_ERROR : "false",
-  TImpalaQueryOptions.MAX_ERRORS : "0",
-  TImpalaQueryOptions.DISABLE_CODEGEN : "false",
-  TImpalaQueryOptions.BATCH_SIZE : "0",
-  TImpalaQueryOptions.NUM_NODES : "0",
-  TImpalaQueryOptions.MAX_SCAN_RANGE_LENGTH : "0",
-  TImpalaQueryOptions.MAX_IO_BUFFERS : "0"
-  TImpalaQueryOptions.NUM_SCANNER_THREADS : "0"
-  TImpalaQueryOptions.ALLOW_UNSUPPORTED_FORMATS : "false"
-  TImpalaQueryOptions.DEFAULT_ORDER_BY_LIMIT : "-1"
-  TImpalaQueryOptions.DEBUG_ACTION : ""
-  TImpalaQueryOptions.MEM_LIMIT : "0"
+  // Compression codec for parquet when inserting into parquet tables.
+  // Valid values are "snappy", "gzip" and "none"
+  // Leave blank to use default.
+  PARQUET_COMPRESSION_CODEC,
+  
+  // HBase scan query option. If set and > 0, HBASE_CACHING is the value for 
+  // "hbase.client.Scan.setCaching()" when querying HBase table. Otherwise, use backend
+  // default.
+  // If the value is too high, then the hbase region server will have a hard time (GC
+  // pressure and long response times). If the value is too small, then there will be
+  // extra trips to the hbase region server.
+  HBASE_CACHING,
+  
+  // HBase scan query option. If set, HBase scan will always set
+  // "hbase.client.setCacheBlocks" to CACHE_BLOCKS. Default is false.
+  // If the table is large and the query is doing big scan, set it to false to
+  // avoid polluting the cache in the hbase region server.
+  // If the table is small and the table is used several time, set it to true to improve
+  // performance. 
+  HBASE_CACHE_BLOCKS,
 }
 
 // The summary of an insert.
@@ -124,22 +128,13 @@ struct TPingImpalaServiceResp {
 }
 
 // Parameters for a ResetTable request which will invalidate a table's metadata.
+// DEPRECATED.
 struct TResetTableReq {
   // Name of the table's parent database.
   1: required string db_name
 
   // Name of the table.
   2: required string table_name
-}
-
-// Response from call to ResetCatalog
-struct TResetCatalogResp {
-  1: required Status.TStatus status
-}
-
-// Response from call to ResetTable
-struct TResetTableResp {
-  1: required Status.TStatus status
 }
 
 // For all rpc that return a TStatus as part of their result type,
@@ -156,9 +151,11 @@ service ImpalaService extends beeswax.BeeswaxService {
       throws(1:beeswax.BeeswaxException error);
         
   // Invalidates all catalog metadata, forcing a reload
+  // DEPRECATED; execute query "invalidate metadata" to refresh metadata 
   Status.TStatus ResetCatalog();
 
   // Invalidates a specific table's catalog metadata, forcing a reload on the next access
+  // DEPRECATED; execute query "refresh <table>" to refresh metadata
   Status.TStatus ResetTable(1:TResetTableReq request)
 
   // Returns the runtime profile string for the given query handle.
@@ -176,9 +173,4 @@ service ImpalaService extends beeswax.BeeswaxService {
 
 // Impala HiveServer2 service
 service ImpalaHiveServer2Service extends cli_service.TCLIService {
-  // Invalidates all catalog metadata, forcing a reload
-  TResetCatalogResp ResetCatalog();
-
-  // Invalidates a specific table's catalog metadata, forcing a reload on the next access
-  TResetTableResp ResetTable(1:TResetTableReq request);
 }

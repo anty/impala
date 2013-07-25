@@ -17,12 +17,11 @@
 # -build_type parameter can be passed to determine the build type to use for the
 # impalad instance.
 
-. ${IMPALA_HOME}/bin/set-classpath.sh
 
 BUILD_TYPE=debug
 IMPALAD_ARGS=""
-
-# Everything except for -build_type should be passed an an Impalad argument
+CLASSPATH_PREFIX=""
+# Everything except for -build_type should be passed as an Impalad argument
 for ARG in $*
 do
   case "$ARG" in
@@ -31,6 +30,9 @@ do
       ;;
     -build_type=release)
       BUILD_TYPE=release
+      ;;
+    -classpath_prefix=*)
+      CLASSPATH_PREFIX=`echo $ARG | sed 's/-classpath_prefix=//'`
       ;;
     -build_type=*)
       echo "Invalid build type. Valid values are: debug, release"
@@ -41,4 +43,7 @@ do
   esac
 done
 
-$IMPALA_HOME/be/build/${BUILD_TYPE}/service/impalad ${IMPALAD_ARGS}
+. ${IMPALA_HOME}/bin/set-classpath.sh
+
+CLASSPATH=$CLASSPATH_PREFIX:$CLASSPATH \
+  $IMPALA_HOME/be/build/${BUILD_TYPE}/service/impalad ${IMPALAD_ARGS}

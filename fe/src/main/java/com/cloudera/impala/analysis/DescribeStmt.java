@@ -14,42 +14,68 @@
 
 package com.cloudera.impala.analysis;
 
+import com.cloudera.impala.authorization.Privilege;
+import com.cloudera.impala.catalog.AuthorizationException;
 import com.cloudera.impala.common.AnalysisException;
-import com.cloudera.impala.common.InternalException;
+import com.cloudera.impala.thrift.TDescribeTableOutputStyle;
 import com.cloudera.impala.thrift.TDescribeTableParams;
 
 /**
- * Representation of a DESCRIBE table statement. 
+ * Representation of a DESCRIBE table statement which returns metadata on
+ * a specified table:
+ * Syntax: DESCRIBE [FORMATTED] <table>
+ *
+ * If FORMATTED is not specified, the statement only returns info on the given table's
+ * column definition (column name, data type, and comment).
+ * If FORMATTED is specified, extended metadata on the table is returned
+ * (in addition to the column definitions). This metadata includes info about the table
+ * properties, SerDe properties, StorageDescriptor properties, and more.
  */
-public class DescribeStmt extends ParseNodeBase {
+public class DescribeStmt extends StatementBase {
+  private final TDescribeTableOutputStyle outputStyle;
   private TableName table;
 
-  public DescribeStmt(TableName table) {
+  public DescribeStmt(TableName table, TDescribeTableOutputStyle outputStyle) {
     this.table = table;
+    this.outputStyle = outputStyle;
   }
 
+  @Override
   public String toSql() {
-    return "DESCRIBE " + table; 
+    StringBuilder sb = new StringBuilder("DESCRIBE ");
+    if (outputStyle != TDescribeTableOutputStyle.MINIMAL) {
+      sb.append(outputStyle.toString());
+    }
+    return sb.toString() + table;
   }
 
   public TableName getTable() {
     return table;
   }
 
-  public String debugString() {
-    return toSql() + table.toString();
+  public TDescribeTableOutputStyle getOutputStyle() {
+    return outputStyle;
   }
 
-  public void analyze(Analyzer analyzer) throws AnalysisException, InternalException {
+  @Override
+  public String debugString() {
+    return toSql();
+  }
+
+  @Override
+  public void analyze(Analyzer analyzer) throws AnalysisException,
+      AuthorizationException {
     if (!table.isFullyQualified()) {
       table = new TableName(analyzer.getDefaultDb(), table.getTbl());
     }
+    analyzer.getTable(table, Privilege.VIEW_METADATA);
   }
 
   public TDescribeTableParams toThrift() {
     TDescribeTableParams params = new TDescribeTableParams();
     params.setTable_name(getTable().getTbl());
     params.setDb(getTable().getDb());
+    params.setOutput_style(outputStyle);
     return params;
   }
 }

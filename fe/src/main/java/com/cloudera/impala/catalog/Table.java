@@ -15,6 +15,7 @@
 package com.cloudera.impala.catalog;
 
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 
@@ -25,8 +26,6 @@ import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
 
 import com.cloudera.impala.analysis.Expr;
-import com.cloudera.impala.catalog.Catalog.TableNotFoundException;
-import com.cloudera.impala.catalog.Db.TableLoadingException;
 import com.cloudera.impala.planner.DataSink;
 import com.cloudera.impala.thrift.TTableDescriptor;
 import com.google.common.collect.Lists;
@@ -62,8 +61,17 @@ public abstract class Table {
   protected final List<TPrimitiveType> colTypes;
   /**  map from lowercase col. name to Column */
   protected final Map<String, Column> colsByName;
+
   protected final List<String> keyColNames;
-  
+
+  // The lastDdlTime recorded in the table parameter; -1 if not set
+  protected final long lastDdlTime;
+
+  // Set of supported table types.
+  protected static EnumSet<TableType> SUPPORTED_TABLE_TYPES =
+      EnumSet.of(TableType.EXTERNAL_TABLE, TableType.MANAGED_TABLE,
+      TableType.VIRTUAL_VIEW);
+
   protected Table(TableId id, org.apache.hadoop.hive.metastore.api.Table msTable, Db db,
       String name, String owner) {
     this.id = id;
@@ -73,8 +81,12 @@ public abstract class Table {
     this.owner = owner;
     this.colsByPos = Lists.newArrayList();
     this.colsByName = Maps.newHashMap();
+
     this.colTypes = Lists.newArrayList();
     this.keyColNames = Lists.newArrayList();
+
+    this.lastDdlTime = (msTable != null) ? Catalog.getLastDdlTime(msTable) : -1;
+
   }
 
   public TableId getId() {
@@ -97,29 +109,26 @@ public abstract class Table {
   }
 
   /**
-   * Populate members of 'this' from metastore info.
-   *
-   * @param client
-   * @param msTbl
-   * @return
-   *         this if successful
-   *         null if loading table failed
+   * Populate members of 'this' from metastore info. Reuse metadata from oldValue if the
+   * metadata is still valid.
    */
-  public abstract Table load(
-      HiveMetaStoreClient client,
+  public abstract void load(Table oldValue, HiveMetaStoreClient client,
       org.apache.hadoop.hive.metastore.api.Table msTbl) throws TableLoadingException;
-
 
   /**
    * Creates the Impala representation of Hive/HBase metadata for one table.
    * Calls load() on the appropriate instance of Table subclass.
+   * oldCacheEntry is the existing cache entry and might still contain valid info to help
+   * speed up metadata loading. oldCacheEntry is null if there is no existing cache entry
+   * (i.e. during fresh load).
    * @return new instance of HdfsTable or HBaseTable
    *         null if the table does not exist
    * @throws TableLoadingException if there was an error loading the table.
    * @throws TableNotFoundException if the table was not found
    */
   public static Table load(TableId id, HiveMetaStoreClient client, Db db,
-      String tblName) throws TableLoadingException, TableNotFoundException {
+      String tblName, Table oldCacheEntry) throws TableLoadingException,
+      TableNotFoundException {
     // turn all exceptions into TableLoadingException
     try {
       org.apache.hadoop.hive.metastore.api.Table msTbl =
@@ -127,28 +136,33 @@ public abstract class Table {
 
       // Check that the Hive TableType is supported
       TableType tableType = TableType.valueOf(msTbl.getTableType());
-      if (tableType != TableType.EXTERNAL_TABLE && tableType != TableType.MANAGED_TABLE) {
+      if (!SUPPORTED_TABLE_TYPES.contains(tableType)) {
         throw new TableLoadingException(String.format(
             "Unsupported table type '%s' for: %s.%s", tableType, db.getName(), tblName));
       }
 
-      // Determine the table type
+      // Create a table of appropriate type and have it load itself.
       Table table = null;
-      if (HBaseTable.isHBaseTable(msTbl)) {
-        table = new HBaseTable(id, msTbl, db, tblName, msTbl.getOwner());
-      } else if (HdfsTable.isHdfsTable(msTbl)) {
-        table = new HdfsTable(id, msTbl, db, tblName, msTbl.getOwner());
-      } else {
-        throw new TableLoadingException("Unrecognized table type for table: " + tblName);
+      if (TableType.valueOf(msTbl.getTableType()) == TableType.VIRTUAL_VIEW) {
+        table = new View(id, msTbl, db, msTbl.getTableName(), msTbl.getOwner());
+      } else if (msTbl.getSd().getInputFormat().equals(HBaseTable.getInputFormat())) {
+        table = new HBaseTable(id, msTbl, db, msTbl.getTableName(), msTbl.getOwner());
+      } else if (HdfsFileFormat.isHdfsFormatClass(msTbl.getSd().getInputFormat())) {
+        table = new HdfsTable(id, msTbl, db, msTbl.getTableName(), msTbl.getOwner());
       }
-      // Have the table load itself.
-      return table.load(client, msTbl);
+      if (table == null) {
+        throw new TableLoadingException(
+            "Unrecognized table type for table: " + msTbl.getTableName());
+      }
+      table.load(oldCacheEntry, client, msTbl);
+      return table;
     } catch (TableLoadingException e) {
       throw e;
     } catch (NoSuchObjectException e) {
       throw new TableNotFoundException("Table not found: " + tblName, e);
     } catch (Exception e) {
-      throw new TableLoadingException("Failed to load metadata for table: " + tblName, e);
+      throw new TableLoadingException(
+          "Failed to load metadata for table: " + tblName, e);
     }
   }
 

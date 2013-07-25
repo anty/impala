@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Without this option Mongoose looks up the SSL library at run-time
+# and may not guess the correct name on some distributions
+SET_SOURCE_FILES_PROPERTIES(${MONGOOSE_SRC_DIR}/mongoose.c PROPERTIES
+  COMPILE_FLAGS -DNO_SSL_DL)
 
 # where to put generated libraries
 set(LIBRARY_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/util")
@@ -32,7 +36,6 @@ add_library(Util
   disk-info.cc
   hdfs-util.cc
   impalad-metrics.cc
-  integer-array.cc
   jni-util.cc
   logging.cc
   mem-info.cc
@@ -58,7 +61,7 @@ add_library(Webserver STATIC
   webserver.cc
 )
 
-target_link_libraries(Webserver pthread dl Util)
+target_link_libraries(Webserver pthread dl Util ssl)
 
 add_executable(network-perf-benchmark network-perf-benchmark.cc)
 add_executable(parquet-reader parquet-reader.cc)
@@ -67,7 +70,6 @@ target_link_libraries(network-perf-benchmark ${IMPALA_LINK_LIBS})
 target_link_libraries(parquet-reader ${IMPALA_LINK_LIBS})
 
 ADD_BE_TEST(authorization-test)
-ADD_BE_TEST(integer-array-test)
 ADD_BE_TEST(runtime-profile-test)
 ADD_BE_TEST(benchmark-test)
 ADD_BE_TEST(decompress-test)
@@ -77,4 +79,8 @@ ADD_BE_TEST(url-coding-test)
 ADD_BE_TEST(thrift-util-test)
 ADD_BE_TEST(bit-util-test)
 ADD_BE_TEST(rle-test)
+ADD_BE_TEST(blocking-queue-test)
+ADD_BE_TEST(dict-test)
+ADD_BE_TEST(thread-pool-test)
+ADD_BE_TEST(internal-queue-test)
 #ADD_BE_TEST(perf-counters-test)

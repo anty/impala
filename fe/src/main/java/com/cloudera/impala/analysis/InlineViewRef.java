@@ -20,6 +20,10 @@ import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.cloudera.impala.authorization.User;
+import com.cloudera.impala.catalog.AuthorizationException;
+import com.cloudera.impala.catalog.Column;
+import com.cloudera.impala.catalog.InlineView;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.common.InternalException;
 import com.cloudera.impala.service.FeSupport;
@@ -34,13 +38,13 @@ public class InlineViewRef extends TableRef {
   private final static Logger LOG = LoggerFactory.getLogger(SelectStmt.class);
 
   // The select or union statement of the inline view
-  private final QueryStmt queryStmt;
+  protected final QueryStmt queryStmt;
 
   // queryStmt has its own analysis context
-  private Analyzer inlineViewAnalyzer;
+  protected Analyzer inlineViewAnalyzer;
 
   // list of tuple ids materialized by queryStmt
-  private final ArrayList<TupleId> materializedTupleIds = Lists.newArrayList();
+  protected final ArrayList<TupleId> materializedTupleIds = Lists.newArrayList();
 
   // Map inline view colname to the underlying, fully substituted expression.
   // This map is built bottom-up, by recursively applying the substitution
@@ -49,7 +53,7 @@ public class InlineViewRef extends TableRef {
   // (and therefore can be evaluated at runtime).
   // Some rhs exprs are wrapped into IF(TupleIsNull(), NULL, expr) by calling
   // makeOutputNullable() if this inline view is a nullable side of an outer join.
-  private final Expr.SubstitutionMap sMap = new Expr.SubstitutionMap();
+  protected final Expr.SubstitutionMap sMap = new Expr.SubstitutionMap();
 
   /**
    * Constructor with alias and inline view select statement
@@ -58,7 +62,17 @@ public class InlineViewRef extends TableRef {
    */
   public InlineViewRef(String alias, QueryStmt queryStmt) {
     super(alias);
+    Preconditions.checkNotNull(queryStmt);
     this.queryStmt = queryStmt;
+  }
+
+  /**
+   * C'tor for cloning.
+   */
+  public InlineViewRef(InlineViewRef other) {
+    super(other);
+    Preconditions.checkNotNull(other.queryStmt);
+    this.queryStmt = other.queryStmt.clone();
   }
 
   /**
@@ -71,9 +85,15 @@ public class InlineViewRef extends TableRef {
    * the underlying, fully substituted query block select list expressions.
    */
   @Override
-  public void analyze(Analyzer analyzer) throws AnalysisException, InternalException {
+  public void analyze(Analyzer analyzer) throws AnalysisException,
+      AuthorizationException {
+    analyzeAsUser(analyzer, analyzer.getUser());
+  }
+
+  protected void analyzeAsUser(Analyzer analyzer, User user)
+      throws AuthorizationException, AnalysisException {
     // Analyze the inline view query statement with its own analyzer
-    inlineViewAnalyzer = new Analyzer(analyzer);
+    inlineViewAnalyzer = new Analyzer(analyzer, user);
     queryStmt.analyze(inlineViewAnalyzer);
     queryStmt.getMaterializedTupleIds(materializedTupleIds);
     desc = analyzer.registerInlineViewRef(this);
@@ -90,16 +110,51 @@ public class InlineViewRef extends TableRef {
     // create sMap
     for (int i = 0; i < queryStmt.getColLabels().size(); ++i) {
       String colName = queryStmt.getColLabels().get(i);
-      SlotDescriptor slotD = analyzer.registerColumnRef(getAliasAsName(), colName);
       Expr colExpr = queryStmt.getResultExprs().get(i);
-      SlotRef slotRef = new SlotRef(slotD);
+      SlotDescriptor slotDesc = analyzer.registerColumnRef(getAliasAsName(), colName);
+      SlotRef slotRef = new SlotRef(slotDesc);
       sMap.lhs.add(slotRef);
       sMap.rhs.add(colExpr);
     }
     LOG.debug("inline view smap: " + sMap.debugString());
 
     // Now do the remaining join analysis
-    analyzeJoin(analyzer);
+    try {
+      analyzeJoin(analyzer);
+    } catch (InternalException e) {
+      throw new AnalysisException(e.getMessage(), e);
+    }
+  }
+
+  /**
+   * Create a non-materialized tuple descriptor in descTbl for this inline view.
+   * This method is called from the analyzer when registering this inline view.
+   */
+  public TupleDescriptor createTupleDescriptor(DescriptorTable descTbl)
+      throws AnalysisException {
+    // Create a fake catalog table for the inline view
+    InlineView inlineView = new InlineView(alias);
+    for (int i = 0; i < queryStmt.getColLabels().size(); ++i) {
+      // inline view select statement has been analyzed. Col label should be filled.
+      Expr selectItemExpr = queryStmt.getResultExprs().get(i);
+      String colAlias = queryStmt.getColLabels().get(i);
+
+      // inline view col cannot have duplicate name
+      if (inlineView.getColumn(colAlias) != null) {
+        throw new AnalysisException("duplicated inline view column alias: '" +
+            colAlias + "'" + " in inline view " + "'" + alias + "'");
+      }
+
+      // create a column and add it to the inline view
+      Column col = new Column(colAlias, selectItemExpr.getType(), i);
+      inlineView.addColumn(col);
+    }
+
+    // Create the non-materialized tuple and set the fake table in it.
+    TupleDescriptor result = descTbl.createTupleDescriptor();
+    result.setIsMaterialized(false);
+    result.setTable(inlineView);
+    return result;
   }
 
   /**
@@ -120,7 +175,7 @@ public class InlineViewRef extends TableRef {
     // Map for substituting SlotRefs with NullLiterals.
     Expr.SubstitutionMap nullSMap = new Expr.SubstitutionMap();
     for (SlotRef rhsSlotRef: rhsSlotRefs) {
-      nullSMap.lhs.add(rhsSlotRef.clone());
+      nullSMap.lhs.add(rhsSlotRef.clone(null));
       nullSMap.rhs.add(new NullLiteral());
     }
 
@@ -196,6 +251,17 @@ public class InlineViewRef extends TableRef {
 
   @Override
   protected String tableRefToSql() {
-    return "(" + queryStmt.toSql() + ") " + alias;
+    // Enclose the alias in quotes if Hive cannot parse it without quotes.
+    // This is needed for view compatibility between Impala and Hive.
+    String aliasSql = ToSqlUtils.getHiveIdentSql(alias);
+    return "(" + queryStmt.toSql() + ") " + aliasSql;
   }
+
+  @Override
+  public String debugString() {
+    return tableRefToSql();
+  }
+
+  @Override
+  public TableRef clone() { return new InlineViewRef(this); }
 }

@@ -63,22 +63,23 @@ typedef std::map<std::string, std::string> FileMoveMap;
 class RuntimeState {
  public:
   RuntimeState(const TUniqueId& fragment_instance_id,
-               const TQueryOptions& query_options,
-               const std::string& now, ExecEnv* exec_env);
+      const TQueryOptions& query_options, const std::string& now,
+      const std::string& user, ExecEnv* exec_env);
 
   // RuntimeState for executing expr in fe-support.
-  RuntimeState(const std::string& now);
+  RuntimeState(const std::string& now, const std::string& user);
 
   // Empty d'tor to avoid issues with scoped_ptr.
   ~RuntimeState();
 
   // Set per-query state.
   Status Init(const TUniqueId& fragment_instance_id,
-              const TQueryOptions& query_options,
-              const std::string& now, ExecEnv* exec_env);
+      const TQueryOptions& query_options, const std::string& now,
+      const std::string& user, ExecEnv* exec_env);
 
   ObjectPool* obj_pool() const { return obj_pool_.get(); }
   const DescriptorTbl& desc_tbl() const { return *desc_tbl_; }
+  const TQueryOptions& query_options() const { return query_options_; }
   void set_desc_tbl(DescriptorTbl* desc_tbl) { desc_tbl_ = desc_tbl; }
   int batch_size() const { return query_options_.batch_size; }
   bool abort_on_error() const { return query_options_.abort_on_error; }
@@ -87,9 +88,9 @@ class RuntimeState {
   }
   int max_errors() const { return query_options_.max_errors; }
   int max_io_buffers() const { return query_options_.max_io_buffers; }
-  int num_scanner_threads() const { return query_options_.num_scanner_threads; }
   const TimestampValue* now() const { return now_.get(); }
   void set_now(const TimestampValue* now);
+  const std::string& user() const { return user_; }
   const std::vector<std::string>& error_log() const { return error_log_; }
   const std::vector<std::pair<std::string, int> >& file_errors() const {
     return file_errors_;
@@ -102,7 +103,7 @@ class RuntimeState {
   ImpalaInternalServiceClientCache* client_cache() { return exec_env_->client_cache(); }
   DiskIoMgr* io_mgr() { return exec_env_->disk_io_mgr(); }
   std::vector<MemLimit*>* mem_limits() { return &mem_limits_; }
-  MemLimit* fragment_mem_limit() { return fragment_mem_limit_; }
+  MemLimit* query_mem_limit() { return query_mem_limit_; }
   ThreadResourceMgr::ResourcePool* resource_pool() { return resource_pool_; }
 
   FileMoveMap* hdfs_files_to_move() { return &hdfs_files_to_move_; }
@@ -120,10 +121,11 @@ class RuntimeState {
       const RowDescriptor& row_desc, PlanNodeId dest_node_id, int num_senders,
       int buffer_size, RuntimeProfile* profile);
 
-  // Sets the fragment memory limit and adds it to mem_limits_
-  void SetFragmentMemLimit(MemLimit* limit) {
-    DCHECK(fragment_mem_limit_ == NULL);
-    fragment_mem_limit_ = limit;
+  // Sets the memory limit and adds it to mem_limits_.  This is the same MemLimit
+  // object that is used by all fragments for this query on this machine.
+  void SetQueryMemLimit(MemLimit* limit) {
+    DCHECK(query_mem_limit_ == NULL);
+    query_mem_limit_ = limit;
     mem_limits_.push_back(limit);
   }
 
@@ -189,6 +191,9 @@ class RuntimeState {
   // Stores the number of parse errors per file.
   std::vector<std::pair<std::string, int> > file_errors_;
 
+  // Username of user that is executing the query to which this RuntimeState belongs.
+  std::string user_;
+
   // Query-global timestamp, e.g., for implementing now().
   // Use pointer to avoid inclusion of timestampvalue.h and avoid clang issues.
   boost::scoped_ptr<TimestampValue> now_;
@@ -214,8 +219,8 @@ class RuntimeState {
   // all mem limits that apply to this query
   std::vector<MemLimit*> mem_limits_;
 
-  // Fragment memory limit.  Also contained in mem_limits_
-  MemLimit* fragment_mem_limit_;
+  // Query memory limit.  Also contained in mem_limits_
+  MemLimit* query_mem_limit_;
 
   // if true, execution should stop with a CANCELLED status
   bool is_cancelled_;

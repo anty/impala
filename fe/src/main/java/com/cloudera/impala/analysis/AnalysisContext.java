@@ -16,9 +16,10 @@ package com.cloudera.impala.analysis;
 
 import java.io.StringReader;
 
+import com.cloudera.impala.authorization.User;
+import com.cloudera.impala.catalog.AuthorizationException;
 import com.cloudera.impala.catalog.Catalog;
 import com.cloudera.impala.common.AnalysisException;
-import com.cloudera.impala.thrift.TQueryGlobals;
 import com.google.common.base.Preconditions;
 
 /**
@@ -32,23 +33,24 @@ public class AnalysisContext {
   private final String defaultDatabase;
 
   // The user who initiated the request.
-  private final String user;
+  private final User user;
 
-  private final TQueryGlobals queryGlobals;
-
-  public AnalysisContext(Catalog catalog, String defaultDb, String user) {
+  public AnalysisContext(Catalog catalog, String defaultDb, User user) {
     this.catalog = catalog;
     this.defaultDatabase = defaultDb;
     this.user = user;
-    this.queryGlobals = Analyzer.createQueryGlobals();
   }
 
   static public class AnalysisResult {
-    private ParseNode stmt;
+    private StatementBase stmt;
     private Analyzer analyzer;
 
     public boolean isAlterTableStmt() {
       return stmt instanceof AlterTableStmt;
+    }
+
+    public boolean isAlterViewStmt() {
+      return stmt instanceof AlterViewStmt;
     }
 
     public boolean isQueryStmt() {
@@ -63,12 +65,16 @@ public class AnalysisContext {
       return stmt instanceof DropDbStmt;
     }
 
-    public boolean isDropTableStmt() {
-      return stmt instanceof DropTableStmt;
+    public boolean isDropTableOrViewStmt() {
+      return stmt instanceof DropTableOrViewStmt;
     }
 
     public boolean isCreateTableLikeStmt() {
       return stmt instanceof CreateTableLikeStmt;
+    }
+
+    public boolean isCreateViewStmt() {
+      return stmt instanceof CreateViewStmt;
     }
 
     public boolean isCreateTableStmt() {
@@ -77,6 +83,10 @@ public class AnalysisContext {
 
     public boolean isCreateDbStmt() {
       return stmt instanceof CreateDbStmt;
+    }
+
+    public boolean isLoadDataStmt() {
+      return stmt instanceof LoadDataStmt;
     }
 
     public boolean isUseStmt() {
@@ -95,6 +105,10 @@ public class AnalysisContext {
       return stmt instanceof DescribeStmt;
     }
 
+    public boolean isResetMetadataStmt() {
+      return stmt instanceof ResetMetadataStmt;
+    }
+
     public boolean isExplainStmt() {
       if (isQueryStmt()) return ((QueryStmt)stmt).isExplain();
       if (isInsertStmt()) return ((InsertStmt)stmt).isExplain();
@@ -103,8 +117,9 @@ public class AnalysisContext {
 
     public boolean isDdlStmt() {
       return isUseStmt() || isShowTablesStmt() || isShowDbsStmt() || isDescribeStmt() ||
-          isCreateTableLikeStmt() || isCreateTableStmt() || isCreateDbStmt() ||
-          isDropDbStmt() || isDropTableStmt() || isAlterTableStmt();
+          isCreateTableLikeStmt() || isCreateTableStmt() || isCreateViewStmt() ||
+          isCreateDbStmt() || isDropDbStmt() || isDropTableOrViewStmt() ||
+          isResetMetadataStmt() || isAlterTableStmt() || isAlterViewStmt();
     }
 
     public boolean isDmlStmt() {
@@ -116,9 +131,19 @@ public class AnalysisContext {
       return (AlterTableStmt) stmt;
     }
 
+    public AlterViewStmt getAlterViewStmt() {
+      Preconditions.checkState(isAlterViewStmt());
+      return (AlterViewStmt) stmt;
+    }
+
     public CreateTableLikeStmt getCreateTableLikeStmt() {
       Preconditions.checkState(isCreateTableLikeStmt());
       return (CreateTableLikeStmt) stmt;
+    }
+
+    public CreateViewStmt getCreateViewStmt() {
+      Preconditions.checkState(isCreateViewStmt());
+      return (CreateViewStmt) stmt;
     }
 
     public CreateTableStmt getCreateTableStmt() {
@@ -136,9 +161,14 @@ public class AnalysisContext {
       return (DropDbStmt) stmt;
     }
 
-    public DropTableStmt getDropTableStmt() {
-      Preconditions.checkState(isDropTableStmt());
-      return (DropTableStmt) stmt;
+    public DropTableOrViewStmt getDropTableOrViewStmt() {
+      Preconditions.checkState(isDropTableOrViewStmt());
+      return (DropTableOrViewStmt) stmt;
+    }
+
+    public LoadDataStmt getLoadDataStmt() {
+      Preconditions.checkState(isLoadDataStmt());
+      return (LoadDataStmt) stmt;
     }
 
     public QueryStmt getQueryStmt() {
@@ -171,7 +201,7 @@ public class AnalysisContext {
       return (DescribeStmt) stmt;
     }
 
-    public ParseNode getStmt() {
+    public StatementBase getStmt() {
       return stmt;
     }
 
@@ -189,25 +219,25 @@ public class AnalysisContext {
    * @throws AnalysisException
    *           on any kind of error, including parsing error.
    */
-  public AnalysisResult analyze(String stmt) throws AnalysisException {
+  public AnalysisResult analyze(String stmt) throws AnalysisException,
+      AuthorizationException {
     SqlScanner input = new SqlScanner(new StringReader(stmt));
     SqlParser parser = new SqlParser(input);
     try {
       AnalysisResult result = new AnalysisResult();
-      result.stmt = (ParseNode) parser.parse().value;
+      result.stmt = (StatementBase) parser.parse().value;
       if (result.stmt == null) {
         return null;
       }
-      result.analyzer = new Analyzer(catalog, defaultDatabase, user, queryGlobals);
+      result.analyzer = new Analyzer(catalog, defaultDatabase, user);
       result.stmt.analyze(result.analyzer);
       return result;
     } catch (AnalysisException e) {
+      throw e;
+    } catch (AuthorizationException e) {
       throw e;
     } catch (Exception e) {
       throw new AnalysisException(parser.getErrorMsg(stmt), e);
     }
   }
-
-  public TQueryGlobals getQueryGlobals() { return queryGlobals; }
-
 }

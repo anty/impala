@@ -21,6 +21,7 @@ import java.util.ListIterator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.cloudera.impala.catalog.AuthorizationException;
 import com.cloudera.impala.catalog.Column;
 import com.cloudera.impala.catalog.PrimitiveType;
 import com.cloudera.impala.common.AnalysisException;
@@ -29,8 +30,8 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
 /**
- * Representation of a single select block, including GROUP BY, ORDERY BY and HAVING clauses.
- *
+ * Representation of a single select block, including GROUP BY, ORDER BY and HAVING
+ * clauses.
  */
 public class SelectStmt extends QueryStmt {
   private final static Logger LOG = LoggerFactory.getLogger(SelectStmt.class);
@@ -47,6 +48,10 @@ public class SelectStmt extends QueryStmt {
 
   // set if we have any kind of aggregation operation, include SELECT DISTINCT
   private AggregateInfo aggInfo;
+
+  // SQL string of this SelectStmt before inline-view expression substitution.
+  // Set in analyze().
+  private String sqlString;
 
   SelectStmt(SelectList selectList,
              List<TableRef> tableRefList,
@@ -107,7 +112,13 @@ public class SelectStmt extends QueryStmt {
   }
 
   @Override
-  public void analyze(Analyzer analyzer) throws AnalysisException, InternalException {
+  public void analyze(Analyzer analyzer) throws AnalysisException,
+      AuthorizationException {
+    super.analyze(analyzer);
+
+    // Replace BaseTableRefs with ViewRefs.
+    substititeViews(analyzer, tableRefs);
+
     // start out with table refs to establish aliases
     TableRef leftTblRef = null;  // the one to the left of tblRef
     for (TableRef tblRef: tableRefs) {
@@ -117,7 +128,8 @@ public class SelectStmt extends QueryStmt {
     }
 
     // populate selectListExprs, aliasSMap, and colNames
-    for (SelectListItem item: selectList.getItems()) {
+    for (int i = 0; i < selectList.getItems().size(); ++i) {
+      SelectListItem item = selectList.getItems().get(i);
       if (item.isStar()) {
         TableName tblName = item.getTblName();
         if (tblName == null) {
@@ -127,7 +139,7 @@ public class SelectStmt extends QueryStmt {
         }
       } else {
         resultExprs.add(item.getExpr());
-        SlotRef aliasRef = new SlotRef(null, item.toColumnLabel());
+        SlotRef aliasRef = new SlotRef(null, item.toHiveColumnLabel(i));
         if (aliasSMap.lhs.contains(aliasRef)) {
           // If we have already seen this alias, it refers to more than one column and
           // therefore is ambiguous.
@@ -135,7 +147,7 @@ public class SelectStmt extends QueryStmt {
         }
         aliasSMap.lhs.add(aliasRef);
         aliasSMap.rhs.add(item.getExpr().clone(null));
-        colLabels.add(item.toColumnLabel());
+        colLabels.add(item.toHiveColumnLabel(i));
       }
     }
 
@@ -155,11 +167,42 @@ public class SelectStmt extends QueryStmt {
     createSortInfo(analyzer);
     analyzeAggregation(analyzer);
 
+    // Remember the SQL string before inline-view expression substitution.
+    sqlString = toSql();
+
     // Substitute expressions to the underlying inline view expressions
     substituteInlineViewExprs(analyzer);
 
     if (aggInfo != null) {
       LOG.debug("post-analysis " + aggInfo.debugString());
+    }
+  }
+
+  /**
+   * Replaces BaseTableRefs in tblRefs whose alias matches a view registered in
+   * the given analyzer or its parent analyzers with a clone of the matching inline view.
+   * The cloned inline view inherits the context-dependent attributes such as the
+   * on-clause, join hints, etc. from the original BaseTableRef.
+   *
+   * Matches views from the inside out, i.e., we first look
+   * in this analyzer then in the parentAnalyzer then and its parent, etc.,
+   * and finally consult the catalog for matching views (the global scope).
+   *
+   * This method is used for substituting views from WITH clauses
+   * and views from the catalog.
+   */
+  public void substititeViews(Analyzer analyzer, List<TableRef> tblRefs)
+      throws AuthorizationException, AnalysisException {
+    for (int i = 0; i < tblRefs.size(); ++i) {
+      if (!(tblRefs.get(i) instanceof BaseTableRef)) continue;
+      BaseTableRef tblRef = (BaseTableRef) tblRefs.get(i);
+      ViewRef viewDefinition = analyzer.findViewDefinition(tblRef, true);
+      if (viewDefinition == null) continue;
+
+      // Instantiate the view to replace the original BaseTableRef.
+      ViewRef viewRef = viewDefinition.instantiate(tblRef);
+      viewRef.getViewStmt().setIsExplain(isExplain);
+      tblRefs.set(i, viewRef);
     }
   }
 
@@ -218,7 +261,7 @@ public class SelectStmt extends QueryStmt {
     }
     // expand in From clause order
     for (TableRef tableRef: tableRefs) {
-      expandStar(analyzer, tableRef.getAlias(), tableRef.getDesc());
+      expandStar(analyzer, tableRef.getAliasAsName(), tableRef.getDesc());
     }
   }
 
@@ -230,11 +273,11 @@ public class SelectStmt extends QueryStmt {
    */
   private void expandStar(Analyzer analyzer, TableName tblName)
       throws AnalysisException {
-    TupleDescriptor d = analyzer.getDescriptor(tblName);
-    if (d == null) {
+    TupleDescriptor tupleDesc = analyzer.getDescriptor(tblName);
+    if (tupleDesc == null) {
       throw new AnalysisException("unknown table: " + tblName.toString());
     }
-    expandStar(analyzer, tblName.toString(), d);
+    expandStar(analyzer, tblName, tupleDesc);
   }
 
   /**
@@ -245,10 +288,10 @@ public class SelectStmt extends QueryStmt {
    * @param desc
    * @throws AnalysisException
    */
-  private void expandStar(Analyzer analyzer, String alias, TupleDescriptor desc)
+  private void expandStar(Analyzer analyzer, TableName tblName, TupleDescriptor desc)
       throws AnalysisException {
     for (Column col: desc.getTable().getColumnsInHiveOrder()) {
-      resultExprs.add(new SlotRef(new TableName(null, alias), col.getName()));
+      resultExprs.add(new SlotRef(tblName, col.getName()));
       colLabels.add(col.getName().toLowerCase());
     }
   }
@@ -263,7 +306,7 @@ public class SelectStmt extends QueryStmt {
    * @throws AnalysisException
    */
   private void analyzeAggregation(Analyzer analyzer)
-      throws AnalysisException, InternalException {
+      throws AnalysisException {
     if (groupingExprs == null && !selectList.isDistinct()
         && !Expr.contains(resultExprs, AggregateExpr.class)) {
       // we're not computing aggregates
@@ -340,7 +383,11 @@ public class SelectStmt extends QueryStmt {
     ArrayList<AggregateExpr> nonAvgAggExprs = Lists.newArrayList();
     Expr.collectList(aggExprs, AggregateExpr.class, nonAvgAggExprs);
     aggExprs = nonAvgAggExprs;
-    createAggInfo(groupingExprsCopy, aggExprs, analyzer);
+    try {
+      createAggInfo(groupingExprsCopy, aggExprs, analyzer);
+    } catch (InternalException e) {
+      throw new AnalysisException(e.getMessage(), e);
+    }
 
     // combine avg smap with the one that produces the final agg output
     AggregateInfo finalAggInfo =
@@ -417,16 +464,16 @@ public class SelectStmt extends QueryStmt {
       CastExpr inCastExpr = null;
       if (aggExpr.getChild(0).type == PrimitiveType.TIMESTAMP) {
         inCastExpr =
-            new CastExpr(PrimitiveType.DOUBLE, aggExpr.getChild(0).clone(), false);
+            new CastExpr(PrimitiveType.DOUBLE, aggExpr.getChild(0).clone(null), false);
       }
 
       AggregateExpr sumExpr =
           new AggregateExpr(AggregateExpr.Operator.SUM, false, aggExpr.isDistinct(),
                 Lists.newArrayList(aggExpr.getChild(0).type == PrimitiveType.TIMESTAMP ?
-                  inCastExpr : aggExpr.getChild(0).clone()));
+                  inCastExpr : aggExpr.getChild(0).clone(null)));
       AggregateExpr countExpr =
           new AggregateExpr(AggregateExpr.Operator.COUNT, false, aggExpr.isDistinct(),
-                            Lists.newArrayList(aggExpr.getChild(0).clone()));
+                            Lists.newArrayList(aggExpr.getChild(0).clone(null)));
       ArithmeticExpr divExpr =
           new ArithmeticExpr(ArithmeticExpr.Operator.DIVIDE, sumExpr, countExpr);
 
@@ -500,9 +547,20 @@ public class SelectStmt extends QueryStmt {
     }
   }
 
+  /**
+   * Returns the SQL string corresponding to this SelectStmt.
+   */
   @Override
   public String toSql() {
+    // Return the SQL string before inline-view expression substitution.
+    if (sqlString != null) return sqlString;
+
     StringBuilder strBuilder = new StringBuilder();
+    if (withClause != null) {
+      strBuilder.append(withClause.toSql());
+      strBuilder.append(" ");
+    }
+
     // Select list
     strBuilder.append("SELECT ");
     if (selectList.isDistinct()) {
@@ -542,7 +600,7 @@ public class SelectStmt extends QueryStmt {
       strBuilder.append(" ORDER BY ");
       for (int i = 0; i < orderByElements.size(); ++i) {
         strBuilder.append(orderByElements.get(i).getExpr().toSql());
-        strBuilder.append((sortInfo.getIsAscOrder().get(i)) ? " ASC" : " DESC");
+        strBuilder.append(orderByElements.get(i).getIsAsc() ? " ASC" : " DESC");
         strBuilder.append((i+1 != orderByElements.size()) ? ", " : "");
       }
     }
@@ -559,11 +617,35 @@ public class SelectStmt extends QueryStmt {
     // If select statement has an aggregate, then the aggregate tuple id is materialized.
     // Otherwise, all referenced tables are materialized.
     if (aggInfo != null) {
-      tupleIdList.add(aggInfo.getAggTupleId());
+      // Return the tuple id produced in the final aggregation step.
+      if (aggInfo.isDistinctAgg()) {
+        tupleIdList.add(aggInfo.getSecondPhaseDistinctAggInfo().getAggTupleId());
+      } else {
+        tupleIdList.add(aggInfo.getAggTupleId());
+      }
     } else {
       for (TableRef tblRef: tableRefs) {
         tupleIdList.addAll(tblRef.getMaterializedTupleIds());
       }
     }
+  }
+
+  private ArrayList<TableRef> cloneTableRefs() {
+    ArrayList<TableRef> clone = Lists.newArrayList();
+    for (TableRef tblRef : tableRefs) {
+      clone.add(tblRef.clone());
+    }
+    return clone;
+  }
+
+  @Override
+  public QueryStmt clone() {
+    SelectStmt selectClone = new SelectStmt(selectList.clone(), cloneTableRefs(),
+        (whereClause != null) ? whereClause.clone(null) : null,
+        (groupingExprs != null) ? Expr.cloneList(groupingExprs, null) : null,
+        (havingClause != null) ? havingClause.clone(null) : null,
+        cloneOrderByElements(), limit);
+    selectClone.setWithClause(cloneWithClause());
+    return selectClone;
   }
 }

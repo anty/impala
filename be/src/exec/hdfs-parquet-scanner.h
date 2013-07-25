@@ -17,7 +17,6 @@
 #define IMPALA_EXEC_HDFS_PARQUET_SCANNER_H
 
 #include "exec/hdfs-scanner.h"
-#include "util/integer-array.h"
 #include "exec/parquet-common.h"
 
 namespace impala {
@@ -31,23 +30,28 @@ struct HdfsFileDesc;
 //
 // Parquet (and other columnar formats) use scanner ranges differently than
 // other formats.  Each materialized column maps to a single ScanRange.  For
-// streaming reads, all the columns need to be read in parallel.  Most of the heavy
-// lifting is done in the io mgr using the "grouped ranges" functionality.
+// streaming reads, all the columns need to be read in parallel. This is done
+// by issuing one ScanRange (in IssueInitialRanges()) for the file footer as 
+// the other scanners do. This footer range is processed in ProcessSplit().
+// ProcessSplit() then computes the column ranges and submits them to the IoMgr
+// for immediate scheduling (so they don't surface in DiskIoMgr::GetNextRange()).
+// Scheduling them immediately also guarantees they are all read at once.
+//
 // Like the other scanners, each parquet scanner object is one to one with a 
-// ScannerContext.
-// Unlike the other scanners though, the context will have multiple streams, one for 
-// each column.  When the HdfsParquetScanner object is created, it is passed the
-// ScannerContext has only 1 stream just for the metadata.  After parsing the
-// metadata, the ScannerContext will create one stream per column.
+// ScannerContext. Unlike the other scanners though, the context will have multiple 
+// streams, one for each column. 
 class HdfsParquetScanner : public HdfsScanner {
  public:
   HdfsParquetScanner(HdfsScanNode* scan_node, RuntimeState* state);
 
   virtual ~HdfsParquetScanner();
-  virtual Status Prepare();
+  virtual Status Prepare(ScannerContext* context);
   virtual Status Close();
-  virtual Status ProcessSplit(ScannerContext* context);
-  static void IssueInitialRanges(HdfsScanNode*, const std::vector<HdfsFileDesc*>&);
+  virtual Status ProcessSplit();
+
+  // Issue just the footer range for each file.  We'll then parse the footer and pick
+  // out the columns we want.
+  static Status IssueInitialRanges(HdfsScanNode*, const std::vector<HdfsFileDesc*>&);
 
  private:
   // Size of the file footer.  This is a guess.  If this value is too little, we will
@@ -72,6 +76,10 @@ class HdfsParquetScanner : public HdfsScanner {
   
   // Returned in ProcessSplit
   Status parse_status_;
+  
+  // Pool to copy dictionary page buffer into. This pool is shared across all the
+  // pages in a column chunk.
+  boost::scoped_ptr<MemPool> dictionary_pool_;
 
   // Timer for materializing rows.  This ignores time getting the next buffer.
   ScopedTimer<MonotonicStopWatch> assemble_rows_timer_;

@@ -16,7 +16,9 @@ package com.cloudera.impala.analysis;
 
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Calendar;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -26,16 +28,23 @@ import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.cloudera.impala.authorization.Privilege;
+import com.cloudera.impala.authorization.User;
+import com.cloudera.impala.catalog.AuthorizationException;
 import com.cloudera.impala.catalog.Catalog;
 import com.cloudera.impala.catalog.Column;
+import com.cloudera.impala.catalog.DatabaseNotFoundException;
 import com.cloudera.impala.catalog.Db;
-import com.cloudera.impala.catalog.Db.TableLoadingException;
-import com.cloudera.impala.catalog.InlineView;
 import com.cloudera.impala.catalog.PrimitiveType;
 import com.cloudera.impala.catalog.Table;
+import com.cloudera.impala.catalog.TableLoadingException;
+import com.cloudera.impala.catalog.TableNotFoundException;
+import com.cloudera.impala.catalog.View;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.common.IdGenerator;
+import com.cloudera.impala.common.Pair;
 import com.cloudera.impala.thrift.TQueryGlobals;
+import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -49,14 +58,24 @@ import com.google.common.collect.Sets;
  * holding the referenced conjuncts), to make substitute() simple.
  */
 public class Analyzer {
+  // Common analysis error messages
+  public final static String DB_DOES_NOT_EXIST_ERROR_MSG = "Database does not exist: ";
+  public final static String DB_ALREADY_EXISTS_ERROR_MSG = "Database already exists: ";
+  public final static String TBL_DOES_NOT_EXIST_ERROR_MSG = "Table does not exist: ";
+  public final static String TBL_ALREADY_EXISTS_ERROR_MSG = "Table already exists: ";
+
   private final static Logger LOG = LoggerFactory.getLogger(Analyzer.class);
 
   private final DescriptorTable descTbl;
   private final Catalog catalog;
   private final String defaultDb;
-  private final String user;
+  private final User user;
   private final IdGenerator<ExprId> conjunctIdGenerator;
+  private final IdGenerator<EquivalenceClassId> equivClassIdGenerator;
   private final TQueryGlobals queryGlobals;
+
+  // True if we are analyzing an explain request. Should be set before starting analysis.
+  private boolean isExplain;
 
   // An analyzer is a repository for a single select block. A select block can be a top
   // level select statement, or a inline view select block. An inline
@@ -64,6 +83,9 @@ public class Analyzer {
   // (or parent) select block analyzer. For top level select statement, parentAnalyzer is
   // null.
   private final Analyzer parentAnalyzer;
+
+  // map from lowercase table alias to a view definition of a WITH clause.
+  private final Map<String, ViewRef> withClauseViews = Maps.newHashMap();
 
   // map from lowercase table alias to descriptor.
   private final Map<String, TupleDescriptor> aliasMap = Maps.newHashMap();
@@ -108,39 +130,49 @@ public class Analyzer {
   // all conjuncts of the Where clause
   private final Set<ExprId> whereClauseConjuncts = Sets.newHashSet();
 
-  /**
-   * Analyzer constructor for AnalyzerTest.
-   * @param catalog
-   */
-  public Analyzer(Catalog catalog) {
-    this(catalog, Catalog.DEFAULT_DB, System.getProperty("user.name"),
-        createQueryGlobals());
-  }
+  // valueTransfer[slotA][slotB] is true if slotB always has the same value as slotA
+  // or the tuple containing slotB is NULL
+  private boolean[][] valueTransfer;
 
-  public Analyzer(Catalog catalog, String defaultDb, String user,
-        TQueryGlobals queryGlobals) {
+  // map from equivalence class id to the list of its member slots
+  private final Map<EquivalenceClassId, ArrayList<SlotId>> equivClassMembers;
+
+  // map from slot id to its equivalence class id
+  private final Map<SlotId, EquivalenceClassId> equivClassBySlotId = Maps.newHashMap();
+
+  public Analyzer(Catalog catalog, String defaultDb, User user) {
     this.parentAnalyzer = null;
     this.catalog = catalog;
     this.descTbl = new DescriptorTable();
     this.defaultDb = defaultDb;
     this.user = user;
     this.conjunctIdGenerator = new IdGenerator<ExprId>();
-    this.queryGlobals = queryGlobals;
+    this.equivClassIdGenerator = new IdGenerator<EquivalenceClassId>();
+    this.equivClassMembers = Maps.newHashMap();
+    // Create query global parameters to be set in each TPlanExecRequest.
+    SimpleDateFormat formatter = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSSSSSSSS");
+    queryGlobals = new TQueryGlobals();
+    queryGlobals.setNow_string(formatter.format(Calendar.getInstance().getTime()));
+    queryGlobals.setUser(user.getName());
   }
 
   /**
    * Analyzer constructor for nested select block. Catalog and DescriptorTable is
    * inherited from the parentAnalyzer.
-   * @param parentAnalyzer the analyzer of the enclosing select block
+   * Performs the analysis as the given user that is required to be non null.
    */
-  public Analyzer(Analyzer parentAnalyzer) {
+  public Analyzer(Analyzer parentAnalyzer, User user) {
     this.parentAnalyzer = parentAnalyzer;
     this.catalog = parentAnalyzer.catalog;
     this.descTbl = parentAnalyzer.descTbl;
     this.defaultDb = parentAnalyzer.defaultDb;
-    this.user = parentAnalyzer.user;
+    Preconditions.checkNotNull(user);
+    this.user = user;
+    this.isExplain = parentAnalyzer.isExplain;
     // make sure we don't create duplicate ids across entire stmt
     this.conjunctIdGenerator = parentAnalyzer.conjunctIdGenerator;
+    this.equivClassIdGenerator = null;  // only needed at top
+    this.equivClassMembers = null;
     this.queryGlobals = parentAnalyzer.queryGlobals;
   }
 
@@ -155,39 +187,78 @@ public class Analyzer {
   }
 
   /**
-   * Checks that 'name' references an existing table and that alias
+   * Searches the hierarchy of analyzers bottom-up for a registered view
+   * whose alias matches the table name of the given BaseTableRef. Returns the
+   * ViewRef from the innermost scope (analyzer).
+   * If no such registered view was found, also searches for views from the catalog
+   * if seachCatalog is true.
+   * Returns null if no matching views were found.
+   *
+   * This method may trigger a metadata load for finding views registered
+   * in the metastore, if seachCatalog is true.
+   */
+  public ViewRef findViewDefinition(BaseTableRef ref, boolean searchCatalog)
+      throws AuthorizationException, AnalysisException {
+    // Do not consider views from the WITH clause if the table name is fully qualified,
+    // or if WITH-clause view matching was explicitly disabled.
+    if (!ref.getName().isFullyQualified() && ref.isReplaceableByWithView()) {
+      Analyzer analyzer = this;
+      do {
+        String baseTableName = ref.getName().getTbl().toLowerCase();
+        ViewRef view = analyzer.withClauseViews.get(baseTableName);
+        if (view != null) return view;
+        analyzer = analyzer.parentAnalyzer;
+      } while (analyzer != null);
+    }
+    if (!searchCatalog) return null;
+
+    // Consult the catalog for a matching view.
+    Table tbl = null;
+    try {
+      tbl = getTable(ref.getName(), ref.getPrivilegeRequirement());
+    } catch (AnalysisException e) {
+      // Swallow this analysis exception to allow detection and proper error
+      // reporting of recursive references in WITH-clause views.
+      // Non-existent tables/databases will be detected when analyzing tbl.
+      return null;
+    }
+    Preconditions.checkNotNull(tbl);
+    if (tbl instanceof View) {
+      View viewTbl = (View) tbl;
+      Preconditions.checkNotNull(viewTbl.getViewDef());
+      return viewTbl.getViewDef();
+    }
+    return null;
+  }
+
+  /**
+   * Adds view to this analyzer's withClauseViews. Throws an exception if a view
+   * definition with the same alias has already been registered.
+   */
+  public void registerWithClauseView(ViewRef ref) throws AnalysisException {
+    if (withClauseViews.put(ref.getAlias().toLowerCase(), ref) != null) {
+      throw new AnalysisException(
+          String.format("Duplicate table alias: '%s'", ref.getAlias()));
+    }
+  }
+
+  /**
+   * Checks that 'name' references an existing base table and that alias
    * isn't already registered. Creates and returns an empty TupleDescriptor
    * and registers it against alias. If alias is empty, register
    * "name.tbl" and "name.db.tbl" as aliases.
-   * @param ref the BaseTableRef to be registered
-   * @return newly created TupleDescriptor
-   * @throws AnalysisException
+   * Requires that all views have been substituted.
    */
-  public TupleDescriptor registerBaseTableRef(BaseTableRef ref) throws AnalysisException {
+  public TupleDescriptor registerBaseTableRef(BaseTableRef ref)
+      throws AnalysisException, AuthorizationException {
     String lookupAlias = ref.getAlias().toLowerCase();
     if (aliasMap.containsKey(lookupAlias)) {
       throw new AnalysisException("Duplicate table alias: '" + lookupAlias + "'");
     }
-
-    // Always register the ref under the unqualified table name (if there's no
-    // explicit alias), but the *table* must be fully qualified.
-    String dbName =
-        ref.getName().getDb() == null ? getDefaultDb() : ref.getName().getDb();
-    Db db = catalog.getDb(dbName);
-    if (db == null) {
-      throw new AnalysisException("Unknown db: '" + ref.getName().getDb() + "'.");
-    }
-
-    Table tbl = null;
-    try {
-      tbl = db.getTable(ref.getName().getTbl());
-    } catch (TableLoadingException e) {
-      throw new AnalysisException("Failed to load metadata for table: " +
-          ref.getName().getTbl(), e);
-    }
-    if (tbl == null) {
-      throw new AnalysisException("Unknown table: '" + ref.getName().getTbl() + "'");
-    }
+    Table tbl = getTable(ref.getName(), ref.getPrivilegeRequirement());
+    // Views should have been substituted already.
+    Preconditions.checkState(!(tbl instanceof View),
+        String.format("View %s has not been properly substituted.", tbl.getFullName()));
     TupleDescriptor result = descTbl.createTupleDescriptor();
     result.setTable(tbl);
     aliasMap.put(lookupAlias, result);
@@ -220,34 +291,12 @@ public class Analyzer {
       throws AnalysisException {
     String lookupAlias = ref.getAlias().toLowerCase();
     if (aliasMap.containsKey(lookupAlias)) {
-      throw new AnalysisException("duplicate table alias: '" + lookupAlias + "'");
+      throw new AnalysisException("Duplicate table alias: '" + lookupAlias + "'");
     }
-
-    // Create a fake catalog table for the inline view
-    QueryStmt viewStmt = ref.getViewStmt();
-    InlineView inlineView = new InlineView(ref.getAlias());
-    for (int i = 0; i < viewStmt.getColLabels().size(); ++i) {
-      // inline view select statement has been analyzed. Col label should be filled.
-      Expr selectItemExpr = viewStmt.getResultExprs().get(i);
-      String colAlias = viewStmt.getColLabels().get(i);
-
-      // inline view col cannot have duplicate name
-      if (inlineView.getColumn(colAlias) != null) {
-        throw new AnalysisException("duplicated inline view column alias: '" +
-            colAlias + "'" + " in inline view " + "'" + ref.getAlias() + "'");
-      }
-
-      // create a column and add it to the inline view
-      Column col = new Column(colAlias, selectItemExpr.getType(), i);
-      inlineView.addColumn(col);
-    }
-
-    // Register the inline view
-    TupleDescriptor result = descTbl.createTupleDescriptor();
-    result.setIsMaterialized(false);
-    result.setTable(inlineView);
-    aliasMap.put(lookupAlias, result);
-    return result;
+    // Delegate creation of the tuple descriptor to the concrete inline view ref.
+    TupleDescriptor tupleDesc = ref.createTupleDescriptor(descTbl);
+    aliasMap.put(lookupAlias, tupleDesc);
+    return tupleDesc;
   }
 
   /**
@@ -277,15 +326,12 @@ public class Analyzer {
    * registered tables. Creates and returns an empty SlotDescriptor if the
    * column hasn't previously been registered, otherwise returns the existing
    * descriptor.
-   * @param tblName
-   * @param colName
-   * @throws AnalysisException
    */
   public SlotDescriptor registerColumnRef(TableName tblName, String colName)
       throws AnalysisException {
     String alias;
     if (tblName == null) {
-      alias = resolveColumnRef(colName);
+      alias = resolveColumnRef(colName, null);
       if (alias == null) {
         throw new AnalysisException("couldn't resolve column reference: '" +
             colName + "'");
@@ -293,12 +339,21 @@ public class Analyzer {
     } else {
       alias = tblName.toString().toLowerCase();
     }
-    TupleDescriptor d = aliasMap.get(alias);
-    if (d == null) {
+
+    TupleDescriptor tupleDesc = aliasMap.get(alias);
+    // Try to resolve column references ("table.col") that do not refer to an explicit
+    // alias, and that do not use a fully-qualified table name.
+    String tmpAlias = alias;
+    if (tupleDesc == null && tblName != null) {
+      tmpAlias = resolveColumnRef(colName, tblName.getTbl());
+      tupleDesc = aliasMap.get(tmpAlias);
+    }
+    if (tupleDesc == null) {
       throw new AnalysisException("unknown table alias: '" + alias + "'");
     }
+    alias = tmpAlias;
 
-    Column col = d.getTable().getColumn(colName);
+    Column col = tupleDesc.getTable().getColumn(colName);
     if (col == null) {
       throw new AnalysisException("unknown column '" + colName +
           "' (table alias '" + alias + "')");
@@ -306,10 +361,8 @@ public class Analyzer {
 
     String key = alias + "." + col.getName();
     SlotDescriptor result = slotRefMap.get(key);
-    if (result != null) {
-      return result;
-    }
-    result = descTbl.addSlotDescriptor(d);
+    if (result != null) return result;
+    result = descTbl.addSlotDescriptor(tupleDesc);
     result.setColumn(col);
     slotRefMap.put(alias + "." + col.getName(), result);
     return result;
@@ -319,12 +372,17 @@ public class Analyzer {
    * Resolves column name in context of any of the registered table aliases.
    * Returns null if not found or multiple bindings to different tables exist,
    * otherwise returns the table alias.
+   * If a specific table name was given (tableName != null) then only
+   * columns from registered tables with a matching name are considered.
    */
-  private String resolveColumnRef(String colName) throws AnalysisException {
+  private String resolveColumnRef(String colName, String tableName)
+      throws AnalysisException {
     String result = null;
     for (Map.Entry<String, TupleDescriptor> entry: aliasMap.entrySet()) {
-      Column col = entry.getValue().getTable().getColumn(colName);
-      if (col != null) {
+      Table table = entry.getValue().getTable();
+      Column col = table.getColumn(colName);
+      if (col != null &&
+          (tableName == null || tableName.equalsIgnoreCase(table.getName()))) {
         if (result != null) {
           throw new AnalysisException(
               "Unqualified column reference '" + colName + "' is ambiguous");
@@ -380,11 +438,8 @@ public class Analyzer {
   private void registerConjunct(Expr e) {
     // this conjunct would already have an id assigned if it is being re-registered
     // in a subqery analyzer
-    if (e.getId() == null) {
-      e.setId(new ExprId(conjunctIdGenerator));
-    }
+    if (e.getId() == null) e.setId(new ExprId(conjunctIdGenerator));
     conjuncts.put(e.getId(), e);
-    //LOG.info("registered conjunct " + p.getId().toString() + ": " + p.toSql());
 
     ArrayList<TupleId> tupleIds = Lists.newArrayList();
     ArrayList<SlotId> slotIds = Lists.newArrayList();
@@ -415,16 +470,11 @@ public class Analyzer {
     // check whether this is an equi-join predicate, ie, something of the
     // form <expr1> = <expr2> where at least one of the exprs is bound by
     // exactly one tuple id
-    if (!(e instanceof BinaryPredicate)) {
-      return;
-    }
+    if (!(e instanceof BinaryPredicate)) return;
     BinaryPredicate binaryPred = (BinaryPredicate) e;
-    if (binaryPred.getOp() != BinaryPredicate.Operator.EQ) {
-      return;
-    }
-    if (tupleIds.size() != 2) {
-      return;
-    }
+    if (binaryPred.getOp() != BinaryPredicate.Operator.EQ) return;
+    // the binary predicate must refer to at least two tuples to be an eqJoinConjunct
+    if (tupleIds.size() < 2) return;
 
     // examine children and update eqJoinConjuncts
     for (int i = 0; i < 2; ++i) {
@@ -439,6 +489,7 @@ public class Analyzer {
           eqJoinConjuncts.get(lhsTupleIds.get(0)).add(e.getId());
         }
         binaryPred.setIsEqJoinConjunct(true);
+        LOG.info("register: " + Integer.toString(e.getId().asInt()) + " " + e.toSql());
       }
     }
   }
@@ -497,9 +548,7 @@ public class Analyzer {
    */
   public SlotDescriptor getColumnSlot(TupleDescriptor tupleDesc, Column col) {
     for (SlotDescriptor slotDesc: tupleDesc.getSlots()) {
-      if (slotDesc.getColumn() == col) {
-        return slotDesc;
-      }
+      if (slotDesc.getColumn() == col) return slotDesc;
     }
     return null;
   }
@@ -523,9 +572,7 @@ public class Analyzer {
    */
   public List<Expr> getEqJoinConjuncts(TupleId id, TableRef rhsRef) {
     List<ExprId> conjunctIds = eqJoinConjuncts.get(id);
-    if (conjunctIds == null) {
-      return null;
-    }
+    if (conjunctIds == null) return null;
     List<Expr> result = Lists.newArrayList();
     List<ExprId> ojClauseConjuncts = null;
     if (rhsRef != null) {
@@ -536,9 +583,7 @@ public class Analyzer {
       Expr e = conjuncts.get(conjunctId);
       Preconditions.checkState(e != null);
       if (ojClauseConjuncts != null) {
-        if (ojClauseConjuncts.contains(conjunctId)) {
-          result.add(e);
-        }
+        if (ojClauseConjuncts.contains(conjunctId)) result.add(e);
       } else {
         result.add(e);
       }
@@ -546,13 +591,199 @@ public class Analyzer {
     return result;
   }
 
+  private TupleId getTupleId(SlotId slotId) {
+    return descTbl.getSlotDesc(slotId).getParent().getId();
+  }
+
+  /**
+   * Populate valueTransfer based on the registered equi-join predicates
+   * of the form <slotref> = <slotref>.
+   */
+  private void computeValueTransferGraph() {
+    int numSlots = descTbl.getMaxSlotId().asInt() + 1;
+    LOG.info("valuetransfer: #slots=" + Integer.toString(numSlots));
+    valueTransfer = new boolean[numSlots][numSlots];
+    for (int i = 0; i < numSlots; ++i) {
+      Arrays.fill(valueTransfer[i], false);
+      valueTransfer[i][i] = true;
+    }
+    Set<ExprId> analyzedIds = Sets.newHashSet();
+
+    // transform eqJoinConjuncts into a transfer graph;
+    // this doesn't work at all for anything in subqueries, because conjuncts, etc.,
+    // are all registered in separate Analyzers
+    // TODO: fix this with a complete rewrite of how inline views are handled
+    for (Collection<ExprId> ids: eqJoinConjuncts.values()) {
+      for (ExprId id: ids) {
+        LOG.info("check id " + Integer.toString(id.asInt()));
+        if (!analyzedIds.add(id)) continue;
+
+        Predicate p = (Predicate) conjuncts.get(id);
+        Preconditions.checkState(p != null);
+        Pair<SlotId, SlotId> slotIds = p.getEqSlots();
+        if (slotIds == null) continue;
+        // TODO: remove
+        LOG.info("slotIds.first=" + Integer.toString(slotIds.first.asInt()) + " slotIds.second=" + Integer.toString(slotIds.second.asInt()));
+
+        TableRef tblRef = ojClauseByConjunct.get(id);
+        Preconditions.checkState(tblRef == null || tblRef.getJoinOp().isOuterJoin());
+        if (tblRef == null) {
+          // this eq predicate doesn't involve any outer join, ie, it is true for
+          // each result row
+          valueTransfer[slotIds.first.asInt()][slotIds.second.asInt()] = true;
+          valueTransfer[slotIds.second.asInt()][slotIds.first.asInt()] = true;
+          continue;
+        }
+
+        // this is some form of outer join
+        SlotId outerSlot, innerSlot;
+        if (tblRef.getId() == getTupleId(slotIds.first)) {
+          innerSlot = slotIds.first;
+          outerSlot = slotIds.second;
+        } else if (tblRef.getId() == getTupleId(slotIds.second)) {
+          innerSlot = slotIds.second;
+          outerSlot = slotIds.first;
+        } else {
+          // this eq predicate is part of an OJ clause but doesn't reference
+          // the joined table -> ignore this, we can't reason about when it'll
+          // actually be true
+          continue;
+        }
+
+        if (tblRef.getJoinOp() == JoinOperator.FULL_OUTER_JOIN) {
+          // full outer joins don't guarantee any value transfer
+          continue;
+        }
+        if (tblRef.getJoinOp() == JoinOperator.LEFT_OUTER_JOIN) {
+          valueTransfer[outerSlot.asInt()][innerSlot.asInt()] = true;
+        } else if (tblRef.getJoinOp() == JoinOperator.RIGHT_OUTER_JOIN) {
+          valueTransfer[innerSlot.asInt()][outerSlot.asInt()] = true;
+        }
+      }
+    }
+
+    // compute the transitive closure
+    boolean changed = false;
+    do {
+      changed = false;
+      for (int i = 0; i < numSlots; ++i) {
+        for (int j = 0; j < numSlots; ++j) {
+          for (int k = 0; k < numSlots; ++k) {
+            if (valueTransfer[i][j] && valueTransfer[j][k] && !valueTransfer[i][k]) {
+              valueTransfer[i][k] = true;
+              changed = true;
+            }
+          }
+        }
+      }
+    } while (changed);
+
+    // TODO: remove
+    for (int i = 0; i < numSlots; ++i) {
+      List<String> strings = Lists.newArrayList();
+      for (int j = 0; j < numSlots; ++j) {
+        if (i != j && valueTransfer[i][j]) strings.add(Integer.toString(j));
+      }
+      if (!strings.isEmpty()) {
+        LOG.info("transfer from " + Integer.toString(i) + " to: "
+            + Joiner.on(" ").join(strings));
+      }
+    }
+  }
+
+  public void computeEquivClasses() {
+    computeValueTransferGraph();
+
+    // we start out by assigning each slot to its own equiv class
+    int numSlots = descTbl.getMaxSlotId().asInt() + 1;
+    for (int i = 0; i < numSlots; ++i) {
+      EquivalenceClassId id = new EquivalenceClassId(equivClassIdGenerator);
+      equivClassMembers.put(id, Lists.newArrayList(new SlotId(i)));
+    }
+
+    // merge two classes if there is a value transfer between all members of the
+    // combined class; do this until there's nothing left to merge
+    boolean merged;
+    do {
+      merged = false;
+      for (Map.Entry<EquivalenceClassId, ArrayList<SlotId>> e1:
+          equivClassMembers.entrySet()) {
+        for (Map.Entry<EquivalenceClassId, ArrayList<SlotId>> e2:
+            equivClassMembers.entrySet()) {
+          if (e1.getKey() == e2.getKey()) continue;
+          List<SlotId> class1Members = e1.getValue();
+          if (class1Members.isEmpty()) continue;
+          List<SlotId> class2Members = e2.getValue();
+          if (class2Members.isEmpty()) continue;
+
+          // check whether we can transfer values between all members
+          boolean canMerge = true;
+          for (SlotId class1Slot: class1Members) {
+            for (SlotId class2Slot: class2Members) {
+              if (!valueTransfer[class1Slot.asInt()][class2Slot.asInt()]
+                  && !valueTransfer[class2Slot.asInt()][class1Slot.asInt()]) {
+                canMerge = false;
+                break;
+              }
+            }
+            if (!canMerge) break;
+          }
+          if (!canMerge) continue;
+
+          // merge classes 1 and 2 by transfering 2 into 1
+          class1Members.addAll(class2Members);
+          class2Members.clear();
+          merged = true;
+        }
+      }
+    } while (merged);
+
+    // populate equivClassBySlotId
+    for (EquivalenceClassId id: equivClassMembers.keySet()) {
+      for (SlotId slotId: equivClassMembers.get(id)) {
+        equivClassBySlotId.put(slotId, id);
+      }
+    }
+
+    // TODO: remove
+    for (EquivalenceClassId id: equivClassMembers.keySet()) {
+      List<SlotId> members = equivClassMembers.get(id);
+      if (members.isEmpty()) continue;
+      List<String> strings = Lists.newArrayList();
+      for (SlotId slotId: members) {
+        strings.add(slotId.toString());
+      }
+      LOG.info("equiv class: id=" + id.toString() + " members=("
+          + Joiner.on(" ").join(strings) + ")");
+    }
+  }
+
+  /**
+   * Return in equivSlotIds the ids of slots that are in the same equivalence class
+   * as slotId and are part of a tuple in tupleIds.
+   */
+  public void getEquivSlots(SlotId slotId, List<TupleId> tupleIds,
+      List<SlotId> equivSlotIds) {
+    equivSlotIds.clear();
+    // TODO: remove
+    LOG.info("getequivslots: slotid=" + Integer.toString(slotId.asInt()));
+    EquivalenceClassId classId = equivClassBySlotId.get(slotId);
+    for (SlotId memberId: equivClassMembers.get(classId)) {
+      if (tupleIds.contains(descTbl.getSlotDesc(memberId).getParent().getId())) {
+        equivSlotIds.add(memberId);
+      }
+    }
+  }
+
+  public EquivalenceClassId getEquivClassId(SlotId slotId) {
+    return equivClassBySlotId.get(slotId);
+  }
+
   /**
    * Mark predicates as assigned.
    */
   public void markConjunctsAssigned(List<Expr> conjuncts) {
-    if (conjuncts == null) {
-      return;
-    }
+    if (conjuncts == null) return;
     for (Expr p: conjuncts) {
       assignedConjuncts.add(p.getId());
     }
@@ -626,11 +857,15 @@ public class Analyzer {
     return compatibleType;
   }
 
+  public Map<String, ViewRef> getWithClauseViews() {
+    return withClauseViews;
+  }
+
   public String getDefaultDb() {
     return defaultDb;
   }
 
-  public String getUser() {
+  public User getUser() {
     return user;
   }
 
@@ -638,16 +873,77 @@ public class Analyzer {
     return queryGlobals;
   }
 
-  /**
-   * Create query global parameters to be set in each TPlanExecRequest.
+  /*
+   * Returns the Catalog Table object for the TableName at the given Privilege level.
+   *
+   * If the user does not have sufficient privileges to access the table an
+   * AuthorizationException is thrown.
+   * If the table or the db does not exist in the Catalog, an AnalysisError is thrown.
    */
-  public static TQueryGlobals createQueryGlobals() {
-    SimpleDateFormat formatter =
-        new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSSSSSSSS");
-    TQueryGlobals queryGlobals = new TQueryGlobals();
-    Calendar currentDate = Calendar.getInstance();
-    String nowStr = formatter.format(currentDate.getTime());
-    queryGlobals.setNow_string(nowStr);
-    return queryGlobals;
+  public Table getTable(TableName tableName, Privilege privilege)
+      throws AuthorizationException, AnalysisException {
+    Preconditions.checkNotNull(tableName);
+    Preconditions.checkNotNull(privilege);
+    Table table = null;
+    tableName = new TableName(getTargetDbName(tableName), tableName.getTbl());
+
+    // This may trigger a metadata load, in which case we want to return the errors as
+    // AnalysisExceptions.
+    try {
+      table =
+          catalog.getTable(tableName.getDb(), tableName.getTbl(), getUser(), privilege);
+    } catch (DatabaseNotFoundException e) {
+      throw new AnalysisException(DB_DOES_NOT_EXIST_ERROR_MSG + tableName.getDb());
+    } catch (TableNotFoundException e) {
+      throw new AnalysisException(TBL_DOES_NOT_EXIST_ERROR_MSG + tableName.toString());
+    } catch (TableLoadingException e) {
+      throw new AnalysisException(String.format("Failed to load metadata for table: %s",
+          tableName), e);
+    }
+    Preconditions.checkNotNull(table);
+    return table;
   }
+
+  /*
+   * Returns the Catalog Db object for the given database name at the given
+   * Privilege level.
+   *
+   * If the user does not have sufficient privileges to access the database an
+   * AuthorizationException is thrown.
+   * If the database does not exist in the catalog an AnalysisError is thrown.
+   */
+  public Db getDb(String dbName, Privilege privilege)
+      throws AnalysisException, AuthorizationException {
+    Db db = catalog.getDb(dbName, getUser(), privilege);
+    if (db == null) throw new AnalysisException(DB_DOES_NOT_EXIST_ERROR_MSG + dbName);
+    return db;
+  }
+
+  /*
+   * Checks if the given database contains the given table for the given Privilege
+   * level. If the table exists in the database, true is returned. Otherwise false.
+   *
+   * If the user does not have sufficient privileges to access the table an
+   * AuthorizationException is thrown.
+   * If the database does not exist in the catalog an AnalysisError is thrown.
+   */
+  public boolean dbContainsTable(String dbName, String tableName, Privilege privilege)
+      throws AuthorizationException, AnalysisException {
+    try {
+      return catalog.dbContainsTable(dbName, tableName, getUser(), privilege);
+    } catch (DatabaseNotFoundException e) {
+      throw new AnalysisException(DB_DOES_NOT_EXIST_ERROR_MSG + dbName);
+    }
+  }
+
+  /**
+   * If the table name is fully qualified, the database from the TableName object will
+   * be returned. Otherwise the default analyzer database will be returned.
+   */
+  public String getTargetDbName(TableName tableName) {
+    return tableName.isFullyQualified() ? tableName.getDb() : getDefaultDb();
+  }
+
+  public void setIsExplain(boolean isExplain) { this.isExplain = isExplain; }
+  public boolean isExplain() { return isExplain; }
 }

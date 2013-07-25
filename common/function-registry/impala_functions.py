@@ -121,6 +121,8 @@ functions = [
   ['String_Lower', 'STRING', ['STRING'], 'StringFunctions::Lower', ['lower', 'lcase']],
   ['String_Upper', 'STRING', ['STRING'], 'StringFunctions::Upper', ['upper', 'ucase']],
   ['String_Reverse', 'STRING', ['STRING'], 'StringFunctions::Reverse', ['reverse']],
+  ['String_Translate', 'STRING', ['STRING', 'STRING', 'STRING'], 
+        'StringFunctions::Translate', ['translate']],
   ['String_Trim', 'STRING', ['STRING'], 'StringFunctions::Trim', ['trim']],
   ['String_Ltrim', 'STRING', ['STRING'], 'StringFunctions::Ltrim', ['ltrim']],
   ['String_Rtrim', 'STRING', ['STRING'], 'StringFunctions::Rtrim', ['rtrim']],
@@ -146,6 +148,7 @@ functions = [
         'StringFunctions::ParseUrl', ['parse_url']],
   ['String_Parse_Url', 'STRING', ['STRING', 'STRING', 'STRING'], \
         'StringFunctions::ParseUrlKey', ['parse_url']],
+  ['Utility_User', 'STRING', [], 'UtilityFunctions::User', ['user']],
   ['Utility_Sleep', 'BOOLEAN', ['INT'], 'UtilityFunctions::Sleep', ['sleep']],
   ['Utility_Version', 'STRING', [], 'UtilityFunctions::Version', ['version']],
 
@@ -164,6 +167,8 @@ functions = [
   ['Timestamp_month', 'INT', ['TIMESTAMP'], 'TimestampFunctions::Month', ['month']],
   ['Timestamp_dayofmonth', 'INT', ['TIMESTAMP'], \
         'TimestampFunctions::DayOfMonth', ['day', 'dayofmonth']],
+  ['Timestamp_dayofweek', 'INT', ['TIMESTAMP'], \
+        'TimestampFunctions::DayOfWeek', ['dayofweek']],
   ['Timestamp_dayofyear', 'INT', ['TIMESTAMP'],
         'TimestampFunctions::DayOfYear', ['dayofyear']],
   ['Timestamp_weekofyear', 'INT', ['TIMESTAMP'], \
@@ -301,17 +306,17 @@ functions = [
         'ConditionalFunctions::IfTimestamp', ['if']],
 
   ['Conditional_IsNull', 'BOOLEAN', ['BOOLEAN', 'BOOLEAN'], \
-        'ConditionalFunctions::IsNull', ['isnull']],
+        'ConditionalFunctions::IsNull', ['isnull', 'ifnull', 'nvl']],
   ['Conditional_IsNull', 'INT', ['INT', 'INT'], \
-        'ConditionalFunctions::IsNull', ['isnull']],
+        'ConditionalFunctions::IsNull', ['isnull', 'ifnull', 'nvl']],
   ['Conditional_IsNull', 'BIGINT', ['BIGINT', 'BIGINT'], \
-        'ConditionalFunctions::IsNull', ['isnull']],
+        'ConditionalFunctions::IsNull', ['isnull', 'ifnull', 'nvl']],
   ['Conditional_IsNull', 'DOUBLE', ['DOUBLE', 'DOUBLE'], \
-        'ConditionalFunctions::IsNull', ['isnull']],
+        'ConditionalFunctions::IsNull', ['isnull','ifnull', 'nvl']],
   ['Conditional_IsNull', 'STRING', ['STRING', 'STRING'], \
-        'ConditionalFunctions::IsNull', ['isnull']],
+        'ConditionalFunctions::IsNull', ['isnull', 'ifnull', 'nvl']],
   ['Conditional_IsNull', 'TIMESTAMP', ['TIMESTAMP', 'TIMESTAMP'], \
-        'ConditionalFunctions::IsNull', ['isnull']],
+        'ConditionalFunctions::IsNull', ['isnull', 'ifnull', 'nvl']],
   
   ['Conditional_Coalesce', 'BOOLEAN', ['BOOLEAN', '...'], \
         'ConditionalFunctions::CoalesceBool', ['coalesce']],

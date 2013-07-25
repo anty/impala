@@ -19,10 +19,12 @@ import com.cloudera.impala.catalog.RowFormat;
 import com.cloudera.impala.catalog.PrimitiveType;
 import com.cloudera.impala.analysis.UnionStmt.UnionOperand;
 import com.cloudera.impala.analysis.UnionStmt.Qualifier;
+import com.cloudera.impala.thrift.TDescribeTableOutputStyle;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 import java_cup.runtime.Symbol;
+import com.google.common.collect.Lists;
 
 parser code {:
   private Symbol errorToken;
@@ -166,20 +168,22 @@ parser code {:
   }
 :};
 
-terminal KW_ADD, KW_AND, KW_ALL, KW_ALTER, KW_AS, KW_ASC, KW_AVG, KW_BETWEEN, KW_BIGINT,
-  KW_BOOLEAN, KW_BY, KW_CASE, KW_CAST, KW_CHANGE, KW_CREATE, KW_COLUMN, KW_COLUMNS,
-  KW_COMMENT, KW_COUNT, KW_DATABASE, KW_DATABASES, KW_DATE, KW_DATETIME, KW_DESC,
-  KW_DESCRIBE, KW_DISTINCT, KW_DISTINCTPC, KW_DISTINCTPCSA, KW_DIV, KW_DELIMITED,
-  KW_DOUBLE, KW_DROP, KW_ELSE, KW_END, KW_ESCAPED, KW_EXISTS, KW_EXTERNAL, KW_FALSE,
-  KW_FIELDS, KW_FILEFORMAT, KW_FLOAT, KW_FORMAT, KW_FROM, KW_FULL, KW_GROUP, KW_HAVING,
-  KW_IF, KW_IS, KW_IN, KW_INNER, KW_JOIN, KW_INT, KW_LEFT, KW_LIKE, KW_LIMIT, KW_LINES,
-  KW_LOCATION, KW_MIN, KW_MAX, KW_NOT, KW_NULL, KW_ON, KW_OR, KW_ORDER, KW_OUTER,
-  KW_PARQUETFILE, KW_PARTITIONED, KW_RCFILE, KW_REGEXP, KW_RENAME, KW_REPLACE, KW_RLIKE,
-  KW_RIGHT, KW_ROW, KW_SCHEMA, KW_SCHEMAS, KW_SELECT, KW_SET, KW_SEQUENCEFILE, KW_SHOW,
-  KW_SEMI, KW_SMALLINT, KW_STORED, KW_STRING, KW_SUM, KW_TABLES, KW_TERMINATED,
-  KW_TINYINT, KW_TO, KW_TRUE, KW_UNION, KW_USE, KW_USING, KW_WHEN, KW_WHERE, KW_TEXTFILE,
-  KW_THEN, KW_TIMESTAMP, KW_INSERT, KW_INTO, KW_OVERWRITE, KW_TABLE, KW_PARTITION,
-  KW_INTERVAL, KW_VALUES, KW_EXPLAIN;
+// List of keywords. Please keep them sorted alphabetically.
+terminal KW_ADD, KW_ALL, KW_ALTER, KW_AND, KW_AS, KW_ASC, KW_AVG, KW_BETWEEN, KW_BIGINT,
+  KW_BOOLEAN, KW_BY, KW_CASE, KW_CAST, KW_CHANGE, KW_COLUMN, KW_COLUMNS, KW_COMMENT,
+  KW_COUNT, KW_CREATE, KW_DATA, KW_DATABASE, KW_DATABASES, KW_DATE, KW_DATETIME,
+  KW_DELIMITED, KW_DESC, KW_DESCRIBE, KW_DISTINCT, KW_DISTINCTPC, KW_DISTINCTPCSA,
+  KW_DIV, KW_DOUBLE, KW_DROP, KW_ELSE, KW_END, KW_ESCAPED, KW_EXISTS, KW_EXPLAIN,
+  KW_EXTERNAL, KW_FALSE, KW_FIELDS, KW_FILEFORMAT, KW_FLOAT, KW_FORMAT, KW_FORMATTED,
+  KW_FROM, KW_FULL, KW_GROUP, KW_HAVING, KW_IF, KW_IN, KW_INNER, KW_INPATH, KW_INSERT,
+  KW_INT, KW_INTERVAL, KW_INTO, KW_INVALIDATE, KW_IS, KW_JOIN, KW_LEFT, KW_LIKE,
+  KW_LIMIT, KW_LINES, KW_LOAD, KW_LOCATION, KW_MAX, KW_METADATA, KW_MIN, KW_NOT, KW_NULL,
+  KW_ON, KW_OR, KW_ORDER, KW_OUTER, KW_OVERWRITE, KW_PARQUETFILE, KW_PARTITION,
+  KW_PARTITIONED, KW_RCFILE, KW_REFRESH, KW_REGEXP, KW_RENAME, KW_REPLACE, KW_RIGHT,
+  KW_RLIKE, KW_ROW, KW_SCHEMA, KW_SCHEMAS, KW_SELECT, KW_SEMI, KW_SEQUENCEFILE, KW_SET,
+  KW_SHOW, KW_SMALLINT, KW_STORED, KW_STRING, KW_SUM, KW_TABLE, KW_TABLES, KW_TERMINATED,
+  KW_TEXTFILE, KW_THEN, KW_TIMESTAMP, KW_TINYINT, KW_TO, KW_TRUE, KW_UNION, KW_USE,
+  KW_USING, KW_VALUES, KW_VIEW, KW_WHEN, KW_WHERE, KW_WITH;
 
 terminal COMMA, DOT, STAR, LPAREN, RPAREN, LBRACKET, RBRACKET, DIVIDE, MOD, ADD, SUBTRACT;
 terminal BITAND, BITOR, BITXOR, BITNOT;
@@ -191,13 +195,14 @@ terminal Double FLOATINGPOINT_LITERAL;
 terminal String STRING_LITERAL;
 terminal String UNMATCHED_STRING_LITERAL;
 
-nonterminal ParseNodeBase stmt;
+nonterminal StatementBase stmt;
 // Single select statement.
 nonterminal SelectStmt select_stmt;
 // Single values statement.
 nonterminal ValuesStmt values_stmt;
 // Select or union statement.
 nonterminal QueryStmt query_stmt;
+nonterminal QueryStmt optional_query_stmt;
 // Single select_stmt or parenthesized query_stmt.
 nonterminal QueryStmt union_operand;
 // List of select or union blocks connected by UNION operators or a single select block.
@@ -210,17 +215,21 @@ nonterminal ShowTablesStmt show_tables_stmt;
 nonterminal ShowDbsStmt show_dbs_stmt;
 nonterminal String show_pattern;
 nonterminal DescribeStmt describe_stmt;
+nonterminal TDescribeTableOutputStyle describe_output_style;
+nonterminal LoadDataStmt load_stmt;
+nonterminal ResetMetadataStmt reset_metadata_stmt;
 // List of select blocks connected by UNION operators, with order by or limit.
 nonterminal QueryStmt union_with_order_by_or_limit;
 nonterminal SelectList select_clause;
 nonterminal SelectList select_list;
 nonterminal SelectListItem select_list_item;
-nonterminal SelectListItem star_expr ;
+nonterminal SelectListItem star_expr;
 nonterminal Expr expr, non_pred_expr, arithmetic_expr, timestamp_arithmetic_expr;
 nonterminal ArrayList<Expr> expr_list;
 nonterminal ArrayList<Expr> func_arg_list;
 nonterminal String alias_clause;
 nonterminal ArrayList<String> ident_list;
+nonterminal ArrayList<String> optional_ident_list;
 nonterminal TableName table_name;
 nonterminal Expr where_clause;
 nonterminal Predicate predicate, between_predicate, comparison_predicate,
@@ -238,17 +247,20 @@ nonterminal AggregateParamsList aggregate_param_list;
 nonterminal AggregateExpr.Operator aggregate_operator;
 nonterminal SlotRef column_ref;
 nonterminal ArrayList<TableRef> from_clause, table_ref_list;
+nonterminal ArrayList<ViewRef> with_table_ref_list;
+nonterminal WithClause with_clause;
 nonterminal TableRef table_ref;
 nonterminal BaseTableRef base_table_ref;
 nonterminal InlineViewRef inline_view_ref;
+nonterminal ViewRef with_table_ref;
 nonterminal JoinOperator join_operator;
 nonterminal opt_inner, opt_outer;
 nonterminal ArrayList<String> opt_join_hints;
 nonterminal PrimitiveType primitive_type;
 nonterminal Expr sign_chain_expr;
 nonterminal InsertStmt insert_stmt;
-nonterminal ParseNodeBase explain_stmt;
-nonterminal ArrayList<PartitionKeyValue> partition_spec;
+nonterminal StatementBase explain_stmt;
+nonterminal PartitionSpec partition_spec;
 nonterminal ArrayList<PartitionKeyValue> partition_clause;
 nonterminal ArrayList<PartitionKeyValue> static_partition_key_value_list;
 nonterminal ArrayList<PartitionKeyValue> partition_key_value_list;
@@ -257,14 +269,16 @@ nonterminal PartitionKeyValue static_partition_key_value;
 nonterminal Qualifier union_op;
 
 nonterminal AlterTableStmt alter_tbl_stmt;
+nonterminal StatementBase alter_view_stmt;
 nonterminal DropDbStmt drop_db_stmt;
-nonterminal DropTableStmt drop_tbl_stmt;
+nonterminal DropTableOrViewStmt drop_tbl_or_view_stmt;
 nonterminal CreateDbStmt create_db_stmt;
 nonterminal CreateTableLikeStmt create_tbl_like_stmt;
 nonterminal CreateTableStmt create_tbl_stmt;
-nonterminal ColumnDef column_def;
-nonterminal ArrayList<ColumnDef> column_def_list;
-nonterminal ArrayList<ColumnDef> partition_column_defs;
+nonterminal CreateViewStmt create_view_stmt;
+nonterminal ColumnDef column_def, view_column_def;
+nonterminal ArrayList<ColumnDef> column_def_list, view_column_def_list;
+nonterminal ArrayList<ColumnDef> partition_column_defs, view_column_defs;
 // Options for DDL commands - CREATE/DROP/ALTER
 nonterminal String comment_val;
 nonterminal Boolean external_val;
@@ -273,7 +287,7 @@ nonterminal FileFormat file_format_create_table_val;
 nonterminal Boolean if_exists_val;
 nonterminal Boolean if_not_exists_val;
 nonterminal Boolean replace_existing_cols_val;
-nonterminal String location_val;
+nonterminal HdfsURI location_val;
 nonterminal RowFormat row_format_val;
 nonterminal String field_terminator_val;
 nonterminal String line_terminator_val;
@@ -286,6 +300,7 @@ nonterminal String dbs_or_schemas_kw;
 nonterminal String optional_kw_column;
 // Used to simplify commands where KW_TABLE is optional
 nonterminal String optional_kw_table;
+nonterminal Boolean overwrite_val;
 
 precedence left KW_OR;
 precedence left KW_AND;
@@ -297,7 +312,7 @@ precedence left ADD, SUBTRACT;
 precedence left STAR, DIVIDE, MOD, KW_DIV;
 precedence left BITAND, BITOR, BITXOR, BITNOT;
 precedence left KW_ORDER, KW_BY, KW_LIMIT;
-precedence left RPAREN;
+precedence left LPAREN, RPAREN;
 // Support chaining of timestamp arithmetic exprs.
 precedence left KW_INTERVAL;
 
@@ -318,40 +333,93 @@ stmt ::=
   {: RESULT = describe; :}
   | alter_tbl_stmt:alter_tbl
   {: RESULT = alter_tbl; :}
+  | alter_view_stmt:alter_view
+  {: RESULT = alter_view; :}
   | create_tbl_like_stmt:create_tbl_like
   {: RESULT = create_tbl_like; :}
   | create_tbl_stmt:create_tbl
   {: RESULT = create_tbl; :}
+  | create_view_stmt:create_view
+  {: RESULT = create_view; :}
   | create_db_stmt:create_db
   {: RESULT = create_db; :}
   | drop_db_stmt:drop_db
   {: RESULT = drop_db; :}
-  | drop_tbl_stmt:drop_tbl
+  | drop_tbl_or_view_stmt:drop_tbl
   {: RESULT = drop_tbl; :}
   | explain_stmt: explain
   {: RESULT = explain; :}
+  | load_stmt: load
+  {: RESULT = load; :}
+  | reset_metadata_stmt: reset_metadata
+  {: RESULT = reset_metadata; :}
+  ;
+
+load_stmt ::=
+  KW_LOAD KW_DATA KW_INPATH STRING_LITERAL:path overwrite_val:overwrite KW_INTO KW_TABLE
+  table_name:table partition_spec:partition
+  {: RESULT = new LoadDataStmt(table, new HdfsURI(path), overwrite, partition); :}
+  ;
+
+overwrite_val ::=
+  KW_OVERWRITE
+  {: RESULT = Boolean.TRUE; :}
+  | /* empty */
+  {: RESULT = Boolean.FALSE; :}
+  ;
+
+reset_metadata_stmt ::=
+  KW_INVALIDATE KW_METADATA
+  {: RESULT = new ResetMetadataStmt(null, false); :}
+  | KW_INVALIDATE KW_METADATA table_name:table
+  {: RESULT = new ResetMetadataStmt(table, false); :}
+  | KW_REFRESH table_name:table
+  {: RESULT = new ResetMetadataStmt(table, true); :}
   ;
 
 explain_stmt ::=
   KW_EXPLAIN query_stmt:query
-  {: 
+  {:
      query.setIsExplain(true);
      RESULT = query;
   :}
   | KW_EXPLAIN insert_stmt:insert
-  {: 
+  {:
      insert.setIsExplain(true);
      RESULT = insert;
   :}
   ;
 
+// Insert statements have two optional clauses: the column permutation (INSERT into
+// tbl(col1,...) etc) and the PARTITION clause. If the column permutation is present, the
+// query statement clause is optional as well.
 insert_stmt ::=
-  KW_INSERT KW_OVERWRITE optional_kw_table table_name:table
+  with_clause:w KW_INSERT KW_OVERWRITE optional_kw_table table_name:table LPAREN
+  optional_ident_list:col_perm RPAREN partition_clause:list optional_query_stmt:query
+  {: RESULT = new InsertStmt(w, table, true, list, query, col_perm); :}
+  | with_clause:w KW_INSERT KW_OVERWRITE optional_kw_table table_name:table
   partition_clause:list query_stmt:query
-  {: RESULT = new InsertStmt(table, true, list, query); :}
-  | KW_INSERT KW_INTO optional_kw_table table_name:table
+  {: RESULT = new InsertStmt(w, table, true, list, query, null); :}
+  | with_clause:w KW_INSERT KW_INTO optional_kw_table table_name:table LPAREN
+  optional_ident_list:col_perm RPAREN partition_clause:list optional_query_stmt:query
+  {: RESULT = new InsertStmt(w, table, false, list, query, col_perm); :}
+  | with_clause:w KW_INSERT KW_INTO optional_kw_table table_name:table
   partition_clause:list query_stmt:query
-  {: RESULT = new InsertStmt(table, false, list, query); :}
+  {: RESULT = new InsertStmt(w, table, false, list, query, null); :}
+  ;
+
+optional_query_stmt ::=
+  query_stmt:query
+  {: RESULT = query; :}
+  | /* empty */
+  {: RESULT = null; :}
+  ;
+
+optional_ident_list ::=
+  ident_list:ident
+  {: RESULT = ident; :}
+  | /* empty */
+  {: RESULT = Lists.newArrayList(); :}
   ;
 
 optional_kw_table ::=
@@ -365,8 +433,9 @@ alter_tbl_stmt ::=
   {: RESULT = new AlterTableAddReplaceColsStmt(table, col_defs, replace); :}
   | KW_ALTER KW_TABLE table_name:table KW_ADD if_not_exists_val:if_not_exists
     partition_spec:partition location_val:location
-  {: 
-    RESULT = new AlterTableAddPartitionStmt(table, partition, location, if_not_exists);
+  {:
+    RESULT = new AlterTableAddPartitionStmt(table, partition,
+        location, if_not_exists);
   :}
   | KW_ALTER KW_TABLE table_name:table KW_DROP optional_kw_column IDENT:col_name
   {: RESULT = new AlterTableDropColStmt(table, col_name); :}
@@ -379,11 +448,11 @@ alter_tbl_stmt ::=
   | KW_ALTER KW_TABLE table_name:table partition_spec:partition KW_SET KW_FILEFORMAT
     file_format_val:file_format
   {: RESULT = new AlterTableSetFileFormatStmt(table, partition, file_format); :}
-  | KW_ALTER KW_TABLE table_name:table partition_spec:partition KW_SET 
+  | KW_ALTER KW_TABLE table_name:table partition_spec:partition KW_SET
     KW_LOCATION STRING_LITERAL:location
-  {: RESULT = new AlterTableSetLocationStmt(table, partition, location); :}
+  {: RESULT = new AlterTableSetLocationStmt(table, partition, new HdfsURI(location)); :}
   | KW_ALTER KW_TABLE table_name:table KW_RENAME KW_TO table_name:new_table
-  {: RESULT = new AlterTableRenameStmt(table, new_table); :}
+  {: RESULT = new AlterTableOrViewRenameStmt(table, new_table, true); :}
   ;
 
 optional_kw_column ::=
@@ -441,7 +510,7 @@ comment_val ::=
 
 location_val ::=
   KW_LOCATION STRING_LITERAL:location
-  {: RESULT = location; :}
+  {: RESULT = new HdfsURI(location); :}
   | /* empty */
   {: RESULT = null; :}
   ;
@@ -538,14 +607,57 @@ column_def ::=
   {: RESULT = new ColumnDef(col_name, targetType, comment); :}
   ;
 
+create_view_stmt ::=
+  KW_CREATE KW_VIEW if_not_exists_val:if_not_exists table_name:view_name
+  view_column_defs:col_defs comment_val:comment KW_AS query_stmt:view_def
+  {:
+    RESULT = new CreateViewStmt(if_not_exists, view_name, col_defs, comment, view_def);
+  :}
+  ;
+
+view_column_defs ::=
+  LPAREN view_column_def_list:view_col_defs RPAREN
+  {: RESULT = view_col_defs; :}
+  | /* empty */
+  {: RESULT = null; :}
+  ;
+  
+view_column_def_list ::=
+  view_column_def:col_def
+  {:
+    ArrayList<ColumnDef> list = new ArrayList<ColumnDef>();
+    list.add(col_def);
+    RESULT = list;
+  :}
+  | view_column_def_list:list COMMA view_column_def:col_def
+  {:
+    list.add(col_def);
+    RESULT = list;
+  :}
+  ;
+
+view_column_def ::=
+  IDENT:col_name comment_val:comment
+  {: RESULT = new ColumnDef(col_name, null, comment); :}
+  ;
+
+alter_view_stmt ::=
+  KW_ALTER KW_VIEW table_name:table KW_AS query_stmt:view_def
+  {: RESULT = new AlterViewStmt(table, view_def); :}
+  | KW_ALTER KW_VIEW table_name:before_table KW_RENAME KW_TO table_name:new_table
+  {: RESULT = new AlterTableOrViewRenameStmt(before_table, new_table, false); :}
+  ;
+  
 drop_db_stmt ::=
   KW_DROP db_or_schema_kw if_exists_val:if_exists IDENT:db_name
   {: RESULT = new DropDbStmt(db_name, if_exists); :}
   ;
 
-drop_tbl_stmt ::=
-  | KW_DROP KW_TABLE if_exists_val:if_exists table_name:table
-  {: RESULT = new DropTableStmt(table, if_exists); :}
+drop_tbl_or_view_stmt ::=
+  KW_DROP KW_TABLE if_exists_val:if_exists table_name:table
+  {: RESULT = new DropTableOrViewStmt(table, if_exists, true); :}
+  | KW_DROP KW_VIEW if_exists_val:if_exists table_name:table
+  {: RESULT = new DropTableOrViewStmt(table, if_exists, false); :}
   ;
 
 db_or_schema_kw ::=
@@ -591,9 +703,9 @@ partition_key_value_list ::=
 // for dynamic and static partition key/values.
 partition_spec ::=
   KW_PARTITION LPAREN static_partition_key_value_list:list RPAREN
-  {: RESULT = list; :}
+  {: RESULT = new PartitionSpec(list); :}
   | /* Empty */
-  {: RESULT = new ArrayList<PartitionKeyValue>(); :}
+  {: RESULT = null; :}
   ;
 
 static_partition_key_value_list ::=
@@ -643,7 +755,7 @@ static_partition_key_value ::=
 // even if the union has order by and limit.
 // ORDER BY and LIMIT bind to the preceding select statement by default.
 query_stmt ::=
-  union_operand_list:operands
+  with_clause:w union_operand_list:operands
   {:
     QueryStmt queryStmt = null;
     if (operands.size() == 1) {
@@ -651,10 +763,42 @@ query_stmt ::=
     } else {
       queryStmt = new UnionStmt(operands, null, -1);
     }
+    queryStmt.setWithClause(w);
     RESULT = queryStmt;
   :}
-  | union_with_order_by_or_limit:union
-  {: RESULT = union; :}
+  | with_clause:w union_with_order_by_or_limit:union
+  {:
+    union.setWithClause(w);
+    RESULT = union;
+  :}
+  ;
+
+with_clause ::=
+  KW_WITH with_table_ref_list:list
+  {: RESULT = new WithClause(list); :}
+  | /* empty */
+  {: RESULT = null; :}
+  ;
+
+with_table_ref ::=
+  IDENT:alias KW_AS LPAREN query_stmt:query RPAREN
+  {: RESULT = new ViewRef(alias, query); :}
+  | STRING_LITERAL:alias KW_AS LPAREN query_stmt:query RPAREN
+  {: RESULT = new ViewRef(alias, query); :}
+  ;
+
+with_table_ref_list ::=
+  with_table_ref:t
+  {:
+    ArrayList<ViewRef> list = new ArrayList<ViewRef>();
+    list.add(t);
+    RESULT = list;
+  :}
+  | with_table_ref_list:list COMMA with_table_ref:t
+  {:
+    list.add(t);
+    RESULT = list; 
+  :}
   ;
 
 // We must have a non-empty order by or limit for them to bind to the union.
@@ -794,13 +938,22 @@ show_pattern ::=
   ;
 
 describe_stmt ::=
-  KW_DESCRIBE table_name:table
-  {: RESULT = new DescribeStmt(table); :}
+  KW_DESCRIBE describe_output_style:style table_name:table
+  {: RESULT = new DescribeStmt(table, style); :}
+  ;
+
+describe_output_style ::=
+  KW_FORMATTED
+  {: RESULT = TDescribeTableOutputStyle.FORMATTED; :}
+  | /* empty */
+  {: RESULT = TDescribeTableOutputStyle.MINIMAL; :}
   ;
 
 select_stmt ::=
     select_clause:selectList
-  {: RESULT = new SelectStmt(selectList, null, null, null, null, null, -1); :}
+  {:
+    RESULT = new SelectStmt(selectList, null, null, null, null, null, -1);
+  :}
   |
     select_clause:selectList
     from_clause:tableRefList
@@ -856,6 +1009,10 @@ alias_clause ::=
   {: RESULT = ident; :}
   | IDENT:ident
   {: RESULT = ident; :}
+  | KW_AS STRING_LITERAL:l
+  {: RESULT = l; :}
+  | STRING_LITERAL:l
+  {: RESULT = l; :}
   ;
 
 star_expr ::=
@@ -1095,7 +1252,7 @@ case_else_clause ::=
   {: RESULT = null; :}
   ;
 
-sign_chain_expr ::= 
+sign_chain_expr ::=
   SUBTRACT expr:e
   {:
     // integrate signs into literals
@@ -1343,7 +1500,7 @@ like_predicate ::=
     new LikePredicate(LikePredicate.Operator.REGEXP, e1, e2), null); :}
   ;
 
-// Avoid a reduce/reduce conflict with compound_predicate by explicitly 
+// Avoid a reduce/reduce conflict with compound_predicate by explicitly
 // using non_pred_expr and predicate separately instead of expr.
 between_predicate ::=
   expr:e1 KW_BETWEEN non_pred_expr:e2 KW_AND expr:e3
@@ -1352,13 +1509,13 @@ between_predicate ::=
   {: RESULT = new BetweenPredicate(e1, e2, e3, false); :}
   | expr:e1 KW_NOT KW_BETWEEN non_pred_expr:e2 KW_AND expr:e3
   {: RESULT = new BetweenPredicate(e1, e2, e3, true); :}
-  | expr:e1 KW_NOT KW_BETWEEN predicate:e2 KW_AND expr:e3  
+  | expr:e1 KW_NOT KW_BETWEEN predicate:e2 KW_AND expr:e3
   {: RESULT = new BetweenPredicate(e1, e2, e3, true); :}
   ;
 
 in_predicate ::=
   expr:e KW_IN LPAREN func_arg_list:l RPAREN
-  {: RESULT = new InPredicate(e, l, false); :}  
+  {: RESULT = new InPredicate(e, l, false); :}
   | expr:e KW_NOT KW_IN LPAREN func_arg_list:l RPAREN
   {: RESULT = new InPredicate(e, l, true); :}
   ;
@@ -1408,4 +1565,3 @@ primitive_type ::=
   | KW_STRING
   {: RESULT = PrimitiveType.STRING; :}
   ;
-  

@@ -63,15 +63,15 @@ inline bool ScannerContext::Stream::ReadBytes(int length, uint8_t** buf, Status*
     *status = Status("Negative length");
     return false;
   }
+  if (UNLIKELY(length == 0)) {
+    *status = Status::OK;
+    return true;
+  }
   int bytes_read;
   bool dummy_eos;
   RETURN_IF_FALSE(GetBytes(length, buf, &bytes_read, &dummy_eos, status));
   if (UNLIKELY(length != bytes_read)) {
-    // We currently get many spurious incomplete reads when scanners try to read off the
-    // end of the file. Mark as quiet for now to prevent log spew.
-    // TODO: prevent scanners from reading off the end of the file and set quiet back to
-    // false.
-    *status = Status("incomplete read", /* quiet */ true);
+    *status = ReportIncompleteRead(length, bytes_read);
     return false;
   }
   return true;
@@ -80,12 +80,16 @@ inline bool ScannerContext::Stream::ReadBytes(int length, uint8_t** buf, Status*
 // TODO: consider implementing a Skip in the context/stream object that's more 
 // efficient than GetBytes.
 inline bool ScannerContext::Stream::SkipBytes(int length, Status* status) {
+  if (UNLIKELY(length == 0)) {
+    *status = Status::OK;
+    return true;
+  }
   uint8_t* dummy_buf;
   int bytes_read;
   bool dummy_eos;
   RETURN_IF_FALSE(GetBytes(length, &dummy_buf, &bytes_read, &dummy_eos, status));
   if (UNLIKELY(length != bytes_read)) {
-    *status = Status("incomplete read", /* quiet */ true);
+    *status = ReportIncompleteRead(length, bytes_read);
     return false;
   }
   return true;
@@ -112,8 +116,8 @@ inline bool ScannerContext::Stream::ReadBoolean(bool* b, Status* status) {
 
 inline bool ScannerContext::Stream::ReadInt(int32_t* val, Status* status) {
   uint8_t* bytes;
-  RETURN_IF_FALSE(ReadBytes(sizeof(int32_t), &bytes, status));
-  *val = ReadWriteUtil::GetInt(bytes);
+  RETURN_IF_FALSE(ReadBytes(sizeof(uint32_t), &bytes, status));
+  *val = ReadWriteUtil::GetInt<uint32_t>(bytes);
   return true;
 }
 

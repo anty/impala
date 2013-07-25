@@ -69,7 +69,7 @@ ExecNode::ExecNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl
 }
 
 Status ExecNode::Prepare(RuntimeState* state) {
-  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::PREPARE));
+  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::PREPARE, state));
   DCHECK(runtime_profile_.get() != NULL);
   rows_returned_counter_ =
       ADD_COUNTER(runtime_profile_, "RowsReturned", TCounterType::UNIT);
@@ -88,7 +88,7 @@ Status ExecNode::Prepare(RuntimeState* state) {
 }
 
 Status ExecNode::Close(RuntimeState* state) {
-  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::CLOSE));
+  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::CLOSE, state));
   if (rows_returned_counter_ != NULL) {
     COUNTER_SET(rows_returned_counter_, num_rows_returned_);
   }
@@ -246,9 +246,11 @@ void ExecNode::DebugString(int indentation_level, stringstream* out) const {
 }
 
 Status ExecNode::PrepareConjuncts(RuntimeState* state) {
+  codegend_conjuncts_thread_safe_ = true;
   for (vector<Expr*>::iterator i = conjuncts_.begin(); i != conjuncts_.end(); ++i) {
-    RETURN_IF_ERROR(
-        Expr::Prepare(*i, state, row_desc(), false, &codegend_conjuncts_thread_safe_));
+    bool is_thread_safe;
+    RETURN_IF_ERROR(Expr::Prepare(*i, state, row_desc(), false, &is_thread_safe));
+    codegend_conjuncts_thread_safe_ &= is_thread_safe;
   }
   return Status::OK;
 }
@@ -372,14 +374,15 @@ void ExecNode::InitRuntimeProfile(const string& name) {
   runtime_profile_->set_metadata(id_);
 }
 
-Status ExecNode::ExecDebugAction(TExecNodePhase::type phase) {
+Status ExecNode::ExecDebugAction(TExecNodePhase::type phase, RuntimeState* state) {
   DCHECK(phase != TExecNodePhase::INVALID);
   if (debug_phase_ != phase) return Status::OK;
   if (debug_action_ == TDebugAction::FAIL) return Status(TStatusCode::INTERNAL_ERROR);
   if (debug_action_ == TDebugAction::WAIT) {
-    while (true) {
+    while (!state->is_cancelled()) {
       sleep(1);
     }
+    return Status::CANCELLED;
   }
   return Status::OK;
 }

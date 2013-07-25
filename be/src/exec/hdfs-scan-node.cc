@@ -26,6 +26,8 @@
 #include <boost/foreach.hpp>
 #include <dlfcn.h>
 
+#include <hdfs.h>
+
 #include "codegen/llvm-codegen.h"
 #include "common/logging.h"
 #include "common/object-pool.h"
@@ -60,23 +62,18 @@ HdfsScanNode::HdfsScanNode(ObjectPool* pool, const TPlanNode& tnode,
                            const DescriptorTbl& descs)
     : ScanNode(pool, tnode, descs),
       thrift_plan_node_(new TPlanNode(tnode)),
+      runtime_state_(NULL),
       tuple_id_(tnode.hdfs_scan_node.tuple_id),
       compact_data_(tnode.compact_data),
       reader_context_(NULL),
       tuple_desc_(NULL),
       unknown_disk_id_warned_(false),
-      num_unqueued_files_(0),
       scanner_pool_(new ObjectPool()),
       num_partition_keys_(0),
-      num_owned_io_buffers_(0),
-      num_scanners_codegen_enabled_(0),
-      num_scanners_codegen_disabled_(0),
+      disks_accessed_bitmap_(TCounterType::UNIT, 0),
       done_(false),
-      num_queued_io_buffers_(0),
-      max_queued_io_buffers_(0),
-      num_blocked_scanners_(0),
-      counters_reported_(false),
-      disks_accessed_bitmap_(TCounterType::UNIT, 0) {
+      all_ranges_started_(false),
+      counters_reported_(false) {
   max_materialized_row_batches_ = FLAGS_max_row_batches;
   if (max_materialized_row_batches_ <= 0) {
     // TODO: This parameter has an U-shaped effect on performance: increasing the value
@@ -90,17 +87,19 @@ HdfsScanNode::~HdfsScanNode() {
 }
 
 Status HdfsScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
-  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT));
+  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   RETURN_IF_CANCELLED(state);
   SCOPED_TIMER(runtime_profile_->total_time_counter());
 
   {
-    unique_lock<recursive_mutex> l(lock_);
-    if (per_file_splits_.size() == 0 || ReachedLimit() || !status_.ok()) {
-      UpdateCounters();
-      *eos = true;
-      return status_;
-    }
+    unique_lock<mutex> l(lock_);
+    *eos = per_file_splits_.size() == 0 || ReachedLimit() || !status_.ok();
+  }
+
+  if (*eos) {
+    UpdateCounters();
+    unique_lock<mutex> l(lock_);
+    return status_;
   }
 
   RowBatch* materialized_batch = NULL;
@@ -120,8 +119,7 @@ Status HdfsScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos
   }
 
   if (materialized_batch != NULL) {
-    __sync_fetch_and_add(
-        &num_owned_io_buffers_, -1 * materialized_batch->num_io_buffers());
+    num_owned_io_buffers_ -= materialized_batch->num_io_buffers();
     row_batch_consumed_cv_.notify_one();
     row_batch->Swap(materialized_batch);
     // Update the number of materialized rows instead of when they are materialized.
@@ -139,8 +137,7 @@ Status HdfsScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos
 
       *eos = true;
       UpdateCounters();
-      // Wake up disk thread notifying it we are done.  This triggers tear down
-      // of the scanner threads.
+      // Wake up scanner threads notifying them we are done.
       {
         unique_lock<mutex> l(row_batches_lock_);
         done_ = true;
@@ -221,7 +218,7 @@ Status HdfsScanNode::SetScanRanges(const vector<TScanRangeParams>& scan_range_pa
 }
 
 DiskIoMgr::ScanRange* HdfsScanNode::AllocateScanRange(const char* file, int64_t len,
-    int64_t offset, int64_t partition_id, int disk_id, ScannerContext::Stream* stream) {
+    int64_t offset, int64_t partition_id, int disk_id) {
   DCHECK_GE(disk_id, -1);
   if (disk_id == -1) {
     // disk id is unknown, assign it a random one.
@@ -234,7 +231,7 @@ DiskIoMgr::ScanRange* HdfsScanNode::AllocateScanRange(const char* file, int64_t 
   disk_id %= runtime_state_->io_mgr()->num_disks();
 
   ScanRangeMetadata* metadata = 
-      runtime_state_->obj_pool()->Add(new ScanRangeMetadata(partition_id, stream));
+      runtime_state_->obj_pool()->Add(new ScanRangeMetadata(partition_id));
   DiskIoMgr::ScanRange* range = 
       runtime_state_->obj_pool()->Add(new DiskIoMgr::ScanRange());
   range->Reset(file, len, offset, disk_id, metadata);
@@ -318,21 +315,60 @@ HdfsScanner* HdfsScanNode::CreateScanner(HdfsPartitionDescriptor* partition) {
       DCHECK(false) << "Unknown Hdfs file format type:" << partition->file_format();
       return NULL;
   }
-  if (scanner != NULL) {
-    scanner_pool_->Add(scanner);
-    // TODO better error handling
-    Status status = scanner->Prepare();
-    DCHECK(status.ok());
-  }
+  DCHECK(scanner != NULL);
+  scanner_pool_->Add(scanner);
   return scanner;
+}
+
+Tuple* HdfsScanNode::InitTemplateTuple(RuntimeState* state,
+    const vector<Expr*>& expr_values) {
+  if (partition_key_slots_.empty()) return NULL;
+
+  // Look to protect access to partition_key_pool_ and expr_values
+  // TODO: we can push the lock to the mempool and exprs_values should not
+  // use internal memory.
+  Tuple* template_tuple = InitEmptyTemplateTuple();
+
+  unique_lock<mutex> l(lock_);
+  for (int i = 0; i < partition_key_slots_.size(); ++i) {
+    const SlotDescriptor* slot_desc = partition_key_slots_[i];
+    // Exprs guaranteed to be literals, so can safely be evaluated without a row context
+    void* value = expr_values[slot_desc->col_pos()]->GetValue(NULL);
+    RawValue::Write(value, template_tuple, slot_desc, NULL);
+  }
+  return template_tuple;
+}
+
+Tuple* HdfsScanNode::InitEmptyTemplateTuple() {
+  Tuple* template_tuple = NULL;
+  {
+    unique_lock<mutex> l(lock_);
+    template_tuple = reinterpret_cast<Tuple*>(
+        partition_key_pool_->Allocate(tuple_desc_->byte_size()));
+  }
+  memset(template_tuple, 0, tuple_desc_->byte_size());
+  return template_tuple;
 }
 
 Status HdfsScanNode::Prepare(RuntimeState* state) {
   runtime_state_ = state;
-  // TODO: this is a somewhat random heuristic.  Allow queueing up to 2 buffers
-  // per scanner.  This should take into account mem limits.
-  max_queued_io_buffers_ = state->num_scanner_threads() * 2;
   RETURN_IF_ERROR(ScanNode::Prepare(state));
+
+  // Initialize HdfsScanNode specific counters
+  read_timer_ = ADD_TIMER(runtime_profile(), TOTAL_HDFS_READ_TIMER);
+  per_read_thread_throughput_counter_ = runtime_profile()->AddDerivedCounter(
+      PER_READ_THREAD_THROUGHPUT_COUNTER, TCounterType::BYTES_PER_SECOND,
+      bind<int64_t>(&RuntimeProfile::UnitsPerSecond, bytes_read_counter_, read_timer_));
+  scan_ranges_complete_counter_ =
+      ADD_COUNTER(runtime_profile(), SCAN_RANGES_COMPLETE_COUNTER, TCounterType::UNIT);
+  if (DiskInfo::num_disks() < 64) {
+    num_disks_accessed_counter_ =
+        ADD_COUNTER(runtime_profile(), NUM_DISKS_ACCESSED_COUNTER, TCounterType::UNIT);
+  } else {
+    num_disks_accessed_counter_ = 0;
+  }
+  num_scanner_threads_started_counter_ = 
+      ADD_COUNTER(runtime_profile(), NUM_SCANNER_THREADS_STARTED, TCounterType::UNIT);
 
   tuple_desc_ = state->desc_tbl().GetTupleDescriptor(tuple_id_);
   DCHECK(tuple_desc_ != NULL);
@@ -361,6 +397,7 @@ Status HdfsScanNode::Prepare(RuntimeState* state) {
   for (size_t i = 0; i < slots.size(); ++i) {
     if (!slots[i]->is_materialized()) continue;
     int col_idx = slots[i]->col_pos();
+    DCHECK_LT(col_idx, column_idx_to_materialized_slot_idx_.size());
     DCHECK_EQ(column_idx_to_materialized_slot_idx_[col_idx], SKIP_COLUMN);
     all_materialized_slots[col_idx] = slots[i];
   }
@@ -416,37 +453,22 @@ Status HdfsScanNode::Prepare(RuntimeState* state) {
     }
   }
   
+  // We need at least one scanner thread to make progress. We need to make this
+  // reservation before any ranges are issued.
+  runtime_state_->resource_pool()->ReserveOptionalTokens(1);
+  runtime_state_->resource_pool()->SetThreadAvailableCb(
+      bind<void>(mem_fn(&HdfsScanNode::ThreadTokenAvailableCb), this, _1));
+  
   return Status::OK;
 }
 
-Tuple* HdfsScanNode::InitTemplateTuple(RuntimeState* state,
-    const vector<Expr*>& expr_values) {
-  if (partition_key_slots_.empty()) return NULL;
-
-  // Look to protect access to partition_key_pool_ and expr_values
-  // TODO: we can push the lock to the mempool and exprs_values should not
-  // use internal memory.
-  unique_lock<recursive_mutex> l(lock_);
-  Tuple* template_tuple = 
-      reinterpret_cast<Tuple*>(partition_key_pool_->Allocate(tuple_desc_->byte_size()));
-  memset(template_tuple, 0, tuple_desc_->byte_size());
-
-  for (int i = 0; i < partition_key_slots_.size(); ++i) {
-    const SlotDescriptor* slot_desc = partition_key_slots_[i];
-
-    // Exprs guaranteed to be literals, so can safely be evaluated without a row context
-    void* value = expr_values[slot_desc->col_pos()]->GetValue(NULL);
-    RawValue::Write(value, template_tuple, slot_desc, NULL);
-  }
-  return template_tuple;
-}
-
-// This function initiates the connection to hdfs and starts up the disk thread.
+// This function initiates the connection to hdfs and starts up the initial scanner
+// threads.
 // Splits are accumulated by file type and the scanner subclasses are passed
 // the initial splits.  Scanners are expected to queue up a non-zero number of
 // those splits to the io mgr (via the ScanNode).
 Status HdfsScanNode::Open(RuntimeState* state) {
-  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::OPEN));
+  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::OPEN, state));
 
   if (per_file_splits_.empty()) {
     done_ = true;
@@ -454,8 +476,7 @@ Status HdfsScanNode::Open(RuntimeState* state) {
   }
 
   RETURN_IF_ERROR(runtime_state_->io_mgr()->RegisterReader(
-      hdfs_connection_, runtime_state_->resource_pool(),
-      &reader_context_, state->fragment_mem_limit()));
+      hdfs_connection_, &reader_context_, state->query_mem_limit()));
   runtime_state_->io_mgr()->set_bytes_read_counter(reader_context_, bytes_read_counter());
   runtime_state_->io_mgr()->set_read_timer(reader_context_, read_timer());
   runtime_state_->io_mgr()->set_active_read_thread_counter(reader_context_,
@@ -463,16 +484,15 @@ Status HdfsScanNode::Open(RuntimeState* state) {
   runtime_state_->io_mgr()->set_disks_access_bitmap(reader_context_,
       &disks_accessed_bitmap_);
 
-  average_io_mgr_queue_capacity_ = runtime_profile()->AddSamplingCounter(
-      AVERAGE_IO_MGR_QUEUE_CAPACITY, bind<int64_t>(mem_fn(
-          &DiskIoMgr::queue_capacity), runtime_state_->io_mgr(), reader_context_));
-  average_io_mgr_queue_size_ = runtime_profile()->AddSamplingCounter(
-      AVERAGE_IO_MGR_QUEUE_SIZE, bind<int64_t>(mem_fn(
-          &DiskIoMgr::queue_size), runtime_state_->io_mgr(), reader_context_));
   average_scanner_thread_concurrency_ = runtime_profile()->AddSamplingCounter(
       AVERAGE_SCANNER_THREAD_CONCURRENCY, &active_scanner_thread_counter_);
   average_hdfs_read_thread_concurrency_ = runtime_profile()->AddSamplingCounter(
       AVERAGE_HDFS_READ_THREAD_CONCURRENCY, &active_hdfs_read_thread_counter_);
+
+  bytes_read_local_ = ADD_COUNTER(runtime_profile(), "BytesReadLocal",
+      TCounterType::BYTES);
+  bytes_read_short_circuit_ = ADD_COUNTER(runtime_profile(), "BytesReadShortCircuit",
+      TCounterType::BYTES);
 
   // Create num_disks+1 bucket counters
   for (int i = 0; i < state->io_mgr()->num_disks() + 1; ++i) {
@@ -497,6 +517,7 @@ Status HdfsScanNode::Open(RuntimeState* state) {
     int64_t partition_id = metadata->partition_id;
     HdfsPartitionDescriptor* partition = hdfs_table_->GetPartition(partition_id);
     if (partition == NULL) {
+      LOG(INFO) << hdfs_table_->DebugString();
       stringstream ss;
       ss << "Could not find partition with id: " << partition_id;
       return Status(ss.str());
@@ -513,74 +534,62 @@ Status HdfsScanNode::Open(RuntimeState* state) {
     done_ = true;
     return Status::OK;
   }
-
+  
   stringstream ss;
   ss << "Splits complete (node=" << id() << "):";
   progress_ = ProgressUpdater(ss.str(), total_splits);
 
   // Issue initial ranges for all file types.
-  HdfsTextScanner::IssueInitialRanges(this, per_type_files[THdfsFileFormat::TEXT]);
-  BaseSequenceScanner::IssueInitialRanges(this, 
-      per_type_files[THdfsFileFormat::SEQUENCE_FILE]);
-  BaseSequenceScanner::IssueInitialRanges(this,
-      per_type_files[THdfsFileFormat::RC_FILE]);
-  BaseSequenceScanner::IssueInitialRanges(this,
-      per_type_files[THdfsFileFormat::AVRO]);
-  HdfsParquetScanner::IssueInitialRanges(this, per_type_files[THdfsFileFormat::PARQUET]);
-  HdfsHFileScanner::IssueInitialRanges(this, per_type_files[THdfsFileFormat::HFILE]);
+  RETURN_IF_ERROR(
+      HdfsTextScanner::IssueInitialRanges(this, per_type_files[THdfsFileFormat::TEXT]));
+  RETURN_IF_ERROR(BaseSequenceScanner::IssueInitialRanges(this, 
+      per_type_files[THdfsFileFormat::SEQUENCE_FILE]));
+  RETURN_IF_ERROR(BaseSequenceScanner::IssueInitialRanges(this,
+      per_type_files[THdfsFileFormat::RC_FILE]));
+  RETURN_IF_ERROR(BaseSequenceScanner::IssueInitialRanges(this,
+      per_type_files[THdfsFileFormat::AVRO]));
+  RETURN_IF_ERROR(HdfsParquetScanner::IssueInitialRanges(this, 
+        per_type_files[THdfsFileFormat::PARQUET]));
+  RETURN_IF_ERROR(HdfsParquetScanner::IssueInitialRanges(this, 
+        per_type_files[THdfsFileFormat::HFILE]));
+  
   if (!per_type_files[THdfsFileFormat::LZO_TEXT].empty()) {
     // This will dlopen the lzo binary and can fail if it is not present
     RETURN_IF_ERROR(HdfsLzoTextScanner::IssueInitialRanges(state,
         this, per_type_files[THdfsFileFormat::LZO_TEXT]));
   }
 
-  if (progress_.done()) {
-    // No scan ranges queued, nothing to do
-    DCHECK_EQ(queued_ranges_.size(), 0);
-    done_ = true;
-    return Status::OK;
-  }
-
-  // Start up disk thread which in turn drives the scanner threads.
-  disk_read_thread_.reset(new thread(&HdfsScanNode::DiskThread, this));
-
-  // scanners have added their initial ranges, issue the first batch to the io mgr.
-  // TODO: gdb seems to cause a SIGSEGV when the java call this triggers in the
-  // I/O threads when the thread created above appears during that operation. 
-  // We create it first and then wake up the I/O threads. Need to investigate.
-  IssueQueuedRanges();
-
+  done_ = progress_.done();
   return Status::OK;
 }
 
 Status HdfsScanNode::Close(RuntimeState* state) {
-  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::CLOSE));
+  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::CLOSE, state));
   {
     unique_lock<mutex> l(row_batches_lock_);
     done_ = true;
   }
   if (reader_context_ != NULL) {
-    runtime_state_->io_mgr()->CancelReader(reader_context_);
+    state->io_mgr()->CancelReader(reader_context_);
     row_batch_consumed_cv_.notify_all();
   }
+  state->resource_pool()->SetThreadAvailableCb(NULL);
 
-  if (disk_read_thread_ != NULL) disk_read_thread_->join();
+  scanner_threads_.join_all();
 
   // There are materialized batches that have not been returned to the parent node.
   // Clean those up now.
   for (list<RowBatch*>::iterator it = materialized_row_batches_.begin();
        it != materialized_row_batches_.end(); ++it) {
-    __sync_fetch_and_add(&num_owned_io_buffers_, -1 * (*it)->num_io_buffers());
+    num_owned_io_buffers_ -= (*it)->num_io_buffers();
     delete *it;
   }
   materialized_row_batches_.clear();
   
   DCHECK_EQ(num_owned_io_buffers_, 0) << "ScanNode has leaked io buffers";
-  DCHECK_EQ(num_queued_io_buffers_, 0);
-  DCHECK_EQ(num_blocked_scanners_, 0);
 
   if (reader_context_ != NULL) {
-    runtime_state_->io_mgr()->UnregisterReader(reader_context_);
+    state->io_mgr()->UnregisterReader(reader_context_);
   }
 
   // There should be no active scanner threads and hdfs read threads.
@@ -592,172 +601,25 @@ Status HdfsScanNode::Close(RuntimeState* state) {
   return ExecNode::Close(state);
 }
 
-void HdfsScanNode::AddDiskIoRange(DiskIoMgr::ScanRange* range) {
-  unique_lock<recursive_mutex> lock(lock_);
-  queued_ranges_.push_back(range);
-}
-
-void HdfsScanNode::AddDiskIoRange(const HdfsFileDesc* desc) {
-  const vector<DiskIoMgr::ScanRange*>& splits = desc->splits;
-  unique_lock<recursive_mutex> lock(lock_);
-  for (int j = 0; j < splits.size(); ++j) {
-    queued_ranges_.push_back(splits[j]);
-  }
-  FileQueued(desc->filename.c_str());
-}
-
-void HdfsScanNode::FileQueued(const char* filename) {
-  unique_lock<recursive_mutex> lock(lock_);
-  DCHECK_GT(num_unqueued_files_, 0);
-  if (--num_unqueued_files_ == 0) IssueQueuedRanges();
-}
-
-// TODO: this is not in the final state.  Currently, each scanner thread only
-// works on one scan range and cannot switch back and forth between them.  This
-// puts the limitation that we can't have more ranges in flight than the number of
-// scanner threads.  There are two ways we can fix this:
-// 1. Add the logic to the io mgr to cap the number of in flight contexts.  This is
-// yet another resource for the io mgr to deal with.  It's a bit more bookkeeping:
-// max 3 contexts across 5 disks, the io mgr needs to make sure 3 of the disks
-// are busy for this reader.  Also, as in this example, it is not possible to spin
-// up all the disks with 1 scanner thread.
-// 2. Update the scanner threads to be able to switch between scan ranges.  This is
-// more flexible and can be done with getcontext()/setcontext() (or libtask).  
-// ScannerContext provides this abstraction already (when GetBytes() blocks, switch
-// to another scan range).
-//
-// Currently, we have implemented #1.
-Status HdfsScanNode::IssueQueuedRanges() {
-  unique_lock<recursive_mutex> lock(lock_);
+Status HdfsScanNode::AddDiskIoRanges(const vector<DiskIoMgr::ScanRange*>& ranges) {
   RETURN_IF_ERROR(
-      runtime_state_->io_mgr()->AddScanRanges(reader_context_, queued_ranges_));
-  queued_ranges_.clear();
+      runtime_state_->io_mgr()->AddScanRanges(reader_context_, ranges));
+  ThreadTokenAvailableCb(runtime_state_->resource_pool());
   return Status::OK;
 }
 
-// lock_ should be taken before calling this.
-void HdfsScanNode::StartNewScannerThread(DiskIoMgr::BufferDescriptor* buffer) {
-  ScanRangeMetadata* metadata = 
-      reinterpret_cast<ScanRangeMetadata*>(buffer->scan_range()->meta_data());
-  int64_t partition_id = metadata->partition_id;
-  HdfsPartitionDescriptor* partition = hdfs_table_->GetPartition(partition_id);
-  DCHECK(partition != NULL);
-
-  ScannerContext* context = runtime_state_->obj_pool()->Add(
-      new ScannerContext(runtime_state_, this, partition, buffer));
-  metadata->stream = context->GetStream();
-
-  // Track this context as active
-  {
-    unique_lock<mutex> l(disk_thread_resource_lock_);
-    active_scanners_.insert(context);
-    DCHECK_LT(num_blocked_scanners_, active_scanners_.size());
-  }
-
-  HdfsScanner* scanner = CreateScanner(partition);
-  scanner_threads_.add_thread(new thread(&HdfsScanNode::ScannerThread, this,
-        scanner, context)); 
+Status HdfsScanNode::AddDiskIoRanges(const HdfsFileDesc* desc) {
+  const vector<DiskIoMgr::ScanRange*>& ranges = desc->splits;
+  RETURN_IF_ERROR(
+      runtime_state_->io_mgr()->AddScanRanges(reader_context_, ranges));
+  MarkFileDescIssued(desc);
+  ThreadTokenAvailableCb(runtime_state_->resource_pool());
+  return Status::OK;
 }
 
-// The disk thread continuously reads from the io mgr, queuing buffers to the 
-// correct ScannerContext::Stream.  If the buffer is from a new stream (i.e. first
-// buffer for the stream), then a new ScannerContext (and Stream) is created and
-// a new thread is created for the ScannerContext.
-void HdfsScanNode::DiskThread() {
-  while (true) {
-    bool eos = false;
-    DiskIoMgr::BufferDescriptor* buffer_desc = NULL;
-    
-    {
-      unique_lock<mutex> lock(disk_thread_resource_lock_);
-      DCHECK_LE(num_blocked_scanners_, active_scanners_.size());
-      // Wait if the number of buffers is at the max limit (to generate back pressure
-      // on the io mgr) AND all scanners can make progress AND there aren't any ranges
-      // started in the io mgr that don't have a scanner thread processing them.
-      // Thread tokens are acquired in the io mgr (i.e. num_optional_threads()) and then
-      // get queued in the io mgr queue.  Only when this thread reads them, is a scanner
-      // thread (active_scanners_) created.  We don't want to actively be starting new
-      // scanner threads if possible. 
-      DCHECK_LE(num_blocked_scanners_, active_scanners_.size());
-      int num_started_ranges = runtime_state_->resource_pool()->num_optional_threads();
-      while (num_blocked_scanners_ == 0 &&
-             num_queued_io_buffers_ >= max_queued_io_buffers_ &&
-             num_started_ranges == active_scanners_.size() &&
-             !done_) {
-        disk_thread_resource_cv_.wait(lock);
-      }
-      if (done_) break;
-    }
-
-    Status status = 
-        runtime_state_->io_mgr()->GetNext(reader_context_, &buffer_desc, &eos);
-
-    ScannerContext::Stream* stream = NULL;
-    {
-      unique_lock<recursive_mutex> lock(lock_);
-
-      // done_ will trigger the io mgr to return CANCELLED, we can ignore that error
-      // since the scan node triggered it itself.
-      if (done_) {
-        if (buffer_desc != NULL) buffer_desc->Return();
-        break;
-      }
-
-      // The disk io mgr is done or error occurred. Tear everything down.
-      if (!status.ok()) {
-        {
-          unique_lock<mutex> l(row_batches_lock_);
-          done_ = true;
-        }
-        if (buffer_desc != NULL) buffer_desc->Return();
-        status_.AddError(status);
-        break;
-      }
-
-      DCHECK(buffer_desc != NULL);
-      __sync_fetch_and_add(&num_owned_io_buffers_, 1);
-
-      ScanRangeMetadata* metadata = 
-          reinterpret_cast<ScanRangeMetadata*>(buffer_desc->scan_range()->meta_data());
-      if (metadata->stream == NULL) {
-        // This buffer is not part of an existing stream, create a new scanner,
-        // context and stream to process it.
-        StartNewScannerThread(buffer_desc);
-      } else {
-        stream = metadata->stream;
-      }
-    }
-
-    if (stream != NULL) {
-      // Do not hold lock_ when calling AddBuffer.
-      stream->AddBuffer(buffer_desc);
-    }
-  }
-  // At this point the disk thread is starting cleanup and will no longer read
-  // from the io mgr.  This can happen in one of these conditions:
-  //   1. All ranges were returned.  (common case).
-  //   2. Limit was reached (done_ and status_ is ok)
-  //   3. Error occurred (done_ and status_ not ok).
-  DCHECK(done_);
-
-  VLOG_FILE << "Disk thread done (node=" << id() << ")";
-  // Wake up all contexts that are still waiting.  done_ indicates that the
-  // node is complete (e.g. parse error or limit reached()) and the scanner should
-  // terminate immediately.
-  {
-    unique_lock<recursive_mutex> lock(lock_);
-    for (unordered_set<ScannerContext*>::iterator it = active_scanners_.begin(); 
-        it != active_scanners_.end(); ++it) {
-      (*it)->Cancel();
-    }
-    unique_lock<mutex> l(disk_thread_resource_lock_);
-    active_scanners_.clear();
-  }
-
-  scanner_threads_.join_all();
-
-  // Wake up thread in GetNext	
-  row_batch_added_cv_.notify_one();
+void HdfsScanNode::MarkFileDescIssued(const HdfsFileDesc* desc) {
+  DCHECK_GT(num_unqueued_files_, 0);
+  --num_unqueued_files_;
 }
 
 void HdfsScanNode::AddMaterializedRowBatch(RowBatch* row_batch) {
@@ -775,76 +637,115 @@ void HdfsScanNode::AddMaterializedRowBatch(RowBatch* row_batch) {
   row_batch_added_cv_.notify_one();
 }
 
-void HdfsScanNode::ScannerThread(HdfsScanner* scanner, ScannerContext* context) {
-  // Call into the scanner to process the range.  From the scanner's perspective,
-  // everything is single threaded.
-  Status status;
-  {
-    SCOPED_THREAD_COUNTER_MEASUREMENT(scanner_thread_counters());
-    ScopedCounter scoped_counter(&active_scanner_thread_counter_, -1);
-    status = scanner->ProcessSplit(context);
-    scanner->Close();
-    if (context->num_buffers_added() != 0) {
-      // This scanner saw at least one io buffer indicating the io mgr reserved
-      // a thread for it.  Release that now.
-      runtime_state_->resource_pool()->ReleaseThreadToken(false);
-    }
-  }
+void HdfsScanNode::ThreadTokenAvailableCb(ThreadResourceMgr::ResourcePool* pool) {
+  // This is called to start up new scanner threads. It's not a big deal if we
+  // spin up more than strictly necessary since they will go through and terminate
+  // promptly. However, we want to minimize that by checking a conditions.
+  //  1. Don't start up if the ScanNode is done
+  //  2. Don't start up if all the ranges have been taken by another thread.
+  //  3. Don't start up if the number of ranges left is less than the number of
+  //     active scanner threads.
 
-  // Scanner thread completed. Take a look and update the status 
-  unique_lock<recursive_mutex> l(lock_);
-  {
-    unique_lock<mutex> l(disk_thread_resource_lock_);
-    active_scanners_.erase(context);
-  }
-  ScannerContext::Stream* stream = context->GetStream();
-  DCHECK(stream != NULL);
-  
-  // If there was already an error, the disk thread will do the cleanup.
-  if (!status_.ok()) return;
+  unique_lock<mutex> lock(lock_);
+  if (done_) return;
+  if (all_ranges_started_) return;
 
-  if (!status.ok()) {
-    if (status.IsCancelled()) {
-      // Scan node should be the only thing that initiated scanner threads to see
-      // cancelled (i.e. limit reached).  No need to do anything here.
-      DCHECK(done_);
-      return;
-    }
+  bool started_scanner = false;
+  while (active_scanner_thread_counter_.value() < progress_.remaining() &&
+      pool->TryAcquireThreadToken()) {
+    COUNTER_UPDATE(&active_scanner_thread_counter_, 1);
+    COUNTER_UPDATE(num_scanner_threads_started_counter_, 1);
+    scanner_threads_.add_thread(new thread(&HdfsScanNode::ScannerThread, this));
+    started_scanner = true;
+  }
+  if (!started_scanner) ++num_skipped_tokens_;
+}
+
+inline void HdfsScanNode::ScannerThreadHelper() {
+  while (!done_ && !runtime_state_->resource_pool()->optional_exceeded()) {
+    DiskIoMgr::ScanRange* scan_range;
+    Status status = runtime_state_->io_mgr()->GetNextRange(reader_context_, &scan_range);
     
-    // This thread hit an error, record it and bail
-    // TODO: better way to report errors?  Maybe via the thrift interface?
-    if (VLOG_QUERY_IS_ON && !runtime_state_->error_log().empty()) {
-      stringstream ss;
-      ss << "Scan node (id=" << id() << ") ran into a parse error for scan range "
-         << stream->filename() << "(" << stream->scan_range()->offset() << ":" 
-         << stream->scan_range()->len() 
-         << ").  Processed " << stream->total_bytes_returned() << " bytes." << endl
-         << runtime_state_->ErrorLog();
-      VLOG_QUERY << ss.str();
-    }
-  
-    status_ = status;
-    {
-      unique_lock<mutex> l(row_batches_lock_);
-      done_ = true;
-    }
-    // Notify the disk which will trigger tear down of all threads.
-    runtime_state_->io_mgr()->CancelReader(reader_context_);
-    // Notify the main thread which reports the error
-    row_batch_added_cv_.notify_one();
-  }
+    if (status.ok() && scan_range != NULL) {
+      // Got a scan range. Create a new scanner object and process the range
+      // end to end (in this thread).
+      ScanRangeMetadata* metadata = 
+          reinterpret_cast<ScanRangeMetadata*>(scan_range->meta_data());
+      int64_t partition_id = metadata->partition_id;
+      HdfsPartitionDescriptor* partition = hdfs_table_->GetPartition(partition_id);
+      DCHECK(partition != NULL);
 
-  if (progress_.done()) {
-    // All ranges are finished.  Indicate we are done.
-    {
-      unique_lock<mutex> l(row_batches_lock_);
-      done_ = true;
+      ScannerContext* context = runtime_state_->obj_pool()->Add(
+          new ScannerContext(runtime_state_, this, partition, scan_range));
+      HdfsScanner* scanner = CreateScanner(partition);
+      status = scanner->Prepare(context);
+
+      if (status.ok()) {
+        status = scanner->ProcessSplit();
+        if (!status.ok()) {
+          ScannerContext::Stream* stream = context->GetStream();
+          // This thread hit an error, record it and bail
+          // TODO: better way to report errors?  Maybe via the thrift interface?
+          if (VLOG_QUERY_IS_ON && !runtime_state_->error_log().empty()) {
+            stringstream ss;
+            ss << "Scan node (id=" << id() << ") ran into a parse error for scan range "
+              << stream->filename() << "(" << stream->scan_range()->offset() << ":" 
+              << stream->scan_range()->len() 
+              << ").  Processed " << stream->total_bytes_returned() << " bytes." << endl
+              << runtime_state_->ErrorLog();
+            VLOG_QUERY << ss.str();
+          }
+        }
+      }
+      scanner->Close();
     }
-    row_batch_added_cv_.notify_one();
-  } else {
-    // The scanner could have queued more ranges.  Send them to the io mgr.
-    IssueQueuedRanges();
+
+    if (!status.ok()) {
+      unique_lock<mutex> l(lock_);
+      // If there was already an error, the main thread will do the cleanup
+      if (!status_.ok()) break;
+    
+      if (status.IsCancelled()) {
+        // Scan node should be the only thing that initiated scanner threads to see
+        // cancelled (i.e. limit reached).  No need to do anything here.
+        DCHECK(done_);
+        break;
+      }
+    
+      status_ = status;
+      done_ = true;
+      // Notify the disk which will trigger tear down of all threads.
+      runtime_state_->io_mgr()->CancelReader(reader_context_);
+      // Notify the main thread which reports the error
+      row_batch_added_cv_.notify_one();
+    }
+
+    // Done with range and it completed successfully
+    if (progress_.done()) {
+      // All ranges are finished.  Indicate we are done.
+      {
+        unique_lock<mutex> l(row_batches_lock_);
+        done_ = true;
+      }
+      row_batch_added_cv_.notify_one();
+      return;
+    } 
+
+    if (scan_range == NULL && num_unqueued_files_ == 0) {
+      // All ranges have been queued and GetNextRange() returned NULL. This
+      // means that every range is either done or being processed by
+      // another thread.
+      all_ranges_started_ = true;
+      break;
+    }
   } 
+}
+
+void HdfsScanNode::ScannerThread() {
+  SCOPED_THREAD_COUNTER_MEASUREMENT(scanner_thread_counters());
+  ScannerThreadHelper();
+  COUNTER_UPDATE(&active_scanner_thread_counter_, -1);
+  runtime_state_->resource_pool()->ReleaseThreadToken(false);
 }
 
 void HdfsScanNode::RangeComplete(const THdfsFileFormat::type& file_type, 
@@ -885,13 +786,11 @@ void HdfsScanNode::ComputeSlotMaterializationOrder(vector<int>* order) const {
 }
 
 void HdfsScanNode::UpdateCounters() {
-  unique_lock<recursive_mutex> l(lock_);
+  unique_lock<mutex> l(lock_);
   if (counters_reported_) return;
   counters_reported_ = true;
 
   runtime_profile()->StopRateCounterUpdates(total_throughput_counter());
-  runtime_profile()->StopSamplingCounterUpdates(average_io_mgr_queue_capacity_);
-  runtime_profile()->StopSamplingCounterUpdates(average_io_mgr_queue_size_);
   runtime_profile()->StopSamplingCounterUpdates(average_scanner_thread_concurrency_);
   runtime_profile()->StopSamplingCounterUpdates(average_hdfs_read_thread_concurrency_);
   runtime_profile()->StopBucketingCountersUpdates(&hdfs_read_thread_concurrency_bucket_,
@@ -908,7 +807,9 @@ void HdfsScanNode::UpdateCounters() {
   // Convert disk access bitmap to num of disk accessed
   uint64_t num_disk_bitmap = disks_accessed_bitmap_.value();
   int64_t num_disk_accessed = BitUtil::Popcount(num_disk_bitmap);
-  num_disks_accessed_counter_->Set(num_disk_accessed);
+  if (num_disks_accessed_counter_ != NULL) {
+    num_disks_accessed_counter_->Set(num_disk_accessed);
+  }
 
   // output completed file types and counts to info string
   if (!file_type_counts_.empty()) {
@@ -930,6 +831,12 @@ void HdfsScanNode::UpdateCounters() {
   
   if (memory_used_counter_ != NULL) {
     COUNTER_UPDATE(memory_used_counter_, tuple_pool_->peak_allocated_bytes());
+  }
+
+  if (reader_context_ != NULL) {
+    bytes_read_local_->Set(runtime_state_->io_mgr()->bytes_read_local(reader_context_));
+    bytes_read_short_circuit_->Set(
+        runtime_state_->io_mgr()->bytes_read_short_circuit(reader_context_));
   }
 }
 

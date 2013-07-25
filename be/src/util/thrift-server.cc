@@ -15,6 +15,8 @@
 #include <boost/thread.hpp>
 #include <boost/thread/mutex.hpp>
 #include <boost/thread/condition_variable.hpp>
+#include <boost/uuid/uuid_io.hpp>
+
 #include <thrift/concurrency/PosixThreadFactory.h>
 #include <thrift/concurrency/Thread.h>
 #include <thrift/concurrency/ThreadManager.h>
@@ -29,11 +31,13 @@
 
 #include "util/thrift-server.h"
 #include "util/authorization.h"
+#include "util/network-util.h"
 
 #include <sstream>
 
 using namespace std;
 using namespace boost;
+using namespace boost::uuids;
 using namespace apache::thrift;
 using namespace apache::thrift::concurrency;
 using namespace apache::thrift::protocol;
@@ -41,8 +45,8 @@ using namespace apache::thrift::transport;
 using namespace apache::thrift::server;
 
 DEFINE_int32(rpc_cnxn_attempts, 10,
-    "Advanced: The number of times to retry connecting to an RPC server. If zero or less, "
-             "connections will be retried until successful");
+    "Advanced: The number of times to retry connecting to an RPC server. If zero or less,"
+    "connections will be retried until successful");
 DEFINE_int32(rpc_cnxn_retry_interval_ms, 2000,
     "Advanced: The interval, in ms, between retrying connections to an RPC server");
 DECLARE_string(principal);
@@ -68,7 +72,7 @@ class ThriftServer::ThriftServerEventProcessor : public TServerEventHandler {
   // SessionHandlerIf handler.
   virtual void* createContext(shared_ptr<TProtocol> input, shared_ptr<TProtocol> output);
 
-  // Called when a client starts an RPC; we set the thread-local session key.
+  // Called when a client starts an RPC; we set the thread-local session context.
   virtual void processContext(void* context, shared_ptr<TTransport> output);
 
   // Called when a client disconnects; we call any SessionHandlerIf handler.
@@ -176,21 +180,25 @@ void ThriftServer::ThriftServerEventProcessor::preServe() {
   signal_cond_.notify_all();
 }
 
-// This thread-local variable contains the current session key for whichever
-// thrift server is currently serving a request on the current thread.
-__thread ThriftServer::SessionKey* __session_key__;
+// This thread-local variable contains the current session context for whichever
+// thrift server is currently serving a request on the current thread. This includes
+// session state such as the session identifier and the username.
+__thread ThriftServer::SessionContext* __session_context__;
 
-ThriftServer::SessionKey* ThriftServer::GetThreadSessionKey() {
-  return __session_key__;
+
+const ThriftServer::SessionId& ThriftServer::GetThreadSessionId() {
+  return __session_context__->session_id;
+}
+
+const ThriftServer::SessionContext* ThriftServer::GetThreadSessionContext() {
+  return __session_context__;
 }
 
 void* ThriftServer::ThriftServerEventProcessor::createContext(shared_ptr<TProtocol> input,
     shared_ptr<TProtocol> output) {
-
-  stringstream ss;
-
   TSocket* socket = NULL;
   TTransport* transport = input->getTransport().get();
+  shared_ptr<SessionContext> session_ptr = shared_ptr<SessionContext>(new SessionContext);
   if (!thrift_server_->kerberos_enabled_) {
     switch (thrift_server_->server_type_) {
       case Nonblocking:
@@ -206,23 +214,26 @@ void* ThriftServer::ThriftServerEventProcessor::createContext(shared_ptr<TProtoc
         DCHECK(false) << "Unexpected thrift server type";
     }
   } else {
-    socket = static_cast<TSocket*>(
-        static_cast<TSaslServerTransport*>(transport)->getUnderlyingTransport().get());
+    TSaslServerTransport* sasl_transport = static_cast<TSaslServerTransport*>(transport);
+    // Get the username from the transport.
+    session_ptr->username = sasl_transport->getUsername();
+    socket = static_cast<TSocket*>(sasl_transport->getUnderlyingTransport().get());
   }
 
-  ss << socket->getPeerAddress() << ":" << socket->getPeerPort();
-
   {
-    lock_guard<mutex> l_(thrift_server_->session_keys_lock_);
+    session_ptr->network_address =
+        MakeNetworkAddress(socket->getPeerAddress(), socket->getPeerPort());
 
-    shared_ptr<SessionKey> key_ptr(new string(ss.str()));
+    lock_guard<mutex> l(thrift_server_->session_contexts_lock_);
+    session_ptr->session_id = to_string(thrift_server_->uuid_generator_());
 
-    __session_key__ = key_ptr.get();
-    thrift_server_->session_keys_[key_ptr.get()] = key_ptr;
+    // Add the session to the session map.
+    __session_context__ = session_ptr.get();
+    thrift_server_->session_contexts_[session_ptr.get()] = session_ptr;
   }
 
   if (thrift_server_->session_handler_ != NULL) {
-    thrift_server_->session_handler_->SessionStart(*__session_key__);
+    thrift_server_->session_handler_->SessionStart(*__session_context__);
   }
 
   if (thrift_server_->metrics_enabled_) {
@@ -230,29 +241,29 @@ void* ThriftServer::ThriftServerEventProcessor::createContext(shared_ptr<TProtoc
     thrift_server_->total_connections_metric_->Increment(1L);
   }
 
-  // Store the __session_key__ in the per-client context to avoid recomputing
-  // it. If only this were accessible from RPC method calls, we wouldn't have to
+  // Store the __session_context__ in the per-client context. If only this were
+  // accessible from RPC method calls, we wouldn't have to
   // mess around with thread locals.
-  return (void*)__session_key__;
+  return (void*)__session_context__;
 }
 
 void ThriftServer::ThriftServerEventProcessor::processContext(void* context,
     shared_ptr<TTransport> transport) {
-  __session_key__ = reinterpret_cast<SessionKey*>(context);
+  __session_context__ = reinterpret_cast<SessionContext*>(context);
 }
 
 void ThriftServer::ThriftServerEventProcessor::deleteContext(void* serverContext,
     shared_ptr<TProtocol> input, shared_ptr<TProtocol> output) {
 
-  __session_key__ = (SessionKey*)serverContext;
+  __session_context__ = (SessionContext*) serverContext;
 
   if (thrift_server_->session_handler_ != NULL) {
-    thrift_server_->session_handler_->SessionEnd(*__session_key__);
+    thrift_server_->session_handler_->SessionEnd(*__session_context__);
   }
 
   {
-    lock_guard<mutex> l_(thrift_server_->session_keys_lock_);
-    thrift_server_->session_keys_.erase(__session_key__);
+    lock_guard<mutex> l(thrift_server_->session_contexts_lock_);
+    thrift_server_->session_contexts_.erase(__session_context__);
   }
 
   if (thrift_server_->metrics_enabled_) {
@@ -316,7 +327,6 @@ Status ThriftServer::Start() {
     }
     RETURN_IF_ERROR(GetKerberosTransportFactory(FLAGS_principal,
         FLAGS_keytab_file, &transport_factory));
-
     kerberos_enabled_ = true;
   }
 
@@ -363,7 +373,6 @@ Status ThriftServer::Start() {
   RETURN_IF_ERROR(event_processor->StartAndWaitForServer());
 
   LOG(INFO) << "ThriftServer '" << name_ << "' started on port: " << port_;
-
   DCHECK(started_);
   return Status::OK;
 }

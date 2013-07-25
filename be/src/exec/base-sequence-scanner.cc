@@ -29,11 +29,12 @@ const int BaseSequenceScanner::SYNC_MARKER = -1;
 // Macro to convert between SerdeUtil errors to Status returns.
 #define RETURN_IF_FALSE(x) if (UNLIKELY(!(x))) return parse_status_
 
-void BaseSequenceScanner::IssueInitialRanges(HdfsScanNode* scan_node, 
+Status BaseSequenceScanner::IssueInitialRanges(HdfsScanNode* scan_node, 
     const vector<HdfsFileDesc*>& files) {
   // Issue just the header range for each file.  When the header is complete,
   // we'll issue the splits for that file.  Splits cannot be processed until the
   // header is parsed (the header object is then shared across splits for that file).
+  vector<DiskIoMgr::ScanRange*> header_ranges;
   for (int i = 0; i < files.size(); ++i) {
     ScanRangeMetadata* metadata =
         reinterpret_cast<ScanRangeMetadata*>(files[i]->splits[0]->meta_data());
@@ -41,8 +42,10 @@ void BaseSequenceScanner::IssueInitialRanges(HdfsScanNode* scan_node,
     // 1 queue for each NIC as well?
     DiskIoMgr::ScanRange* header_range = scan_node->AllocateScanRange(
         files[i]->filename.c_str(), HEADER_SIZE, 0, metadata->partition_id, -1);
-    scan_node->AddDiskIoRange(header_range);
+    header_ranges.push_back(header_range);
   }
+  RETURN_IF_ERROR(scan_node->AddDiskIoRanges(header_ranges));
+  return Status::OK;
 }
   
 BaseSequenceScanner::BaseSequenceScanner(HdfsScanNode* node, RuntimeState* state,
@@ -57,8 +60,8 @@ BaseSequenceScanner::BaseSequenceScanner(HdfsScanNode* node, RuntimeState* state
 BaseSequenceScanner::~BaseSequenceScanner() {
 }
 
-Status BaseSequenceScanner::Prepare() {
-  RETURN_IF_ERROR(HdfsScanner::Prepare());
+Status BaseSequenceScanner::Prepare(ScannerContext* context) {
+  RETURN_IF_ERROR(HdfsScanner::Prepare(context));
   decompress_timer_ = ADD_TIMER(scan_node_->runtime_profile(), "DecompressionTime");
   bytes_skipped_counter_ = ADD_COUNTER(
       scan_node_->runtime_profile(), "BytesSkipped", TCounterType::BYTES);
@@ -66,7 +69,8 @@ Status BaseSequenceScanner::Prepare() {
 }
 
 Status BaseSequenceScanner::Close() {
-  context_->AcquirePool(data_buffer_pool_.get());
+  AttachPool(data_buffer_pool_.get());
+  AddFinalRowBatch();
   context_->Close();
   if (!only_parsing_header_) {
     scan_node_->RangeComplete(file_format(), header_->compression_type);
@@ -79,9 +83,7 @@ Status BaseSequenceScanner::Close() {
   return Status::OK;
 }
 
-Status BaseSequenceScanner::ProcessSplit(ScannerContext* context) {
-  SetContext(context);
-
+Status BaseSequenceScanner::ProcessSplit() {
   header_ = reinterpret_cast<FileHeader*>(
       scan_node_->GetFileMetadata(stream_->filename()));
   if (header_ == NULL) {
@@ -98,7 +100,8 @@ Status BaseSequenceScanner::ProcessSplit(ScannerContext* context) {
 
     // Header is parsed, set the metadata in the scan node and issue more ranges
     scan_node_->SetFileMetadata(stream_->filename(), header_);
-    IssueFileRanges(stream_->filename());
+    HdfsFileDesc* desc = scan_node_->GetFileDesc(stream_->filename());
+    scan_node_->AddDiskIoRanges(desc);
     return Status::OK;
   }
   

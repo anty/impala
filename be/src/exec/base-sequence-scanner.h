@@ -36,11 +36,11 @@ class ScannerContext;
 class BaseSequenceScanner : public HdfsScanner {
  public:
   // Issue the initial ranges for all sequence container files.
-  static void IssueInitialRanges(HdfsScanNode*, const std::vector<HdfsFileDesc*>&);
+  static Status IssueInitialRanges(HdfsScanNode*, const std::vector<HdfsFileDesc*>&);
 
-  virtual Status Prepare();
+  virtual Status Prepare(ScannerContext* context);
   virtual Status Close();
-  virtual Status ProcessSplit(ScannerContext* context);
+  virtual Status ProcessSplit();
 
   virtual ~BaseSequenceScanner();
 
@@ -51,6 +51,8 @@ class BaseSequenceScanner : public HdfsScanner {
   // Data that is shared between scan ranges of the same file.  The subclass is 
   // responsible for filling in all these fields in ReadFileHeader
   struct FileHeader {
+    virtual ~FileHeader() {}
+
     // The sync hash for this file.
     uint8_t sync[SYNC_HASH_SIZE];
 

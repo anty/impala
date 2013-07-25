@@ -14,50 +14,38 @@
 
 package com.cloudera.impala.analysis;
 
-import java.util.List;
-
-import com.cloudera.impala.catalog.HdfsTable;
-import com.cloudera.impala.catalog.Table;
+import com.cloudera.impala.authorization.Privilege;
+import com.cloudera.impala.catalog.AuthorizationException;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.thrift.TAlterTableParams;
 import com.cloudera.impala.thrift.TAlterTableSetLocationParams;
 import com.cloudera.impala.thrift.TAlterTableType;
-import com.cloudera.impala.thrift.TPartitionKeyValue;
-import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.ImmutableList;
 
 /**
  * Represents an ALTER TABLE [PARTITION partitionSpec] SET LOCATION statement.
  */
 public class AlterTableSetLocationStmt extends AlterTableStmt {
-  private final String location;
-  private final List<PartitionKeyValue> partitionSpec;
-
-  // The value Hive is configured to use for NULL partition key values.
-  // Set during analysis.
-  private String nullPartitionKeyValue;
+  private final HdfsURI location;
+  private final PartitionSpec partitionSpec;
 
   public AlterTableSetLocationStmt(TableName tableName,
-      List<PartitionKeyValue> partitionSpec, String location) {
+      PartitionSpec partitionSpec, HdfsURI location) {
     super(tableName);
     Preconditions.checkNotNull(location);
-    Preconditions.checkNotNull(partitionSpec);
     this.location = location;
-    this.partitionSpec = ImmutableList.copyOf(partitionSpec);
+    this.partitionSpec = partitionSpec;
+    if (partitionSpec != null) {
+      partitionSpec.setTableName(tableName);
+    }
   }
 
-  public String getLocation() {
+  public HdfsURI getLocation() {
     return location;
   }
 
-  public List<PartitionKeyValue> getPartitionSpec() {
+  public PartitionSpec getPartitionSpec() {
     return partitionSpec;
-  }
-
-  private String getNullPartitionKeyValue() {
-    Preconditions.checkNotNull(nullPartitionKeyValue);
-    return nullPartitionKeyValue;
   }
 
   @Override
@@ -65,43 +53,26 @@ public class AlterTableSetLocationStmt extends AlterTableStmt {
     TAlterTableParams params = super.toThrift();
     params.setAlter_type(TAlterTableType.SET_LOCATION);
     TAlterTableSetLocationParams locationParams =
-        new TAlterTableSetLocationParams(location);
-    for (PartitionKeyValue kv: partitionSpec) {
-      String value = kv.getPartitionKeyValueString(getNullPartitionKeyValue());
-      locationParams.addToPartition_spec(new TPartitionKeyValue(kv.getColName(), value));
+        new TAlterTableSetLocationParams(location.toString());
+    if (partitionSpec != null) {
+      locationParams.setPartition_spec(partitionSpec.toThrift());
     }
     params.setSet_location_params(locationParams);
     return params;
   }
 
   @Override
-  public void analyze(Analyzer analyzer) throws AnalysisException {
+  public void analyze(Analyzer analyzer) throws AnalysisException,
+      AuthorizationException {
     super.analyze(analyzer);
-    // Alterting the table, rather than the partition.
-    if (partitionSpec.size() == 0) {
+    if (location != null) location.analyze(analyzer, Privilege.ALL);
+
+    // Altering the table rather than the partition.
+    if (partitionSpec == null) {
       return;
     }
-
-    Table table = getTargetTable();
-    String tableName = getDb() + "." + getTbl();
-
-    // Make sure the target table is partitioned.
-    if (table.getMetaStoreTable().getPartitionKeysSize() == 0) {
-      throw new AnalysisException("Table is not partitioned: " + tableName);
-    }
-
-    // Make sure static partition key values only contain constant exprs.
-    for (PartitionKeyValue kv: partitionSpec) {
-      kv.analyze(analyzer);
-    }
-
-    // If the table is partitioned it should be an HdfsTable
-    Preconditions.checkState(table instanceof HdfsTable);
-    HdfsTable hdfsTable = (HdfsTable) table;
-    if (hdfsTable.getPartition(partitionSpec) == null) {
-      throw new AnalysisException("No matching partition spec found: (" +
-          Joiner.on(", ").join(partitionSpec) + ")");
-    }
-    nullPartitionKeyValue = hdfsTable.getNullPartitionKeyValue();
+    partitionSpec.setPartitionShouldExist();
+    partitionSpec.setPrivilegeRequirement(Privilege.ALTER);
+    partitionSpec.analyze(analyzer);
   }
 }

@@ -14,7 +14,9 @@
 
 package com.cloudera.impala.analysis;
 
+import java.util.List;
 import java.util.ArrayList;
+
 import com.google.common.collect.Lists;
 
 /**
@@ -26,8 +28,12 @@ class SelectList {
   private boolean isDistinct;
 
   public SelectList() {
-    super();
     this.isDistinct = false;
+  }
+
+  public SelectList(List<SelectListItem> items) {
+    isDistinct = false;
+    this.items.addAll(items);
   }
 
   public ArrayList<SelectListItem> getItems() {
@@ -40,5 +46,15 @@ class SelectList {
 
   public void setIsDistinct(boolean value) {
     isDistinct = value;
+  }
+
+  @Override
+  public SelectList clone() {
+    SelectList clone = new SelectList();
+    for (SelectListItem item: items) {
+      clone.items.add(item.clone());
+    }
+    clone.setIsDistinct(isDistinct);
+    return clone;
   }
 }

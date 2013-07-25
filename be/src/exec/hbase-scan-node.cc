@@ -21,6 +21,7 @@
 #include "runtime/row-batch.h"
 #include "runtime/string-value.h"
 #include "runtime/tuple-row.h"
+#include "runtime/tuple.h"
 #include "util/jni-util.h"
 #include "util/runtime-profile.h"
 #include "gen-cpp/PlanNodes_types.h"
@@ -41,7 +42,12 @@ HBaseScanNode::HBaseScanNode(ObjectPool* pool, const TPlanNode& tnode,
       num_errors_(0),
       hbase_scanner_(NULL),
       row_key_slot_(NULL),
-      text_converter_(new TextConverter('\\', "", false)) {
+      row_key_binary_encoded_(false),
+      text_converter_(new TextConverter('\\', "", false)),
+      suggested_max_caching_(0) {
+  if (tnode.hbase_scan_node.__isset.suggested_max_caching) {
+    suggested_max_caching_ = tnode.hbase_scan_node.suggested_max_caching;
+  }
 }
 
 HBaseScanNode::~HBaseScanNode() {
@@ -53,6 +59,7 @@ bool HBaseScanNode::CmpColPos(const SlotDescriptor* a, const SlotDescriptor* b) 
 
 Status HBaseScanNode::Prepare(RuntimeState* state) {
   RETURN_IF_ERROR(ScanNode::Prepare(state));
+  read_timer_ = ADD_TIMER(runtime_profile(), TOTAL_HBASE_READ_TIMER);
 
   tuple_pool_.reset(new MemPool(state->mem_limits())),
   hbase_scanner_.reset(new HBaseTableScanner(this, state->htable_factory(), state));
@@ -83,6 +90,7 @@ Status HBaseScanNode::Prepare(RuntimeState* state) {
   // Create list of family/qualifier pointers in same sort order as sorted_non_key_slots_.
   const HBaseTableDescriptor* hbase_table =
       static_cast<const HBaseTableDescriptor*>(tuple_desc_->table_desc());
+  row_key_binary_encoded_ = hbase_table->cols()[ROW_KEY].binary_encoded;
   sorted_cols_.reserve(sorted_non_key_slots_.size());
   for (int i = 0; i < sorted_non_key_slots_.size(); ++i) {
     sorted_cols_.push_back(&hbase_table->cols()[sorted_non_key_slots_[i]->col_pos()]);
@@ -97,7 +105,7 @@ Status HBaseScanNode::Prepare(RuntimeState* state) {
 }
 
 Status HBaseScanNode::Open(RuntimeState* state) {
-  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::OPEN));
+  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::OPEN, state));
   RETURN_IF_CANCELLED(state);
   SCOPED_TIMER(runtime_profile_->total_time_counter());
   JNIEnv* env = getJNIEnv();
@@ -108,7 +116,6 @@ void HBaseScanNode::WriteTextSlot(
     const string& family, const string& qualifier,
     void* value, int value_length, SlotDescriptor* slot,
     RuntimeState* state, bool* error_in_row) {
-  SCOPED_TIMER(materialize_tuple_timer());
   if (!text_converter_->WriteSlot(slot, tuple_,
       reinterpret_cast<char*>(value), value_length, true, false, tuple_pool_.get())) {
     *error_in_row = true;
@@ -124,13 +131,13 @@ void HBaseScanNode::WriteTextSlot(
 }
 
 Status HBaseScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
-  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT));
+  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   RETURN_IF_CANCELLED(state);
   // For GetNext, most of the time is spent in HBaseTableScanner::ResultScanner_next,
   // but there's still some considerable time inside here.
   // TODO: need to understand how the time is spent inside this function.
   SCOPED_TIMER(runtime_profile_->total_time_counter());
-  SCOPED_TIMER(materialize_tuple_timer());
+  SCOPED_THREAD_COUNTER_MEASUREMENT(scanner_thread_counters());
   if (ReachedLimit()) {
     *eos = true;
     return Status::OK;
@@ -174,30 +181,39 @@ Status HBaseScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eo
     TupleRow* row = row_batch->GetRow(row_idx);
     row->SetTuple(tuple_idx_, tuple_);
 
-    // Write row key slot.
-    if (row_key_slot_ != NULL) {
-      void* key;
-      int key_length;
-      RETURN_IF_ERROR(hbase_scanner_->GetRowKey(env, &key, &key_length));
-      if (key == NULL) {
-        tuple_->SetNull(row_key_slot_->null_indicator_offset());
-      } else {
-        WriteTextSlot("key", "",
-            key, key_length, row_key_slot_, state, &error_in_row);
-      }
-    }
+    {
+      // Measure row key and column value materialization time
+      SCOPED_TIMER(materialize_tuple_timer());
 
-    // Write non-key slots.
-    for (int i = 0; i < sorted_non_key_slots_.size(); ++i) {
-      void* value;
-      int value_length;
-      RETURN_IF_ERROR(hbase_scanner_->GetValue(env, sorted_cols_[i]->first,
-          sorted_cols_[i]->second, &value, &value_length));
-      if (value == NULL) {
-        tuple_->SetNull(sorted_non_key_slots_[i]->null_indicator_offset());
-      } else {
-        WriteTextSlot(sorted_cols_[i]->first, sorted_cols_[i]->second,
-            value, value_length, sorted_non_key_slots_[i], state, &error_in_row);
+      // Write row key slot.
+      if (row_key_slot_ != NULL) {
+        if (row_key_binary_encoded_) {
+          RETURN_IF_ERROR(hbase_scanner_->GetRowKey(env, row_key_slot_, tuple_));
+        } else {
+          void* key;
+          int key_length;
+          RETURN_IF_ERROR(hbase_scanner_->GetRowKey(env, &key, &key_length));
+          WriteTextSlot("key", "", key, key_length, row_key_slot_, state, &error_in_row);
+        }
+      }
+
+      // Write non-key slots.
+      for (int i = 0; i < sorted_non_key_slots_.size(); ++i) {
+        if (sorted_cols_[i]->binary_encoded) {
+          RETURN_IF_ERROR(hbase_scanner_->GetValue(env, sorted_cols_[i]->family,
+              sorted_cols_[i]->qualifier, sorted_non_key_slots_[i], tuple_));
+        } else {
+          void* value;
+          int value_length;
+          RETURN_IF_ERROR(hbase_scanner_->GetValue(env, sorted_cols_[i]->family,
+              sorted_cols_[i]->qualifier, &value, &value_length));
+          if (value == NULL) {
+            tuple_->SetNull(sorted_non_key_slots_[i]->null_indicator_offset());
+          } else {
+            WriteTextSlot(sorted_cols_[i]->family, sorted_cols_[i]->qualifier,
+                value, value_length, sorted_non_key_slots_[i], state, &error_in_row);
+          }
+        }
       }
     }
 
@@ -234,14 +250,17 @@ Status HBaseScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eo
     }
     COUNTER_UPDATE(rows_read_counter_, 1);
   }
+
+  return Status::OK;
 }
 
 Status HBaseScanNode::Close(RuntimeState* state) {
-  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::CLOSE));
+  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::CLOSE, state));
   SCOPED_TIMER(runtime_profile_->total_time_counter());
   if (memory_used_counter() != NULL) {
     COUNTER_UPDATE(memory_used_counter(), tuple_pool_->peak_allocated_bytes());
   }
+  runtime_profile()->StopRateCounterUpdates(total_throughput_counter());
 
   if (hbase_scanner_.get() != NULL) {
     JNIEnv* env = getJNIEnv();

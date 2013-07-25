@@ -18,10 +18,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.ListIterator;
 
+import com.cloudera.impala.catalog.AuthorizationException;
 import com.cloudera.impala.catalog.PrimitiveType;
 import com.cloudera.impala.common.AnalysisException;
-import com.cloudera.impala.common.InternalException;
 import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
 
 /**
  * Representation of a union with its list of operands,
@@ -55,8 +56,9 @@ public class UnionStmt extends QueryStmt {
       this.qualifier = qualifier;
     }
 
-    public void analyze(Analyzer parent) throws AnalysisException, InternalException {
-      analyzer = new Analyzer(parent);
+    public void analyze(Analyzer parent) throws AnalysisException,
+        AuthorizationException {
+      analyzer = new Analyzer(parent, parent.getUser());
       queryStmt.analyze(analyzer);
     }
 
@@ -75,6 +77,11 @@ public class UnionStmt extends QueryStmt {
 
     public Analyzer getAnalyzer() {
       return analyzer;
+    }
+
+    @Override
+    public UnionOperand clone() {
+      return new UnionOperand(queryStmt.clone(), qualifier);
     }
   }
 
@@ -98,8 +105,10 @@ public class UnionStmt extends QueryStmt {
    * union operands are union compatible, adding implicit casts if necessary.
    */
   @Override
-  public void analyze(Analyzer analyzer)
-      throws AnalysisException, InternalException {
+  public void analyze(Analyzer analyzer) throws AnalysisException,
+      AuthorizationException {
+    super.analyze(analyzer);
+
     Preconditions.checkState(operands.size() > 0);
 
     // Propagates DISTINCT from left to right,
@@ -236,7 +245,7 @@ public class UnionStmt extends QueryStmt {
             + expr.toSql());
       }
       // Create copy to protect against accidentally shared state.
-      i.set(resultExprs.get((int)pos - 1).clone());
+      i.set(resultExprs.get((int) pos - 1).clone(null));
     }
   }
 
@@ -253,6 +262,12 @@ public class UnionStmt extends QueryStmt {
   public String toSql() {
     StringBuilder strBuilder = new StringBuilder();
     Preconditions.checkState(operands.size() > 0);
+
+    if (withClause != null) {
+      strBuilder.append(withClause.toSql());
+      strBuilder.append(" ");
+    }
+
     strBuilder.append(operands.get(0).getQueryStmt().toSql());
     for (int i = 1; i < operands.size() - i; ++i) {
       strBuilder.append(" UNION " +
@@ -300,5 +315,16 @@ public class UnionStmt extends QueryStmt {
   public ArrayList<String> getColLabels() {
     Preconditions.checkState(operands.size() > 0);
     return operands.get(0).getQueryStmt().getColLabels();
+  }
+
+  @Override
+  public QueryStmt clone() {
+    List<UnionOperand> operandClones = Lists.newArrayList();
+    for (UnionOperand operand: operands) {
+      operandClones.add(operand.clone());
+    }
+    UnionStmt unionClone = new UnionStmt(operandClones, cloneOrderByElements(), limit);
+    unionClone.setWithClause(cloneWithClause());
+    return unionClone;
   }
 }

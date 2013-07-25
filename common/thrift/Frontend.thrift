@@ -26,14 +26,34 @@ include "cli_service.thrift"
 // These are supporting structs for JniFrontend.java, which serves as the glue
 // between our C++ execution environment and the Java frontend.
 
-// Arguments to getTableNames, which returns a list of tables that match an 
+// Per-client session state
+struct TSessionState {
+  // The default database for the session
+  1: required string database
+
+  // The user to whom this session belongs
+  2: required string user
+
+  // A unique identifier for this session
+  3: required string session_id
+
+  // Client network address
+  4: required Types.TNetworkAddress network_address
+}
+
+// Arguments to getTableNames, which returns a list of tables that match an
 // optional pattern.
 struct TGetTablesParams {
   // If not set, match tables in all DBs
-  1: optional string db 
+  1: optional string db
 
   // If not set, match every table
-  2: optional string pattern 
+  2: optional string pattern
+
+  // Session state for the user who initiated this request. If authorization is
+  // enabled, only the tables this user has access to will be returned. If not
+  // set, access checks will be skipped (used for internal Impala requests)
+  3: optional TSessionState session
 }
 
 // getTableNames returns a list of unqualified table names
@@ -46,6 +66,11 @@ struct TGetTablesResult {
 struct TGetDbsParams {
   // If not set, match every database
   1: optional string pattern
+
+  // Session state for the user who initiated this request. If authorization is
+  // enabled, only the databases this user has access to will be returned. If not
+  // set, access checks will be skipped (used for internal Impala requests)
+  2: optional TSessionState session
 }
 
 // getDbNames returns a list of database names
@@ -66,16 +91,33 @@ struct TColumnDef {
   2: optional string comment
 }
 
-// Arguments to DescribeTable, which returns a list of column descriptors for a 
-// given table
+// Used by DESCRIBE <table> statements to control what information is returned and how to
+// format the output.
+enum TDescribeTableOutputStyle {
+  // The default output style if no options are specified for DESCRIBE <table>.
+  MINIMAL,
+  // Output additional information on the table in formatted style.
+  // Set for DESCRIBE FORMATTED statements.
+  FORMATTED
+}
+
+// Arguments to DescribeTable, which returns a list of column descriptors and additional
+// metadata for a given table. What information is returned is controlled by the
+// given TDescribeTableOutputStyle.
+// NOTE: This struct should only be used for intra-process communication.
 struct TDescribeTableParams {
-  1: optional string db
+  1: required string db
   2: required string table_name
+
+  // Controls the output style for this describe command.
+  3: required TDescribeTableOutputStyle output_style
 }
 
 // Results of a call to describeTable()
+// NOTE: This struct should only be used for intra-process communication.
 struct TDescribeTableResult {
-  1: required list<TColumnDef> columns
+  // Output from a DESCRIBE TABLE command.
+  1: required list<Data.TResultRow> results
 }
 
 // Parameters of CREATE DATABASE commands
@@ -132,6 +174,7 @@ enum TAlterTableType {
   DROP_COLUMN,
   DROP_PARTITION,
   RENAME_TABLE,
+  RENAME_VIEW,
   SET_FILE_FORMAT,
   SET_LOCATION,
 }
@@ -146,13 +189,13 @@ struct TPartitionKeyValue {
 }
 
 // Parameters for ALTER TABLE rename commands
-struct TAlterTableRenameParams {
+struct TAlterTableOrViewRenameParams {
   // The new table name
   1: required TTableName new_table_name
 }
 
 // Parameters for ALTER TABLE ADD|REPLACE COLUMNS commands.
-struct TAlterTableAddReplaceColsParams { 
+struct TAlterTableAddReplaceColsParams {
   // List of columns to add to the table
   1: required list<TColumnDef> columns
 
@@ -161,7 +204,7 @@ struct TAlterTableAddReplaceColsParams {
 }
 
 // Parameters for ALTER TABLE ADD PARTITION commands
-struct TAlterTableAddPartitionParams { 
+struct TAlterTableAddPartitionParams {
   // The partition spec (list of keys and values) to add.
   1: required list<TPartitionKeyValue> partition_spec
 
@@ -174,13 +217,13 @@ struct TAlterTableAddPartitionParams {
 }
 
 // Parameters for ALTER TABLE DROP COLUMN commands.
-struct TAlterTableDropColParams { 
+struct TAlterTableDropColParams {
   // Column name to drop.
   1: required string col_name
 }
 
 // Parameters for ALTER TABLE DROP PARTITION commands
-struct TAlterTableDropPartitionParams { 
+struct TAlterTableDropPartitionParams {
   // The partition spec (list of keys and values) to add.
   1: required list<TPartitionKeyValue> partition_spec
 
@@ -189,7 +232,7 @@ struct TAlterTableDropPartitionParams {
 }
 
 // Parameters for ALTER TABLE CHANGE COLUMN commands
-struct TAlterTableChangeColParams { 
+struct TAlterTableChangeColParams {
   // Target column to change.
   1: required string col_name
 
@@ -198,7 +241,7 @@ struct TAlterTableChangeColParams {
 }
 
 // Parameters for ALTER TABLE SET [PARTITION partitionSpec] FILEFORMAT commands.
-struct TAlterTableSetFileFormatParams { 
+struct TAlterTableSetFileFormatParams {
   // New file format
   1: required TFileFormat file_format
 
@@ -207,7 +250,7 @@ struct TAlterTableSetFileFormatParams {
 }
 
 // Parameters for ALTER TABLE SET [PARTITION partitionSpec] location commands.
-struct TAlterTableSetLocationParams { 
+struct TAlterTableSetLocationParams {
   // New HDFS storage location of the table
   1: required string location
 
@@ -222,8 +265,8 @@ struct TAlterTableParams {
   // Fully qualified name of the target table being altered
   2: required TTableName table_name
 
-  // Parameters for ALTER TABLE RENAME
-  3: optional TAlterTableRenameParams rename_params
+  // Parameters for ALTER TABLE/VIEW RENAME
+  3: optional TAlterTableOrViewRenameParams rename_params
 
   // Parameters for ALTER TABLE ADD COLUMNS
   4: optional TAlterTableAddReplaceColsParams add_replace_cols_params
@@ -311,6 +354,30 @@ struct TCreateTableParams {
   10: optional string location
 }
 
+// Parameters of a CREATE VIEW or ALTER VIEW AS SELECT command
+struct TCreateOrAlterViewParams {
+  // Fully qualified name of the view to create
+  1: required TTableName view_name
+
+  // List of column definitions for the view
+  2: required list<TColumnDef> columns
+
+  // The owner of the view
+  3: required string owner
+
+  // Original SQL string of view definition
+  4: required string original_view_def
+
+  // Expanded SQL string of view definition used in view substitution
+  5: required string expanded_view_def
+
+  // Optional comment for the view
+  6: optional string comment
+
+  // Do not throw an error if a table or view of the same name already exists
+  7: optional bool if_not_exists
+}
+
 // Parameters of DROP DATABASE commands
 struct TDropDbParams {
   // Name of the database to drop
@@ -320,22 +387,24 @@ struct TDropDbParams {
   2: required bool if_exists
 }
 
-// Parameters of DROP TABLE commands
-struct TDropTableParams {
-  // Fully qualified name of the table to drop
+// Parameters of DROP TABLE/VIEW commands
+struct TDropTableOrViewParams {
+  // Fully qualified name of the table/view to drop
   1: required TTableName table_name
 
-  // If true, no error is raised if the target table does not exist
+  // If true, no error is raised if the target table/view does not exist
   2: required bool if_exists
 }
 
-// Per-client session state
-struct TSessionState {
-  // The default database, changed by USE <database> queries.
-  1: required string database
+// Parameters of REFRESH/INVALIDATE METADATA commands
+// NOTE: This struct should only be used for intra-process communication.
+struct TResetMetadataParams {
+  // If true, refresh. Otherwise, invalidate metadata
+  1: required bool is_refresh
 
-  // The user who this session belongs to.
-  2: required string user
+  // Fully qualified name of the table to refresh or invalidate; not set if invalidating
+  // the entire catalog
+  2: optional TTableName table_name
 }
 
 struct TClientRequest {
@@ -370,7 +439,7 @@ struct TUseDbParams {
   1: required string db
 }
 
-// Results of an EXPLAIN 
+// Results of an EXPLAIN
 struct TExplainResult {
   // each line in the explain plan occupies an entry in the list
   1: required list<Data.TResultRow> results
@@ -393,20 +462,46 @@ struct TCatalogUpdate {
   3: required set<string> created_partitions;
 }
 
-// Metadata required to finalize a query - that is, to clean up after the query is done. 
+// Metadata required to finalize a query - that is, to clean up after the query is done.
 // Only relevant for INSERT queries.
 struct TFinalizeParams {
   // True if the INSERT query was OVERWRITE, rather than INTO
   1: required bool is_overwrite;
- 
+
   // The base directory in hdfs of the table targeted by this INSERT
   2: required string hdfs_base_dir;
- 
+
   // The target table name
   3: required string table_name;
 
   // The target table database
   4: required string table_db;
+}
+
+// Request for a LOAD DATA statement. LOAD DATA is only supported for HDFS backed tables.
+struct TLoadDataReq {
+  // Fully qualified table name to load data into.
+  1: required TTableName table_name
+
+  // The source data file or directory to load into the table.
+  2: required string source_path
+
+  // If true, loaded files will overwrite all data in the target table/partition's
+  // directory. If false, new files will be added alongside existing files. If there are
+  // any file name conflicts, the new files will be uniquified by appending a UUID to the
+  // base file name preserving the extension if one exists.
+  3: required bool overwrite
+
+  // An optional partition spec. Set if this operation should apply to a specific
+  // partition rather than the base table.
+  4: optional list<TPartitionKeyValue> partition_spec
+}
+
+// Response of a LOAD DATA statement.
+struct TLoadDataResp {
+  // A result row that contains information on the result of the LOAD operation. This
+  // includes details like the number of files moved as part of the request.
+  1: required Data.TResultRow load_summary
 }
 
 // Result of call to ImpalaPlanService/JniFrontend.CreateQueryRequest()
@@ -451,11 +546,15 @@ enum TDdlType {
   USE,
   DESCRIBE,
   ALTER_TABLE,
+  ALTER_VIEW,
   CREATE_DATABASE,
   CREATE_TABLE,
   CREATE_TABLE_LIKE,
+  CREATE_VIEW,
   DROP_DATABASE,
   DROP_TABLE,
+  DROP_VIEW,
+  RESET_METADATA
 }
 
 struct TDdlExecRequest {
@@ -476,6 +575,9 @@ struct TDdlExecRequest {
   // Parameters for ALTER TABLE
   6: optional TAlterTableParams alter_table_params
 
+  // Parameters for ALTER VIEW
+  14: optional TCreateOrAlterViewParams alter_view_params
+
   // Parameters for CREATE DATABASE
   7: optional TCreateDbParams create_db_params
 
@@ -485,11 +587,17 @@ struct TDdlExecRequest {
   // Parameters for CREATE TABLE LIKE
   9: optional TCreateTableLikeParams create_table_like_params
 
+  // Parameters for CREATE VIEW
+  13: optional TCreateOrAlterViewParams create_view_params
+
   // Paramaters for DROP DATABAE
   10: optional TDropDbParams drop_db_params
 
-  // Parameters for DROP TABLE
-  11: optional TDropTableParams drop_table_params
+  // Parameters for DROP TABLE/VIEW
+  11: optional TDropTableOrViewParams drop_table_or_view_params
+
+  // Parameters for REFRESH/INVALIDATE METADATA
+  12: optional TResetMetadataParams reset_metadata_params
 }
 
 // HiveServer2 Metadata operations (JniFrontend.hiveServer2MetadataOperation)
@@ -508,7 +616,7 @@ enum TMetadataOpcode {
 struct TMetadataOpRequest {
   // opcode
   1: required TMetadataOpcode opcode
-  
+
   // input parameter
   2: optional cli_service.TGetInfoReq get_info_req
   3: optional cli_service.TGetTypeInfoReq get_type_info_req
@@ -518,13 +626,18 @@ struct TMetadataOpRequest {
   7: optional cli_service.TGetTableTypesReq get_table_types_req
   8: optional cli_service.TGetColumnsReq get_columns_req
   9: optional cli_service.TGetFunctionsReq get_functions_req
+
+  // Session state for the user who initiated this request. If authorization is
+  // enabled, only the server objects this user has access to will be returned.
+  // If not set, access checks will be skipped (used for internal Impala requests)
+  10: optional TSessionState session
 }
 
 // Output of JniFrontend.hiveServer2MetadataOperation
 struct TMetadataOpResponse {
   // Schema of the result
   1: required TResultSetMetadata result_set_metadata
-  
+
   // Result set
   2: required list<Data.TResultRow> results
 }
@@ -548,4 +661,7 @@ struct TExecRequest {
 
   // Result of EXPLAIN. Set iff stmt_type is EXPLAIN
   6: optional TExplainResult explain_result
+
+  // Request for LOAD DATA statements.
+  7: optional TLoadDataReq load_data_request
 }

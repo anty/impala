@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "util/webserver.h"
+
 #include <stdio.h>
 #include <signal.h>
 #include <string>
@@ -21,19 +23,20 @@
 #include <boost/bind.hpp>
 #include <boost/mem_fn.hpp>
 #include <boost/algorithm/string.hpp>
+#include <boost/filesystem.hpp>
 
 #include "common/logging.h"
 #include "util/cpu-info.h"
 #include "util/disk-info.h"
 #include "util/mem-info.h"
 #include "util/url-coding.h"
-#include "util/webserver.h"
 #include "util/logging.h"
 #include "util/debug-util.h"
 #include "util/thrift-util.h"
 
 using namespace std;
 using namespace boost;
+using namespace boost::filesystem;
 using namespace google;
 
 const char* GetDefaultDocumentRoot();
@@ -47,6 +50,15 @@ DEFINE_string(webserver_doc_root, GetDefaultDocumentRoot(),
     "root");
 DEFINE_bool(enable_webserver_doc_root, true,
     "If true, webserver may serve static files from the webserver_doc_root");
+
+DEFINE_string(webserver_certificate_file, "",
+    "The location of the debug webserver's SSL certificate file, in .pem format. If "
+    "empty, webserver SSL support is not enabled");
+DEFINE_string(webserver_authentication_domain, "",
+    "Domain used for debug webserver authentication");
+DEFINE_string(webserver_password_file, "",
+    "(Optional) Location of .htpasswd file containing user names and hashed passwords for"
+    " debug webserver authentication");
 
 // Mongoose requires a non-null return from the callback to signify successful processing
 static void* PROCESSING_COMPLETE = reinterpret_cast<void*>(1);
@@ -132,6 +144,13 @@ Status Webserver::Start() {
     string port_as_string = lexical_cast<string>(http_address_.port);
     listening_spec << ":" << port_as_string;
   }
+
+  bool enable_ssl = !FLAGS_webserver_certificate_file.empty();
+  if (enable_ssl) {
+    LOG(INFO) << "Webserver: Enabling HTTPS support";
+    // Mongoose makes sockets with 's' suffixes accept SSL traffic only
+    listening_spec << "s";
+  }
   string listening_str = listening_spec.str();
   vector<const char*> options;
 
@@ -141,6 +160,29 @@ Status Webserver::Start() {
     options.push_back(FLAGS_webserver_doc_root.c_str());
   } else {
     LOG(INFO)<< "Document root disabled";
+  }
+
+  if (enable_ssl) {
+    options.push_back("ssl_certificate");
+    options.push_back(FLAGS_webserver_certificate_file.c_str());
+  }
+
+  if (!FLAGS_webserver_authentication_domain.empty()) {
+    options.push_back("authentication_domain");
+    options.push_back(FLAGS_webserver_authentication_domain.c_str());
+  }
+
+  if (!FLAGS_webserver_password_file.empty()) {
+    // Mongoose doesn't log anything if it can't stat the password file (but will if it
+    // can't open it, which it tries to do during a request)
+    if (!exists(FLAGS_webserver_password_file)) {
+      stringstream ss;
+      ss << "Webserver: Password file does not exist: " << FLAGS_webserver_password_file;
+      return Status(ss.str());
+    }
+    LOG(INFO) << "Webserver: Password file is " << FLAGS_webserver_password_file;
+    options.push_back("global_passwords_file");
+    options.push_back(FLAGS_webserver_password_file.c_str());
   }
 
   options.push_back("listening_ports");
@@ -193,6 +235,13 @@ void* Webserver::MongooseCallbackStatic(enum mg_event event,
 
 void* Webserver::MongooseCallback(enum mg_event event, struct mg_connection* connection,
     const struct mg_request_info* request_info) {
+  if (event == MG_EVENT_LOG) {
+    const char* msg = mg_get_log_message(connection);
+    if (msg != NULL) {
+      LOG(INFO) << "Webserver: " << msg;
+    }
+    return PROCESSING_COMPLETE;
+  }
   if (event == MG_NEW_REQUEST) {
     if (!FLAGS_webserver_doc_root.empty() && FLAGS_enable_webserver_doc_root) {
       if (strncmp(DOC_FOLDER, request_info->uri, DOC_FOLDER_LEN) == 0) {

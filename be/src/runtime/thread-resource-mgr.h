@@ -135,6 +135,18 @@ class ThreadResourceMgr {
       return num_required_threads() + num_optional_threads();
     }
 
+    int num_reserved_optional_threads() { return num_reserved_optional_threads_; }
+
+    // Returns true if the number of optional threads has now exceeded the quota.
+    bool optional_exceeded() {
+      // Cache this so optional/required are computed based on the same value.
+      volatile int64_t num_threads = num_threads_;
+      int64_t optional_threads = num_threads >> 32;
+      int64_t required_threads = num_threads & 0xFFFFFFFF;
+      return optional_threads > num_reserved_optional_threads_ &&
+             optional_threads + required_threads > quota();
+    }
+
     // Returns the number of optional threads that can still be used.
     int num_available_threads() const {
       int value = std::max(quota() - static_cast<int>(num_threads()), 

@@ -26,11 +26,14 @@ add_library(Runtime STATIC
   data-stream-sender.cc
   descriptors.cc
   disk-io-mgr.cc
+  disk-io-mgr-reader-context.cc
+  disk-io-mgr-scan-range.cc
   disk-io-mgr-stress.cc
   exec-env.cc
   hbase-table.cc
   hbase-table-factory.cc
   hdfs-fs-cache.cc
+  mem-limit.cc
   mem-pool.cc
   parallel-executor.cc
   plan-fragment-executor.cc

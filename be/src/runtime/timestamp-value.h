@@ -21,6 +21,8 @@
 #include <boost/cstdint.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
 
+#include "util/hash-util.h"
+
 namespace impala {
 
 time_t to_time_t(boost::posix_time::ptime t);
@@ -177,6 +179,17 @@ class  TimestampValue {
     return TimestampValue(boost::posix_time::second_clock::local_time());
   }
 
+  // Returns the local time with microsecond accuracy
+  static TimestampValue local_time_micros() {
+    return TimestampValue(boost::posix_time::microsec_clock::local_time());
+  }
+  
+  inline uint32_t Hash() const {
+    uint32_t hash = HashUtil::Hash(
+        &time_of_day_, sizeof(boost::posix_time::time_duration), 0);
+    return HashUtil::Hash(&time_of_day_, sizeof(boost::gregorian::date), hash);
+  }
+
  private:
   friend class UnusedClass;
 
@@ -207,6 +220,11 @@ class  TimestampValue {
   boost::posix_time::time_duration time_of_day_;
   boost::gregorian::date date_;
 };
+
+// This function must be called 'hash_value' to be picked up by boost.
+inline std::size_t hash_value(const TimestampValue& v) {
+  return v.Hash();
+}
 
 std::ostream& operator<<(std::ostream& os, const TimestampValue& timestamp_value);
 }

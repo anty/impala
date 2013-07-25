@@ -139,13 +139,13 @@ void ImpalaServer::query(QueryHandle& query_handle, const Query& query) {
   }
 
   shared_ptr<QueryExecState> exec_state;
-  ThriftServer::SessionKey* session_key = ThriftServer::GetThreadSessionKey();
   shared_ptr<SessionState> session;
-  GetSessionState(*session_key, &session);
-  DCHECK(session != NULL);  // We made these keys...
+  GetSessionState(ThriftServer::GetThreadSessionId(), &session);
+  DCHECK(session != NULL);  // The session should exist.
   {
-    // The session is created when it connects.  We don't know the user until
-    // something is run.
+    // The session is created when the client connects. Depending on the underlying
+    // transport, the username may be known at that time. If the username hasn't been set
+    // yet, set it now.
     lock_guard<mutex> l(session->lock);
     if (session->user.empty()) session->user = query.hadoop_user;
     query_request.sessionState.user = session->user;
@@ -179,13 +179,13 @@ void ImpalaServer::executeAndWait(QueryHandle& query_handle, const Query& query,
   }
 
   shared_ptr<QueryExecState> exec_state;
-  ThriftServer::SessionKey* session_key = ThriftServer::GetThreadSessionKey();
   shared_ptr<SessionState> session;
-  GetSessionState(*session_key, &session);
-  DCHECK(session != NULL);  // We made these keys...
+  GetSessionState(ThriftServer::GetThreadSessionId(), &session);
+  DCHECK(session != NULL);  // The session should exist.
   {
-    // The session is created when it connects.  We don't know the user until
-    // something is run.
+    // The session is created when the client connects. Depending on the underlying
+    // transport, the username may be known at that time. If the username hasn't been set
+    // yet, set it now.
     lock_guard<mutex> l(session->lock);
     if (session->user.empty()) session->user = query.hadoop_user;
   }
@@ -226,7 +226,7 @@ void ImpalaServer::explain(QueryExplanation& query_explanation, const Query& que
     RaiseBeeswaxException(status.GetErrorMsg(), SQLSTATE_GENERAL_ERROR);
   }
 
-  status = GetExplainPlan(query_request, &query_explanation.textual);
+  status = frontend_->GetExplainPlan(query_request, &query_explanation.textual);
   if (!status.ok()) {
     // raise Syntax error or access violation; this is the closest.
     RaiseBeeswaxException(
@@ -409,30 +409,35 @@ void ImpalaServer::PingImpalaService(TPingImpalaServiceResp& return_val) {
 }
 
 void ImpalaServer::ResetCatalog(impala::TStatus& status) {
-  ResetCatalogInternal().ToThrift(&status);
+  Status::DEPRECATED_RPC.ToThrift(&status);
 }
 
 void ImpalaServer::ResetTable(impala::TStatus& status, const TResetTableReq& request) {
-  ResetTableInternal(request.db_name, request.table_name).ToThrift(&status);
+  Status::DEPRECATED_RPC.ToThrift(&status);
 }
 
-void ImpalaServer::SessionStart(const ThriftServer::SessionKey& session_key) {
-  // Currently Kerberos uses only one session id, so there can be dups.
-  // TODO: Re-enable this check once IMP-391 is resolved
-  // DCHECK(session_state_map_.find(session_key) == session_state_map_.end());
+void ImpalaServer::SessionStart(const ThriftServer::SessionContext& session_context) {
+  const ThriftServer::SessionId& session_id = session_context.session_id;
   shared_ptr<SessionState> state;
   state.reset(new SessionState);
   state->closed = false;
   state->start_time = TimestampValue::local_time();
   state->database = "default";
   state->session_type = BEESWAX;
+  state->network_address = session_context.network_address;
+  // If the username was set by a lower-level transport, use it.
+  if (!session_context.username.empty()) {
+    state->user = session_context.username;
+  }
 
   lock_guard<mutex> l(session_state_map_lock_);
-  session_state_map_.insert(make_pair(session_key, state));
+  bool success = session_state_map_.insert(make_pair(session_id, state)).second;
+  // The session should not have already existed.
+  DCHECK(success);
 }
 
-void ImpalaServer::SessionEnd(const ThriftServer::SessionKey& session_key) {
-  CloseSessionInternal(session_key);
+void ImpalaServer::SessionEnd(const ThriftServer::SessionContext& session_context) {
+  CloseSessionInternal(session_context.session_id);
 }
 
 Status ImpalaServer::QueryToTClientRequest(const Query& query,
@@ -442,8 +447,9 @@ Status ImpalaServer::QueryToTClientRequest(const Query& query,
   VLOG_QUERY << "query: " << ThriftDebugString(query);
   {
     shared_ptr<SessionState> session;
-    RETURN_IF_ERROR(GetSessionState(*ThriftServer::GetThreadSessionKey(), &session));
-    session->ToThrift(&request->sessionState);
+    const ThriftServer::SessionId& session_id = ThriftServer::GetThreadSessionId();
+    RETURN_IF_ERROR(GetSessionState(session_id, &session));
+    session->ToThrift(session_id, &request->sessionState);
   }
 
   // Override default query options with Query.Configuration
@@ -492,11 +498,11 @@ void ImpalaServer::RaiseBeeswaxException(const string& msg, const char* sql_stat
 
 Status ImpalaServer::FetchInternal(const TUniqueId& query_id,
     const bool start_over, const int32_t fetch_size, beeswax::Results* query_results) {
-  shared_ptr<QueryExecState> exec_state = GetQueryExecState(query_id, true);
+  shared_ptr<QueryExecState> exec_state = GetQueryExecState(query_id, false);
   if (exec_state == NULL) return Status("Invalid query handle");
 
-  // make sure we release the lock on exec_state if we see any error
-  lock_guard<mutex> l(*exec_state->lock(), adopt_lock_t());
+  lock_guard<mutex> frl(*exec_state->fetch_rows_lock());
+  lock_guard<mutex> l(*exec_state->lock());
 
   if (exec_state->num_rows_fetched() == 0) {
     exec_state->query_events()->MarkEvent("First row fetched");

@@ -19,7 +19,6 @@
 #include <boost/scoped_ptr.hpp>
 
 #include "common/logging.h"
-#include "util/uid-util.h"  // for some reasoon needed right here for hash<TUniqueId>
 #include "codegen/llvm-codegen.h"
 #include "common/status.h"
 #include "exec/exec-node.h"
@@ -58,8 +57,8 @@ Java_com_cloudera_impala_service_FeSupport_NativeEvalConstExpr(
   DeserializeThriftMsg(env, thrift_predicate_bytes, &thrift_predicate);
   TQueryGlobals query_globals;
   DeserializeThriftMsg(env, thrift_query_globals_bytes, &query_globals);
-  RuntimeState state(query_globals.now_string);
-  jbyteArray result_bytes;
+  RuntimeState state(query_globals.now_string, query_globals.user);
+  jbyteArray result_bytes = NULL;
   JniLocalFrame jni_frame;
   Expr* e;
   THROW_IF_ERROR_RET(jni_frame.push(env), env, JniUtil::internal_exc_class(),

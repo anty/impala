@@ -14,17 +14,16 @@
 
 package com.cloudera.impala.service;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.hive.metastore.api.AlreadyExistsException;
-import org.apache.hadoop.hive.metastore.api.InvalidObjectException;
-import org.apache.hadoop.hive.metastore.api.InvalidOperationException;
-import org.apache.hadoop.hive.metastore.api.MetaException;
-import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
 import org.apache.hive.service.cli.thrift.TGetColumnsReq;
 import org.apache.hive.service.cli.thrift.TGetFunctionsReq;
 import org.apache.hive.service.cli.thrift.TGetSchemasReq;
@@ -33,43 +32,52 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.cloudera.impala.analysis.AnalysisContext;
+import com.cloudera.impala.analysis.DropTableOrViewStmt;
 import com.cloudera.impala.analysis.InsertStmt;
 import com.cloudera.impala.analysis.QueryStmt;
+import com.cloudera.impala.analysis.ResetMetadataStmt;
 import com.cloudera.impala.analysis.TableName;
+import com.cloudera.impala.authorization.AuthorizationConfig;
+import com.cloudera.impala.authorization.ImpalaInternalAdminUser;
+import com.cloudera.impala.authorization.Privilege;
+import com.cloudera.impala.authorization.User;
+import com.cloudera.impala.catalog.AuthorizationException;
 import com.cloudera.impala.catalog.Catalog;
-import com.cloudera.impala.catalog.Catalog.DatabaseNotFoundException;
-import com.cloudera.impala.catalog.Column;
+import com.cloudera.impala.catalog.CatalogException;
+import com.cloudera.impala.catalog.DatabaseNotFoundException;
 import com.cloudera.impala.catalog.Db;
-import com.cloudera.impala.catalog.Db.TableLoadingException;
-import com.cloudera.impala.catalog.FileFormat;
 import com.cloudera.impala.catalog.HdfsTable;
-import com.cloudera.impala.catalog.RowFormat;
+import com.cloudera.impala.catalog.MetaStoreClientPool.MetaStoreClient;
 import com.cloudera.impala.catalog.Table;
+import com.cloudera.impala.catalog.TableNotFoundException;
 import com.cloudera.impala.common.AnalysisException;
+import com.cloudera.impala.common.FileSystemUtil;
 import com.cloudera.impala.common.ImpalaException;
 import com.cloudera.impala.common.InternalException;
-import com.cloudera.impala.common.MetaStoreClientPool.MetaStoreClient;
 import com.cloudera.impala.common.NotImplementedException;
 import com.cloudera.impala.planner.PlanFragment;
 import com.cloudera.impala.planner.Planner;
 import com.cloudera.impala.planner.ScanNode;
 import com.cloudera.impala.thrift.TCatalogUpdate;
 import com.cloudera.impala.thrift.TClientRequest;
-import com.cloudera.impala.thrift.TColumnDef;
 import com.cloudera.impala.thrift.TColumnDesc;
 import com.cloudera.impala.thrift.TColumnValue;
 import com.cloudera.impala.thrift.TDdlExecRequest;
 import com.cloudera.impala.thrift.TDdlType;
+import com.cloudera.impala.thrift.TDescribeTableOutputStyle;
+import com.cloudera.impala.thrift.TDescribeTableResult;
 import com.cloudera.impala.thrift.TExecRequest;
 import com.cloudera.impala.thrift.TExplainLevel;
 import com.cloudera.impala.thrift.TExplainResult;
 import com.cloudera.impala.thrift.TFinalizeParams;
+import com.cloudera.impala.thrift.TLoadDataReq;
+import com.cloudera.impala.thrift.TLoadDataResp;
 import com.cloudera.impala.thrift.TMetadataOpRequest;
 import com.cloudera.impala.thrift.TMetadataOpResponse;
-import com.cloudera.impala.thrift.TPartitionKeyValue;
 import com.cloudera.impala.thrift.TPlanFragment;
 import com.cloudera.impala.thrift.TPrimitiveType;
 import com.cloudera.impala.thrift.TQueryExecRequest;
+import com.cloudera.impala.thrift.TResetMetadataParams;
 import com.cloudera.impala.thrift.TResultRow;
 import com.cloudera.impala.thrift.TResultSetMetadata;
 import com.cloudera.impala.thrift.TStmtType;
@@ -85,44 +93,57 @@ import com.google.common.collect.Maps;
 public class Frontend {
   private final static Logger LOG = LoggerFactory.getLogger(Frontend.class);
   private final boolean lazyCatalog;
-  private Catalog catalog;
 
-  public Frontend() {
-    // Default to lazy loading
-    this(true);
+  private Catalog catalog;
+  private DdlExecutor ddlExecutor;
+  private final AuthorizationConfig authzConfig;
+
+  public Frontend(boolean lazy, AuthorizationConfig authorizationConfig) {
+    this.lazyCatalog = lazy;
+    this.authzConfig = authorizationConfig;
+    this.catalog = new Catalog(lazy, false, authzConfig);
+    ddlExecutor = new DdlExecutor(catalog);
   }
 
-  public Frontend(boolean lazy) {
-    this.lazyCatalog = lazy;
-    this.catalog = new Catalog(lazy, false);
+  public DdlExecutor getDdlExecutor() {
+    return ddlExecutor;
   }
 
   /**
    * Invalidates all catalog metadata, forcing a reload.
    */
-  public void resetCatalog() {
-    this.catalog.close();
-    this.catalog = new Catalog(lazyCatalog, true);
+  private void resetCatalog() {
+    catalog.close();
+    catalog = new Catalog(lazyCatalog, true, authzConfig);
+    ddlExecutor = new DdlExecutor(catalog);
+  }
+
+  public Catalog getCatalog() {
+    return catalog;
   }
 
   /**
-   * Invalidates a specific table's metadata, forcing the metadata to be reloaded on
-   * the next access.
-   * @throws DatabaseNotFoundException - If the specified database does not exist.
-   * @throws TableNotFoundException - If the specified table does not exist.
+   * If isRefresh is false, invalidates a specific table's metadata, forcing the
+   * metadata to be reloaded on the next access.
+   * If isRefresh is true, performs an immediate incremental refresh.
    */
-  public void resetTable(String dbName, String tableName)
-      throws Catalog.DatabaseNotFoundException, Catalog.TableNotFoundException {
-    Db db = catalog.getDb(dbName);
+  private void resetTable(String dbName, String tableName, boolean isRefresh)
+      throws CatalogException {
+    Db db = catalog.getDb(dbName, ImpalaInternalAdminUser.getInstance(), Privilege.ANY);
     if (db == null) {
-      throw new Catalog.DatabaseNotFoundException("Database not found: " + dbName);
+      throw new DatabaseNotFoundException("Database not found: " + dbName);
     }
     if (!db.containsTable(tableName)) {
-      throw new Catalog.TableNotFoundException(
+      throw new TableNotFoundException(
           "Table not found: " + dbName + "." + tableName);
     }
-    LOG.info("Invalidating table metadata: " + dbName + "." + tableName);
-    db.invalidateTable(tableName, true);
+    if (isRefresh) {
+      LOG.info("Refreshing table metadata: " + dbName + "." + tableName);
+      db.refreshTable(tableName);
+    } else {
+      LOG.info("Invalidating table metadata: " + dbName + "." + tableName);
+      db.invalidateTable(tableName);
+    }
   }
 
   public void close() {
@@ -162,6 +183,10 @@ public class Frontend {
       ddl.ddl_type = TDdlType.ALTER_TABLE;
       ddl.setAlter_table_params(analysis.getAlterTableStmt().toThrift());
       metadata.setColumnDescs(Collections.<TColumnDesc>emptyList());
+    } else if (analysis.isAlterViewStmt()) {
+      ddl.ddl_type = TDdlType.ALTER_VIEW;
+      ddl.setAlter_view_params(analysis.getAlterViewStmt().toThrift());
+      metadata.setColumnDescs(Collections.<TColumnDesc>emptyList());
     } else if (analysis.isCreateTableStmt()) {
       ddl.ddl_type = TDdlType.CREATE_TABLE;
       ddl.setCreate_table_params(analysis.getCreateTableStmt().toThrift());
@@ -169,6 +194,10 @@ public class Frontend {
     } else if (analysis.isCreateTableLikeStmt()) {
       ddl.ddl_type = TDdlType.CREATE_TABLE_LIKE;
       ddl.setCreate_table_like_params(analysis.getCreateTableLikeStmt().toThrift());
+      metadata.setColumnDescs(Collections.<TColumnDesc>emptyList());
+    } else if (analysis.isCreateViewStmt()) {
+      ddl.ddl_type = TDdlType.CREATE_VIEW;
+      ddl.setCreate_view_params(analysis.getCreateViewStmt().toThrift());
       metadata.setColumnDescs(Collections.<TColumnDesc>emptyList());
     } else if (analysis.isCreateDbStmt()) {
       ddl.ddl_type = TDdlType.CREATE_DATABASE;
@@ -178,9 +207,15 @@ public class Frontend {
       ddl.ddl_type = TDdlType.DROP_DATABASE;
       ddl.setDrop_db_params(analysis.getDropDbStmt().toThrift());
       metadata.setColumnDescs(Collections.<TColumnDesc>emptyList());
-    } else if (analysis.isDropTableStmt()) {
-      ddl.ddl_type = TDdlType.DROP_TABLE;
-      ddl.setDrop_table_params(analysis.getDropTableStmt().toThrift());
+    } else if (analysis.isDropTableOrViewStmt()) {
+      DropTableOrViewStmt stmt = analysis.getDropTableOrViewStmt();
+      ddl.ddl_type = (stmt.isDropTable()) ? TDdlType.DROP_TABLE : TDdlType.DROP_VIEW;
+      ddl.setDrop_table_or_view_params(stmt.toThrift());
+      metadata.setColumnDescs(Collections.<TColumnDesc>emptyList());
+    } else if (analysis.isResetMetadataStmt()) {
+      ddl.ddl_type = TDdlType.RESET_METADATA;
+      ResetMetadataStmt resetMetadataStmt = (ResetMetadataStmt) analysis.getStmt();
+      ddl.setReset_metadata_params(resetMetadataStmt.toThrift());
       metadata.setColumnDescs(Collections.<TColumnDesc>emptyList());
     }
 
@@ -189,132 +224,62 @@ public class Frontend {
   }
 
   /**
-   * Appends one or more columns to the given table, optionally replacing all existing
-   * columns.
+   * Loads a table or partition with one or more data files. If the "overwrite" flag
+   * in the request is true, all existing data in the table/partition will be replaced.
+   * If the "overwrite" flag is false, the files will be added alongside any existing
+   * data files.
    */
-  public void alterTableAddReplaceCols(TableName tableName, List<TColumnDef> columns,
-      boolean replaceExistingCols)
-      throws MetaException, org.apache.thrift.TException, InvalidObjectException,
-      ImpalaException, TableLoadingException {
-    catalog.alterTableAddReplaceCols(tableName, columns, replaceExistingCols);
-  }
+  public TLoadDataResp loadTableData(TLoadDataReq request) throws ImpalaException,
+      IOException {
+    TableName tableName = TableName.fromThrift(request.getTable_name());
 
-  /**
-   * Adds a new partition to an existing table.
-   */
-  public void alterTableAddPartition(TableName tableName,
-      List<TPartitionKeyValue> partitionSpec, String location, boolean ifNotExists)
-      throws MetaException, org.apache.thrift.TException, InvalidObjectException,
-      ImpalaException, TableLoadingException {
-    catalog.alterTableAddPartition(tableName, partitionSpec, location, ifNotExists);
-  }
+    // Get the destination for the load. If the load is targeting a partition,
+    // this the partition location. Otherwise this is the table location.
+    String destPathString = null;
+    if (request.isSetPartition_spec()) {
+      destPathString = catalog.getHdfsPartition(tableName.getDb(), tableName.getTbl(),
+          request.getPartition_spec()).getLocation();
+    } else {
+      destPathString = catalog.getTable(tableName.getDb(), tableName.getTbl(),
+          ImpalaInternalAdminUser.getInstance(), Privilege.INSERT)
+          .getMetaStoreTable().getSd().getLocation();
+    }
 
-  /**
-   * Drops a column from an existing table.
-   */
-  public void alterTableDropCol(TableName tableName, String colName)
-      throws MetaException, org.apache.thrift.TException, InvalidObjectException,
-      ImpalaException, TableLoadingException {
-    catalog.alterTableDropCol(tableName, colName);
-  }
+    Path destPath = new Path(destPathString);
+    DistributedFileSystem dfs = FileSystemUtil.getDistributedFileSystem(destPath);
 
-  /**
-   * Drops a partition from an existing table.
-   */
-  public void alterTableDropPartition(TableName tableName,
-      List<TPartitionKeyValue> partitionSpec, boolean ifExists)
-      throws MetaException, org.apache.thrift.TException, InvalidObjectException,
-      ImpalaException, TableLoadingException {
-    catalog.alterTableDropPartition(tableName, partitionSpec, ifExists);
-  }
+    // Create a temporary directory within the final destination directory to stage the
+    // file move.
+    Path tmpDestPath = FileSystemUtil.makeTmpSubdirectory(destPath);
 
-  /**
-   * Changes the column definition of an existing column.
-   */
-  public void alterTableChangeCol(TableName tableName, String colName,
-      TColumnDef newColDef) throws MetaException, org.apache.thrift.TException,
-      InvalidObjectException, ImpalaException, TableLoadingException {
-    catalog.alterTableChangeCol(tableName, colName, newColDef);
-  }
+    Path sourcePath = new Path(request.source_path);
+    int filesLoaded = 0;
+    if (dfs.isDirectory(sourcePath)) {
+      filesLoaded = FileSystemUtil.moveAllVisibleFiles(sourcePath, tmpDestPath);
+    } else {
+      FileSystemUtil.moveFile(sourcePath, tmpDestPath, true);
+      filesLoaded = 1;
+    }
 
-  /**
-   * Renames a table.
-   */
-  public void alterTableRename(TableName tableName, TableName newTableName)
-      throws MetaException, org.apache.thrift.TException, InvalidObjectException,
-      ImpalaException, TableLoadingException {
-    catalog.alterTableRename(tableName, newTableName);
-  }
+    // If this is an OVERWRITE, delete all files in the destination.
+    if (request.isOverwrite()) {
+      FileSystemUtil.deleteAllVisibleFiles(destPath);
+    }
 
-  /**
-   * Changes the file format for the given table.
-   */
-  public void alterTableSetFileFormat(TableName tableName,
-      List<TPartitionKeyValue> partitionSpec, FileFormat fileFormat) throws MetaException,
-      org.apache.thrift.TException, InvalidObjectException, ImpalaException,
-      TableLoadingException {
-    catalog.alterTableSetFileFormat(tableName, partitionSpec, fileFormat);
-  }
+    // Move the files from the temporary location to the final destination.
+    FileSystemUtil.moveAllVisibleFiles(tmpDestPath, destPath);
+    // Cleanup the tmp directory.
+    dfs.delete(tmpDestPath, true);
+    resetTable(tableName.getDb(), tableName.getTbl(), true);
 
-  /**
-   * Changes the HDFS storage location for the given table.
-   */
-  public void alterTableSetLocation(TableName tableName,
-      List<TPartitionKeyValue> partitionSpec, String location) throws MetaException,
-      org.apache.thrift.TException, InvalidObjectException, ImpalaException,
-      TableLoadingException {
-    catalog.alterTableSetLocation(tableName, partitionSpec, location);
-  }
-
-  /**
-   * Creates a new database in the metastore.
-   */
-  public void createDatabase(String dbName, String comment, String locationUri,
-      boolean ifNotExists) throws MetaException, org.apache.thrift.TException,
-      AlreadyExistsException, InvalidObjectException {
-    catalog.createDatabase(dbName, comment, locationUri, ifNotExists);
-  }
-
-  /**
-   * Creates a new table in the metastore.
-   */
-  public void createTable(TableName tableName, List<TColumnDef> columns,
-      List<TColumnDef> partitionColumns, String owner, boolean isExternal, String comment,
-      RowFormat rowFormat, FileFormat fileFormat, String location, boolean ifNotExists)
-      throws MetaException, NoSuchObjectException, org.apache.thrift.TException,
-      AlreadyExistsException, InvalidObjectException {
-    catalog.createTable(tableName, columns, partitionColumns, owner, isExternal, comment,
-        rowFormat, fileFormat, location, ifNotExists);
-  }
-
-  /**
-   * Creates a new table in the metastore.
-   */
-  public void createTableLike(TableName tableName, TableName oldTableName, String owner,
-      boolean isExternal, String comment, FileFormat fileFormat, String location,
-      boolean ifNotExists) throws MetaException, NoSuchObjectException,
-      org.apache.thrift.TException, AlreadyExistsException, InvalidObjectException,
-      ImpalaException, TableLoadingException {
-    catalog.createTableLike(tableName, oldTableName, owner, isExternal, comment,
-        fileFormat, location, ifNotExists);
-  }
-
-  /**
-   * Drops the specified table.
-   */
-  public void dropTable(TableName tableName, boolean ifExists)
-      throws MetaException, NoSuchObjectException, org.apache.thrift.TException,
-      AlreadyExistsException, InvalidObjectException, InvalidOperationException {
-    catalog.dropTable(tableName, ifExists);
-  }
-
-  /**
-   * Drops the specified database.
-   */
-  public void dropDatabase(String dbName, boolean ifExists)
-    throws MetaException, NoSuchObjectException, org.apache.thrift.TException,
-    AlreadyExistsException, InvalidObjectException, InvalidOperationException {
-    catalog.dropDatabase(dbName, ifExists);
+    TLoadDataResp response = new TLoadDataResp();
+    TColumnValue col = new TColumnValue();
+    String loadMsg = String.format(
+        "Loaded %d file(s). Total files in destination location: %d",
+        filesLoaded, FileSystemUtil.getTotalNumVisibleFiles(destPath));
+    col.setStringVal(loadMsg);
+    response.setLoad_summary(new TResultRow(Lists.newArrayList(col)));
+    return response;
   }
 
   /**
@@ -328,57 +293,33 @@ public class Frontend {
   }
 
   /**
-   * Returns all tables that match the specified database and pattern.  If
-   * pattern is null, matches all tables. If db is null, all databases are
-   * searched for matches.
+   * Returns all tables that match the specified database and pattern that are accessible
+   * to the given user. If pattern is null, matches all tables. If db is null, all
+   * databases are searched for matches.
    */
-  public List<String> getTableNames(String dbName, String tablePattern)
+  public List<String> getTableNames(String dbName, String tablePattern, User user)
       throws ImpalaException {
-    return catalog.getTableNames(dbName, tablePattern);
+    return catalog.getTableNames(dbName, tablePattern, user);
   }
 
   /**
-   * Returns all tables that match the specified database and pattern.  If
-   * pattern is null, matches all tables. If db is null, all databases are
-   * searched for matches.
+   * Returns all database names that match the specified database and pattern that
+   * are accessible to the given user. If pattern is null, matches all dbs.
    */
-  public List<String> getDbNames(String dbPattern)
-      throws ImpalaException {
-    return catalog.getDbNames(dbPattern);
+  public List<String> getDbNames(String dbPattern, User user) {
+    return catalog.getDbNames(dbPattern, user);
   }
 
   /**
-   * Returns a list of column descriptors describing a the columns in the
-   * specified table. Throws an AnalysisException if the table or db is not
-   * found.
+   * Returns table metadata, such as the column descriptors, in the specified table.
+   * Throws an exception if the table or db is not found or if there is an error
+   * loading the table metadata.
    */
-  public List<TColumnDef> describeTable(String dbName, String tableName)
-      throws ImpalaException {
-    Db db = catalog.getDb(dbName);
-    if (db == null) {
-      throw new AnalysisException("Unknown database: " + dbName);
-    }
-
-    Table table = null;
-    try {
-      table = db.getTable(tableName);
-    } catch (TableLoadingException e) {
-      throw new AnalysisException("Failed to load table metadata for: " + tableName, e);
-    }
-
-    if (table == null) {
-      throw new AnalysisException("Unknown table: " + db.getName() + "." + tableName);
-    }
-
-    List<TColumnDef> columns = Lists.newArrayList();
-    for (Column column: table.getColumnsInHiveOrder()) {
-      TColumnDef colDef = new TColumnDef(
-          new TColumnDesc(column.getName(), column.getType().toThrift()));
-      colDef.setComment(column.getComment());
-      columns.add(colDef);
-    }
-
-    return columns;
+  public TDescribeTableResult describeTable(String dbName, String tableName,
+      TDescribeTableOutputStyle outputStyle) throws ImpalaException {
+    Table table = catalog.getTable(dbName, tableName,
+        ImpalaInternalAdminUser.getInstance(), Privilege.ALL);
+    return DescribeResultFactory.buildDescribeTableResult(table, outputStyle);
   }
 
   /**
@@ -388,9 +329,11 @@ public class Frontend {
    */
   public TExecRequest createExecRequest(
       TClientRequest request, StringBuilder explainString)
-      throws InternalException, AnalysisException, NotImplementedException {
+      throws AuthorizationException, InternalException, AnalysisException,
+      NotImplementedException {
     AnalysisContext analysisCtxt = new AnalysisContext(catalog,
-        request.sessionState.database, request.sessionState.user);
+        request.sessionState.database,
+        new User(request.sessionState.user));
     AnalysisContext.AnalysisResult analysisResult = null;
     LOG.info("analyze query " + request.stmt);
     analysisResult = analysisCtxt.analyze(request.stmt);
@@ -402,6 +345,12 @@ public class Frontend {
     if (analysisResult.isDdlStmt()) {
       result.stmt_type = TStmtType.DDL;
       createDdlExecRequest(analysisResult, result);
+      return result;
+    } else if (analysisResult.isLoadDataStmt()) {
+      result.stmt_type = TStmtType.LOAD;
+      result.setResult_set_metadata(new TResultSetMetadata(Arrays.asList(
+          new TColumnDesc("summary", TPrimitiveType.STRING))));
+      result.setLoad_data_request(analysisResult.getLoadDataStmt().toThrift());
       return result;
     }
 
@@ -456,7 +405,7 @@ public class Frontend {
     }
 
     // Global query parameters to be set in each TPlanExecRequest.
-    queryExecRequest.query_globals = analysisCtxt.getQueryGlobals();
+    queryExecRequest.query_globals = analysisResult.getAnalyzer().getQueryGlobals();
 
     if (analysisResult.isQueryStmt()) {
       // fill in the metadata
@@ -492,7 +441,6 @@ public class Frontend {
     // Copy the statement type into the TQueryExecRequest so that it
     // is visible to the coordinator.
     result.query_exec_request.stmt_type = result.stmt_type;
-
     return result;
   }
 
@@ -524,24 +472,27 @@ public class Frontend {
    */
   public TMetadataOpResponse execHiveServer2MetadataOp(TMetadataOpRequest request)
       throws ImpalaException {
+    User user = request.isSetSession() ?
+        new User(request.session.getUser()) : ImpalaInternalAdminUser.getInstance();
     switch (request.opcode) {
       case GET_TYPE_INFO: return MetadataOp.getTypeInfo();
       case GET_SCHEMAS:
       {
         TGetSchemasReq req = request.getGet_schemas_req();
-        return MetadataOp.getSchemas(catalog, req.getCatalogName(), req.getSchemaName());
+        return MetadataOp.getSchemas(
+            catalog, req.getCatalogName(), req.getSchemaName(), user);
       }
       case GET_TABLES:
       {
         TGetTablesReq req = request.getGet_tables_req();
         return MetadataOp.getTables(catalog, req.getCatalogName(), req.getSchemaName(),
-            req.getTableName(), req.getTableTypes());
+            req.getTableName(), req.getTableTypes(), user);
       }
       case GET_COLUMNS:
       {
         TGetColumnsReq req = request.getGet_columns_req();
         return MetadataOp.getColumns(catalog, req.getCatalogName(), req.getSchemaName(),
-            req.getTableName(), req.getColumnName());
+            req.getTableName(), req.getColumnName(), user);
       }
       case GET_CATALOGS: return MetadataOp.getCatalogs();
       case GET_TABLE_TYPES: return MetadataOp.getTableTypes();
@@ -562,7 +513,8 @@ public class Frontend {
    */
   public void updateMetastore(TCatalogUpdate update) throws ImpalaException {
     // Only update metastore for Hdfs tables.
-    Table table = catalog.getTable(update.getDb_name(), update.getTarget_table());
+    Table table = catalog.getTable(update.getDb_name(), update.getTarget_table(),
+        ImpalaInternalAdminUser.getInstance(), Privilege.ALL);
     if (!(table instanceof HdfsTable)) {
       LOG.warn("Unexpected table type in updateMetastore: "
           + update.getTarget_table());
@@ -591,10 +543,11 @@ public class Frontend {
       }
       if (addedNewPartition) {
         try {
-          // Update the last DDL time of the table.
+          // Operate on a copy of msTbl to prevent our cached msTbl becoming inconsistent
+          // if the alteration fails in the metastore.
           org.apache.hadoop.hive.metastore.api.Table msTbl =
               table.getMetaStoreTable().deepCopy();
-          Catalog.updateLastDdlTime(msTbl, msClient);
+          DdlExecutor.updateLastDdlTime(msTbl, msClient);
         } catch (Exception e) {
           throw new InternalException("Error updating lastDdlTime", e);
         }
@@ -603,8 +556,22 @@ public class Frontend {
       msClient.release();
     }
 
-    // Mark the table metadata as invalid so it will be reloaded on the next access.
-    LOG.info("Invalidating table metadata: " + dbName + "." + tblName);
-    catalog.invalidateTable(dbName, tblName, true);
+    // Refresh the table metadata.
+    resetTable(dbName, tblName, true);
+  }
+
+  /**
+   * Execute a reset metadata statement.
+   */
+  public void execResetMetadata(TResetMetadataParams params)
+      throws CatalogException {
+    if (params.isSetTable_name()) {
+      resetTable(params.getTable_name().getDb_name(),
+          params.getTable_name().getTable_name(), params.isIs_refresh());
+    } else {
+      // Invalidate the catalog if no table name is provided.
+      Preconditions.checkArgument(!params.isIs_refresh());
+      resetCatalog();
+    }
   }
 }

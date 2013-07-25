@@ -17,17 +17,20 @@
 #include <vector>
 #include <gflags/gflags.h>
 #include <snappy.h>
-#include <thrift/protocol/TBinaryProtocol.h>
-#include <thrift/protocol/TDebugProtocol.h>
-#include <thrift/TApplicationException.h>
-#include <thrift/transport/TBufferTransports.h>
 #include "gen-cpp/parquet_types.h"
 
 // TCompactProtocol requires some #defines to work right.  
 // TODO: is there a better include to use?
 #define SIGNED_RIGHT_SHIFT_IS 1
 #define ARITHMETIC_RIGHT_SHIFT 1
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wstring-plus-int"
 #include <thrift/protocol/TCompactProtocol.h>
+#include <thrift/protocol/TBinaryProtocol.h>
+#include <thrift/protocol/TDebugProtocol.h>
+#include <thrift/TApplicationException.h>
+#include <thrift/transport/TBufferTransports.h>
+#pragma clang diagnostic pop
 
 #include "util/rle-encoding.h"
 
@@ -347,7 +350,7 @@ int main(int argc, char** argv) {
         uint8_t* definition_data = data_page_data + sizeof(int32_t);
         uint8_t* values = data_page_data + num_definition_bytes + sizeof(int32_t);
     
-        impala::RleDecoder definition_levels(definition_data, num_definition_bytes);
+        impala::RleDecoder definition_levels(definition_data, num_definition_bytes, 1);
 
         switch (col.meta_data.type) {
           case Type::BOOLEAN:

@@ -145,6 +145,7 @@ HdfsTableDescriptor::HdfsTableDescriptor(const TTableDescriptor& tdesc,
   {
   	col_types_.push_back(ThriftToType(*type_it));
   }
+  avro_schema_ = tdesc.hdfsTable.__isset.avroSchema ? tdesc.hdfsTable.avroSchema : "";
 }
 
 string HdfsTableDescriptor::DebugString() const {
@@ -175,8 +176,10 @@ HBaseTableDescriptor::HBaseTableDescriptor(const TTableDescriptor& tdesc)
   : TableDescriptor(tdesc),
     table_name_(tdesc.hbaseTable.tableName) {
   for (int i = 0; i < tdesc.hbaseTable.families.size(); ++i) {
-    cols_.push_back(make_pair(tdesc.hbaseTable.families[i],
-        tdesc.hbaseTable.qualifiers[i]));
+    bool is_binary_encoded = tdesc.hbaseTable.__isset.binary_encoded &&
+        tdesc.hbaseTable.binary_encoded[i];
+    cols_.push_back(HBaseTableDescriptor::HBaseColumnDescriptor(
+        tdesc.hbaseTable.families[i], tdesc.hbaseTable.qualifiers[i], is_binary_encoded));
   }
 }
 
@@ -185,7 +188,8 @@ string HBaseTableDescriptor::DebugString() const {
   out << "HBaseTable(" << TableDescriptor::DebugString() << " table=" << table_name_;
   out << " cols=[";
   for (int i = 0; i < cols_.size(); ++i) {
-    out << (i > 0 ? " " : "") << cols_[i].first << ":" << cols_[i].second;
+    out << (i > 0 ? " " : "") << cols_[i].family << ":" << cols_[i].qualifier << ":"
+        << cols_[i].binary_encoded;
   }
   out << "])";
   return out.str();

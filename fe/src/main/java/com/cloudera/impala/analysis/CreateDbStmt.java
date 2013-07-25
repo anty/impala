@@ -14,20 +14,20 @@
 
 package com.cloudera.impala.analysis;
 
+import org.apache.hadoop.hive.metastore.MetaStoreUtils;
+
+import com.cloudera.impala.authorization.Privilege;
+import com.cloudera.impala.catalog.AuthorizationException;
+import com.cloudera.impala.catalog.Db;
 import com.cloudera.impala.common.AnalysisException;
-import com.cloudera.impala.common.InternalException;
 import com.cloudera.impala.thrift.TCreateDbParams;
-
-import com.google.common.base.Preconditions;
-
-import org.apache.hadoop.hive.metastore.api.Database;
 
 /**
  * Represents a CREATE DATABASE statement
  */
-public class CreateDbStmt extends ParseNodeBase {
+public class CreateDbStmt extends StatementBase {
   private final String dbName;
-  private final String location;
+  private final HdfsURI location;
   private final String comment;
   private final boolean ifNotExists;
 
@@ -44,7 +44,7 @@ public class CreateDbStmt extends ParseNodeBase {
    * storage location. Create database will throw an error if the database already exists
    * unless the ifNotExists is true.
    */
-  public CreateDbStmt(String dbName, String comment, String location,
+  public CreateDbStmt(String dbName, String comment, HdfsURI location,
       boolean ifNotExists) {
     this.dbName = dbName;
     this.comment = comment;
@@ -64,14 +64,16 @@ public class CreateDbStmt extends ParseNodeBase {
     return ifNotExists;
   }
 
-  public String getLocation() {
+  public HdfsURI getLocation() {
     return location;
   }
 
+  @Override
   public String debugString() {
     return toSql();
   }
 
+  @Override
   public String toSql() {
     StringBuilder sb = new StringBuilder("CREATE DATABASE");
     if (ifNotExists) {
@@ -93,18 +95,28 @@ public class CreateDbStmt extends ParseNodeBase {
     TCreateDbParams params = new TCreateDbParams();
     params.setDb(getDb());
     params.setComment(getComment());
-    params.setLocation(getLocation());
+    params.setLocation(location == null ? null : location.toString());
     params.setIf_not_exists(getIfNotExists());
     return params;
   }
 
-  public void analyze(Analyzer analyzer) throws AnalysisException {
+  @Override
+  public void analyze(Analyzer analyzer) throws AnalysisException,
+      AuthorizationException {
+    // Check whether the db name meets the Metastore's requirements.
+    if (!MetaStoreUtils.validateName(dbName)) {
+      throw new AnalysisException("Invalid database name: " + dbName);
+    }
+
     // Note: It is possible that a database with the same name was created external to
     // this Impala instance. If that happens, the caller will not get an
     // AnalysisException when creating the database, they will get a Hive
-    // AlreadyExistsException.
-    if (analyzer.getCatalog().getDb(getDb()) != null && !ifNotExists) {
-      throw new AnalysisException("Database already exists: " + getDb());
+    // AlreadyExistsException once the request has been sent to the metastore.
+    Db db = analyzer.getCatalog().getDb(getDb(), analyzer.getUser(), Privilege.CREATE);
+    if (db != null && !ifNotExists) {
+      throw new AnalysisException(Analyzer.DB_ALREADY_EXISTS_ERROR_MSG + getDb());
     }
+
+    if (location != null) location.analyze(analyzer, Privilege.ALL);
   }
 }

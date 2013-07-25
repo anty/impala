@@ -14,6 +14,7 @@
 
 #include "service/query-exec-state.h"
 #include "service/impala-server.h"
+#include "service/frontend.h"
 
 #include "exec/ddl-executor.h"
 #include "exprs/expr.h"
@@ -28,7 +29,7 @@ using namespace beeswax;
 namespace impala {
 
 ImpalaServer::QueryExecState::QueryExecState(
-    ExecEnv* exec_env, ImpalaServer* server,
+    ExecEnv* exec_env, Frontend* frontend,
     shared_ptr<SessionState> session,
     const TSessionState& query_session_state, const string& sql_stmt)
   : sql_stmt_(sql_stmt),
@@ -44,14 +45,13 @@ ImpalaServer::QueryExecState::QueryExecState(
     current_batch_(NULL),
     current_batch_row_(0),
     num_rows_fetched_(0),
-    impala_server_(server),
-    start_time_(TimestampValue::local_time()) {
+    frontend_(frontend),
+    start_time_(TimestampValue::local_time_micros()) {
   row_materialization_timer_ = ADD_TIMER(&server_profile_, "RowMaterializationTimer");
   client_wait_timer_ = ADD_TIMER(&server_profile_, "ClientFetchWaitTimer");
   query_events_ = summary_profile_.AddEventSequence("Query Timeline");
   query_events_->Start();
   profile_.AddChild(&summary_profile_);
-  profile_.AddChild(&server_profile_);
 
   // Creating a random_generator every time is not free, but
   // benchmarks show it to be slightly cheaper than contending for a
@@ -62,6 +62,7 @@ ImpalaServer::QueryExecState::QueryExecState(
   query_id_.hi = *reinterpret_cast<uint64_t*>(&query_uuid.data[0]);
   query_id_.lo = *reinterpret_cast<uint64_t*>(&query_uuid.data[8]);
 
+  profile_.set_name("Query (id=" + PrintId(query_id()) + ")");
   summary_profile_.AddInfoString("Start Time", start_time().DebugString());
   summary_profile_.AddInfoString("End Time", "");
   summary_profile_.AddInfoString("Query Type", "N/A");
@@ -75,8 +76,8 @@ ImpalaServer::QueryExecState::QueryExecState(
 
 Status ImpalaServer::QueryExecState::Exec(TExecRequest* exec_request) {
   exec_request_ = *exec_request;
-  profile_.set_name("Query (id=" + PrintId(query_id()) + ")");
 
+  profile_.AddChild(&server_profile_);
   summary_profile_.AddInfoString("Query Type", PrintTStmtType(stmt_type()));
   summary_profile_.AddInfoString("Query State", PrintQueryState(query_state_));
 
@@ -85,7 +86,7 @@ Status ImpalaServer::QueryExecState::Exec(TExecRequest* exec_request) {
     case TStmtType::DML:
       return ExecQueryOrDmlRequest();
     case TStmtType::EXPLAIN: {
-      explain_result_set_.reset(new vector<TResultRow>(
+      request_result_set_.reset(new vector<TResultRow>(
           exec_request_.explain_result.results));
       return Status::OK;
     }
@@ -95,12 +96,22 @@ Status ImpalaServer::QueryExecState::Exec(TExecRequest* exec_request) {
         parent_session_->database = exec_request_.ddl_exec_request.use_db_params.db;
         return Status::OK;
       }
-      ddl_executor_.reset(new DdlExecutor(impala_server_));
-      Status status = ddl_executor_->Exec(&exec_request_.ddl_exec_request);
+      ddl_executor_.reset(new DdlExecutor(frontend_));
+      Status status = ddl_executor_->Exec(exec_request_.ddl_exec_request,
+          query_session_state_);
       {
         lock_guard<mutex> l(lock_);
         return UpdateQueryStatus(status);
       }
+    }
+    case TStmtType::LOAD: {
+      DCHECK(exec_request_.__isset.load_data_request);
+      TLoadDataResp response;
+      RETURN_IF_ERROR(
+          frontend_->LoadData(exec_request_.load_data_request, &response));
+      request_result_set_.reset(new vector<TResultRow>);
+      request_result_set_->push_back(response.load_summary);
+      return Status::OK;
     }
     default:
       stringstream errmsg;
@@ -157,14 +168,14 @@ Status ImpalaServer::QueryExecState::ExecQueryOrDmlRequest() {
 }
 
 void ImpalaServer::QueryExecState::Done() {
-  end_time_ = TimestampValue::local_time();
+  end_time_ = TimestampValue::local_time_micros();
   summary_profile_.AddInfoString("End Time", end_time().DebugString());
   summary_profile_.AddInfoString("Query State", PrintQueryState(query_state_));
   query_events_->MarkEvent("Unregister query");
 }
 
 Status ImpalaServer::QueryExecState::Exec(const TMetadataOpRequest& exec_request) {
-  ddl_executor_.reset(new DdlExecutor(impala_server_));
+  ddl_executor_.reset(new DdlExecutor(frontend_));
   RETURN_IF_ERROR(ddl_executor_->Exec(exec_request));
   result_metadata_ = ddl_executor_->result_set_metadata();
   return Status::OK;
@@ -228,13 +239,13 @@ Status ImpalaServer::QueryExecState::FetchRowsInternal(const int32_t max_rows,
 
   if (eos_) return Status::OK;
 
-  if (ddl_executor_ != NULL || explain_result_set_ != NULL) {
-    // DDL or EXPLAIN
-    DCHECK(ddl_executor_ == NULL || explain_result_set_ == NULL);
+  if (ddl_executor_ != NULL || request_result_set_ != NULL) {
+    // DDL / EXPLAIN / LOAD
+    DCHECK(ddl_executor_ == NULL || request_result_set_ == NULL);
     query_state_ = QueryState::FINISHED;
     int num_rows = 0;
     const vector<TResultRow>& all_rows = (ddl_executor_ != NULL) ?
-        ddl_executor_->result_set() : (*(explain_result_set_.get()));
+        ddl_executor_->result_set() : (*(request_result_set_.get()));
     // max_rows <= 0 means no limit
     while ((num_rows < max_rows || max_rows <= 0)
         && num_rows_fetched_ < all_rows.size()) {
@@ -263,7 +274,14 @@ Status ImpalaServer::QueryExecState::FetchRowsInternal(const int32_t max_rows,
   }
 
   // query with a FROM clause
-  RETURN_IF_ERROR(coord_->Wait());
+  lock_.unlock();
+  Status status = coord_->Wait();
+  lock_.lock();
+  if (!status.ok()) return status;
+
+  // Check if query_state_ changed during Wait() call
+  if (query_state_ == QueryState::EXCEPTION) return query_status_;
+
   query_state_ = QueryState::FINISHED;  // results will be ready after this call
   // Fetch the next batch if we've returned the current batch entirely
   if (current_batch_ == NULL || current_batch_row_ >= current_batch_->num_rows()) {
@@ -331,7 +349,7 @@ Status ImpalaServer::QueryExecState::UpdateMetastore() {
 
     catalog_update.target_table = finalize_params.table_name;
     catalog_update.db_name = finalize_params.table_db;
-    RETURN_IF_ERROR(impala_server_->UpdateMetastore(catalog_update));
+    RETURN_IF_ERROR(frontend_->UpdateMetastore(catalog_update));
   }
   return Status::OK;
 }
@@ -340,7 +358,19 @@ Status ImpalaServer::QueryExecState::FetchNextBatch() {
   DCHECK(!eos_);
   DCHECK(coord_.get() != NULL);
 
-  RETURN_IF_ERROR(coord_->GetNext(&current_batch_, coord_->runtime_state()));
+  // Temporarily release lock so calls to Cancel() are not blocked.  fetch_rows_lock_
+  // ensures that we do not call coord_->GetNext() multiple times concurrently.
+  lock_.unlock();
+  Status status = coord_->GetNext(&current_batch_, coord_->runtime_state());
+  lock_.lock();
+  if (!status.ok()) return status;
+
+  // Check if query_state_ changed during GetNext() call
+  if (query_state_ == QueryState::EXCEPTION) {
+    current_batch_ = NULL;
+    return query_status_;
+  }
+
   current_batch_row_ = 0;
   eos_ = current_batch_ == NULL;
   return Status::OK;

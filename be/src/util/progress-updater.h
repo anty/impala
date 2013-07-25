@@ -19,6 +19,8 @@
 #include <string>
 #include <boost/cstdint.hpp>
 
+#include "common/atomic.h"
+
 namespace impala {
 
 // Utility class to update progress.  This is split out so a different
@@ -51,6 +53,7 @@ class ProgressUpdater {
 
   int64_t total() const { return total_; }
   int64_t num_complete() const { return num_complete_; }
+  int64_t remaining() const { return total() - num_complete(); }
 
   // Returns a string representation of the current progress
   std::string ToString() const;
@@ -60,7 +63,8 @@ class ProgressUpdater {
   int logging_level_;
   int64_t total_;
   int update_period_;
-  int64_t num_complete_;
+
+  AtomicInt<int64_t> num_complete_;
   int last_output_percentage_;
 };
 

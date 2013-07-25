@@ -618,7 +618,7 @@ void TestSingleLiteralConstruction(PrimitiveType type, void* value,
     const string& string_val) {
   ObjectPool pool;
   RowDescriptor desc;
-  RuntimeState state(TUniqueId(), TQueryOptions(), "", NULL);
+  RuntimeState state(TUniqueId(), TQueryOptions(), "", "", NULL);
 
   Expr* expr = Expr::CreateLiteral(&pool, type, value);
   EXPECT_TRUE(expr != NULL);
@@ -629,7 +629,7 @@ void TestSingleLiteralConstruction(PrimitiveType type, void* value,
 TEST_F(ExprTest, NullLiteral) {
   for (int type = TYPE_BOOLEAN; type != TYPE_DATE; ++type) {
     NullLiteral expr(static_cast<PrimitiveType>(type));
-    RuntimeState state(TUniqueId(), TQueryOptions(), "", NULL);
+    RuntimeState state(TUniqueId(), TQueryOptions(), "", "", NULL);
     Status status = Expr::Prepare(&expr, &state, RowDescriptor(), disable_codegen_);
     EXPECT_TRUE(status.ok());
     EXPECT_TRUE(expr.GetValue(NULL) == NULL);
@@ -643,7 +643,9 @@ TEST_F(ExprTest, LiteralConstruction) {
   int32_t i_val = 234;
   int64_t l_val = 1234;
   float f_val = 3.14f;
-  double d_val = 1.23;
+  double d_val_1 = 1.23;
+  double d_val_2 = 7e6;
+  double d_val_3 = 5.9e-3;
   string str_input = "Hello";
   StringValue str_val(const_cast<char*>(str_input.data()), str_input.length());
 
@@ -656,8 +658,12 @@ TEST_F(ExprTest, LiteralConstruction) {
   TestSingleLiteralConstruction(TYPE_BIGINT, &l_val, "+1234");
   TestSingleLiteralConstruction(TYPE_FLOAT, &f_val, "3.14");
   TestSingleLiteralConstruction(TYPE_FLOAT, &f_val, "+3.14");
-  TestSingleLiteralConstruction(TYPE_DOUBLE, &d_val, "1.23");
-  TestSingleLiteralConstruction(TYPE_DOUBLE, &d_val, "+1.23");
+  TestSingleLiteralConstruction(TYPE_DOUBLE, &d_val_1, "1.23");
+  TestSingleLiteralConstruction(TYPE_DOUBLE, &d_val_1, "+1.23");
+  TestSingleLiteralConstruction(TYPE_DOUBLE, &d_val_2, "7e6");
+  TestSingleLiteralConstruction(TYPE_DOUBLE, &d_val_2, "+7e6");
+  TestSingleLiteralConstruction(TYPE_DOUBLE, &d_val_3, "5.9e-3");
+  TestSingleLiteralConstruction(TYPE_DOUBLE, &d_val_3, "+5.9e-3");
   TestSingleLiteralConstruction(TYPE_STRING, &str_val, "Hello");
   TestSingleLiteralConstruction(TYPE_NULL, NULL, "NULL");
 
@@ -1186,6 +1192,22 @@ TEST_F(ExprTest, StringFunctions) {
   TestIsNull("strright('abcdefg', NULL)", TYPE_STRING);
   TestIsNull("strright(NULL, NULL)", TYPE_STRING);
 
+  TestStringValue("translate('', '', '')", "");
+  TestStringValue("translate('abcd', '', '')", "abcd");
+  TestStringValue("translate('abcd', 'xyz', '')", "abcd");
+  TestStringValue("translate('abcd', 'a', '')", "bcd");
+  TestStringValue("translate('abcd', 'aa', '')", "bcd");
+  TestStringValue("translate('abcd', 'aba', '')", "cd");
+  TestStringValue("translate('abcd', 'cd', '')", "ab");
+  TestStringValue("translate('abcd', 'cd', 'xy')", "abxy");
+  TestStringValue("translate('abcdabcd', 'cd', 'xy')", "abxyabxy");
+  TestStringValue("translate('abcd', 'abc', 'xy')", "xyd");
+  TestStringValue("translate('abcd', 'abc', 'wxyz')", "wxyd");
+  TestStringValue("translate('x', 'xx', 'ab')", "a");
+  TestIsNull("translate(NULL, '', '')", TYPE_STRING);
+  TestIsNull("translate('', NULL, '')", TYPE_STRING);
+  TestIsNull("translate('', '', NULL)", TYPE_STRING);
+
   TestStringValue("trim('')", "");
   TestStringValue("trim('      ')", "");
   TestStringValue("trim('   abcdefg   ')", "abcdefg");
@@ -1330,10 +1352,6 @@ TEST_F(ExprTest, StringFunctions) {
   TestIsNull("find_in_set(NULL, 'abc,ad,,ade,cde')", TYPE_INT);
   TestIsNull("find_in_set('abc,def', NULL)", TYPE_INT);
   TestIsNull("find_in_set(NULL, NULL)", TYPE_INT);
-
-  TestStringValue("version()", GetVersionString());
-  TestValue("sleep(100)", TYPE_BOOLEAN, true);
-  TestIsNull("sleep(NULL)", TYPE_BOOLEAN);
 }
 
 TEST_F(ExprTest, StringRegexpFunctions) {
@@ -1657,6 +1675,13 @@ TEST_F(ExprTest, StringParseUrlFunction) {
       "index.html?test=true&name=networking&op=true', 'REF', 'name')", TYPE_STRING);
   TestIsNull("parse_url('http://example.com:80/docs/books/tutorial/"
       "index.html?test=true&name=networking&op=true', 'XYZ', 'name')", TYPE_STRING);
+}
+
+TEST_F(ExprTest, UtilityFunctions) {
+  TestStringValue("user()", "impala_test_user");
+  TestStringValue("version()", GetVersionString());
+  TestValue("sleep(100)", TYPE_BOOLEAN, true);
+  TestIsNull("sleep(NULL)", TYPE_BOOLEAN);
 }
 
 TEST_F(ExprTest, MathTrigonometricFunctions) {
@@ -2167,6 +2192,9 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestValue("day(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 22);
   TestValue("dayofyear(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 356);
   TestValue("weekofyear(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 51);
+  TestValue("dayofweek(cast('2011-12-18 09:10:11.000000' as timestamp))", TYPE_INT, 1);
+  TestValue("dayofweek(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 5);
+  TestValue("dayofweek(cast('2011-12-24 09:10:11.000000' as timestamp))", TYPE_INT, 7);
   TestValue("hour(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 9);
   TestValue("minute(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 10);
   TestValue("second(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 11);
@@ -2176,6 +2204,9 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestValue("day(cast('2011-12-22' as timestamp))", TYPE_INT, 22);
   TestValue("dayofyear(cast('2011-12-22' as timestamp))", TYPE_INT, 356);
   TestValue("weekofyear(cast('2011-12-22' as timestamp))", TYPE_INT, 51);
+  TestValue("dayofweek(cast('2011-12-18' as timestamp))", TYPE_INT, 1);
+  TestValue("dayofweek(cast('2011-12-22' as timestamp))", TYPE_INT, 5);
+  TestValue("dayofweek(cast('2011-12-24' as timestamp))", TYPE_INT, 7);
   TestValue("hour(cast('09:10:11.000000' as timestamp))", TYPE_INT, 9);
   TestValue("minute(cast('09:10:11.000000' as timestamp))", TYPE_INT, 10);
   TestValue("second(cast('09:10:11.000000' as timestamp))", TYPE_INT, 11);
@@ -2190,6 +2221,7 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestIsNull("dayofmonth(cast('09:10:11.000000' as timestamp))", TYPE_INT);
   TestIsNull("day(cast('09:10:11.000000' as timestamp))", TYPE_INT);
   TestIsNull("dayofyear(cast('09:10:11.000000' as timestamp))", TYPE_INT);
+  TestIsNull("dayofweek(cast('09:10:11.000000' as timestamp))", TYPE_INT);
   TestIsNull("weekofyear(cast('09:10:11.000000' as timestamp))", TYPE_INT);
   TestIsNull("datediff(cast('09:10:11.12345678' as timestamp), "
       "cast('2012-12-22' as timestamp))", TYPE_INT);
@@ -2198,6 +2230,7 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestIsNull("month(NULL)", TYPE_INT);
   TestIsNull("dayofmonth(NULL)", TYPE_INT);
   TestIsNull("day(NULL)", TYPE_INT);
+  TestIsNull("dayofweek(NULL)", TYPE_INT);
   TestIsNull("dayofyear(NULL)", TYPE_INT);
   TestIsNull("weekofyear(NULL)", TYPE_INT);
   TestIsNull("datediff(NULL, '2011-12-22 09:10:11.12345678')", TYPE_INT);
@@ -2286,24 +2319,28 @@ TEST_F(ExprTest, ConditionalFunctions) {
   TestTimestampValue("if(FALSE, cast('2011-01-01 09:01:01' as timestamp), "
       "cast('1999-06-14 19:07:25' as timestamp))", else_val);
 
-  // Test IsNull() function on all applicable types and NULL.
-  TestValue("isnull(true, NULL)", TYPE_BOOLEAN, true);
-  TestValue("isnull(1, NULL)", TYPE_INT, 1);
-  TestValue("isnull(1 + 1, NULL)", TYPE_BIGINT, 2);
-  TestValue("isnull(10.0, NULL)", TYPE_DOUBLE, 10.0);
-  TestStringValue("isnull('abc', NULL)", "abc");
-  TestTimestampValue("isnull(" + default_timestamp_str_ + ", NULL)",
-      default_timestamp_val_);
-  // Test first argument is NULL.
-  TestValue("isnull(NULL, true)", TYPE_BOOLEAN, true);
-  TestValue("isnull(NULL, 1)", TYPE_INT, 1);
-  TestValue("isnull(NULL, 1 + 1)", TYPE_BIGINT, 2);
-  TestValue("isnull(NULL, 10.0)", TYPE_DOUBLE, 10.0);
-  TestStringValue("isnull(NULL, 'abc')", "abc");
-  TestTimestampValue("isnull(NULL, " + default_timestamp_str_ + ")",
-      default_timestamp_val_);
-  // Test NULL. The return type is boolean to avoid a special NULL function signature.
-  TestIsNull("isnull(NULL, NULL)", TYPE_BOOLEAN);
+  // Test IsNull() function and its aliases on all applicable types and NULL.
+  string isnull_aliases[] = {"IsNull", "IfNull", "Nvl"};
+  for (int i = 0; i < 3; ++i) {
+    string& f = isnull_aliases[i];
+    TestValue(f + "(true, NULL)", TYPE_BOOLEAN, true);
+    TestValue(f + "(1, NULL)", TYPE_INT, 1);
+    TestValue(f + "(1 + 1, NULL)", TYPE_BIGINT, 2);
+    TestValue(f + "(10.0, NULL)", TYPE_DOUBLE, 10.0);
+    TestStringValue(f + "('abc', NULL)", "abc");
+    TestTimestampValue(f + "(" + default_timestamp_str_ + ", NULL)",
+        default_timestamp_val_);
+    // Test first argument is NULL.
+    TestValue(f + "(NULL, true)", TYPE_BOOLEAN, true);
+    TestValue(f + "(NULL, 1)", TYPE_INT, 1);
+    TestValue(f + "(NULL, 1 + 1)", TYPE_BIGINT, 2);
+    TestValue(f + "(NULL, 10.0)", TYPE_DOUBLE, 10.0);
+    TestStringValue(f + "(NULL, 'abc')", "abc");
+    TestTimestampValue(f + "(NULL, " + default_timestamp_str_ + ")",
+        default_timestamp_val_);
+    // Test NULL. The return type is boolean to avoid a special NULL function signature.
+    TestIsNull(f + "(NULL, NULL)", TYPE_BOOLEAN);
+  }
 
   TestIsNull("coalesce(NULL)", TYPE_DOUBLE);
   TestIsNull("coalesce(NULL, NULL)", TYPE_DOUBLE);

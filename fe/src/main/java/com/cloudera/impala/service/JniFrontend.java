@@ -22,6 +22,7 @@ import java.io.InvalidObjectException;
 import java.net.URL;
 import java.net.URLConnection;
 import java.rmi.NoSuchObjectException;
+import java.util.Enumeration;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -31,6 +32,7 @@ import java.util.regex.Pattern;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
 import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.DFSUtil;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
@@ -38,6 +40,8 @@ import org.apache.hadoop.hdfs.HAUtil;
 import org.apache.hadoop.hive.metastore.api.AlreadyExistsException;
 import org.apache.hadoop.hive.metastore.api.InvalidOperationException;
 import org.apache.hadoop.hive.metastore.api.MetaException;
+import org.apache.log4j.Appender;
+import org.apache.log4j.FileAppender;
 import org.apache.thrift.TBase;
 import org.apache.thrift.TDeserializer;
 import org.apache.thrift.TException;
@@ -46,38 +50,35 @@ import org.apache.thrift.protocol.TBinaryProtocol;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.cloudera.impala.analysis.TableName;
-import com.cloudera.impala.catalog.Db.TableLoadingException;
-import com.cloudera.impala.catalog.FileFormat;
-import com.cloudera.impala.catalog.RowFormat;
+import com.cloudera.impala.authorization.AuthorizationConfig;
+import com.cloudera.impala.authorization.ImpalaInternalAdminUser;
+import com.cloudera.impala.authorization.User;
+import com.cloudera.impala.catalog.TableLoadingException;
+import com.cloudera.impala.common.FileSystemUtil;
 import com.cloudera.impala.common.ImpalaException;
 import com.cloudera.impala.common.InternalException;
-import com.cloudera.impala.thrift.TAlterTableAddPartitionParams;
-import com.cloudera.impala.thrift.TAlterTableAddReplaceColsParams;
-import com.cloudera.impala.thrift.TAlterTableChangeColParams;
-import com.cloudera.impala.thrift.TAlterTableDropColParams;
-import com.cloudera.impala.thrift.TAlterTableDropPartitionParams;
 import com.cloudera.impala.thrift.TAlterTableParams;
-import com.cloudera.impala.thrift.TAlterTableRenameParams;
-import com.cloudera.impala.thrift.TAlterTableSetFileFormatParams;
-import com.cloudera.impala.thrift.TAlterTableSetLocationParams;
 import com.cloudera.impala.thrift.TCatalogUpdate;
 import com.cloudera.impala.thrift.TClientRequest;
 import com.cloudera.impala.thrift.TCreateDbParams;
+import com.cloudera.impala.thrift.TCreateOrAlterViewParams;
 import com.cloudera.impala.thrift.TCreateTableLikeParams;
 import com.cloudera.impala.thrift.TCreateTableParams;
 import com.cloudera.impala.thrift.TDescribeTableParams;
 import com.cloudera.impala.thrift.TDescribeTableResult;
 import com.cloudera.impala.thrift.TDropDbParams;
-import com.cloudera.impala.thrift.TDropTableParams;
+import com.cloudera.impala.thrift.TDropTableOrViewParams;
 import com.cloudera.impala.thrift.TExecRequest;
 import com.cloudera.impala.thrift.TGetDbsParams;
 import com.cloudera.impala.thrift.TGetDbsResult;
 import com.cloudera.impala.thrift.TGetTablesParams;
 import com.cloudera.impala.thrift.TGetTablesResult;
+import com.cloudera.impala.thrift.TLoadDataReq;
+import com.cloudera.impala.thrift.TLoadDataResp;
 import com.cloudera.impala.thrift.TMetadataOpRequest;
 import com.cloudera.impala.thrift.TMetadataOpResponse;
-import com.cloudera.impala.thrift.TPartitionKeyValue;
+import com.cloudera.impala.thrift.TResetMetadataParams;
+import com.google.common.base.Preconditions;
 
 /**
  * JNI-callable interface onto a wrapped Frontend instance. The main point is to serialise
@@ -91,12 +92,17 @@ public class JniFrontend {
 
   private final Frontend frontend;
 
-  public JniFrontend() {
-    frontend = new Frontend();
-  }
-
-  public JniFrontend(boolean lazy) {
-    frontend = new Frontend(lazy);
+  /**
+   * Create a new instance of the Jni Frontend.
+   */
+  public JniFrontend(boolean lazy, String serverName, String authorizationPolicyFile,
+      String policyProviderClassName) throws InternalException {
+    // Validate the authorization configuration before initializing the Frontend.
+    // If there are any configuration problems Impala startup will fail.
+    AuthorizationConfig authorizationConfig = new AuthorizationConfig(serverName,
+        authorizationPolicyFile, policyProviderClassName);
+    authorizationConfig.validateConfig();
+    frontend = new Frontend(lazy, authorizationConfig);
   }
 
   /**
@@ -141,64 +147,15 @@ public class JniFrontend {
       InvalidObjectException, ImpalaException, TableLoadingException {
     TAlterTableParams params = new TAlterTableParams();
     deserializeThrift(params, thriftAlterTableParams);
-    switch (params.getAlter_type()) {
-      case ADD_REPLACE_COLUMNS:
-        TAlterTableAddReplaceColsParams addReplaceColParams =
-            params.getAdd_replace_cols_params();
-        frontend.alterTableAddReplaceCols(TableName.fromThrift(params.getTable_name()),
-            addReplaceColParams.getColumns(),
-            addReplaceColParams.isReplace_existing_cols());
-        break;
-      case ADD_PARTITION:
-        TAlterTableAddPartitionParams addPartParams = params.getAdd_partition_params();
-        frontend.alterTableAddPartition(TableName.fromThrift(params.getTable_name()),
-            addPartParams.getPartition_spec(), addPartParams.getLocation(),
-            addPartParams.isIf_not_exists());
-        break;
-      case DROP_COLUMN:
-        TAlterTableDropColParams dropColParams = params.getDrop_col_params();
-        frontend.alterTableDropCol(TableName.fromThrift(params.getTable_name()),
-            dropColParams.getCol_name());
-        break;
-      case CHANGE_COLUMN:
-        TAlterTableChangeColParams changeColParams = params.getChange_col_params();
-        frontend.alterTableChangeCol(TableName.fromThrift(params.getTable_name()),
-            changeColParams.getCol_name(), changeColParams.getNew_col_def());
-        break;
-      case DROP_PARTITION:
-        TAlterTableDropPartitionParams dropPartParams = params.getDrop_partition_params();
-        frontend.alterTableDropPartition(TableName.fromThrift(params.getTable_name()),
-            dropPartParams.getPartition_spec(), dropPartParams.isIf_exists());
-        break;
-      case RENAME_TABLE:
-        TAlterTableRenameParams renameParams = params.getRename_params();
-        frontend.alterTableRename(TableName.fromThrift(params.getTable_name()),
-            TableName.fromThrift(renameParams.getNew_table_name()));
-        break;
-      case SET_FILE_FORMAT:
-        TAlterTableSetFileFormatParams fileFormatParams =
-            params.getSet_file_format_params();
-        List<TPartitionKeyValue> fileFormatPartitionSpec = null;
-        if (fileFormatParams.isSetPartition_spec()) {
-          fileFormatPartitionSpec = fileFormatParams.getPartition_spec();
-        }
-        frontend.alterTableSetFileFormat(TableName.fromThrift(params.getTable_name()),
-            fileFormatPartitionSpec,
-            FileFormat.fromThrift(fileFormatParams.getFile_format()));
-        break;
-      case SET_LOCATION:
-        TAlterTableSetLocationParams setLocationParams = params.getSet_location_params();
-        List<TPartitionKeyValue> partitionSpec = null;
-        if (setLocationParams.isSetPartition_spec()) {
-          partitionSpec = setLocationParams.getPartition_spec();
-        }
-        frontend.alterTableSetLocation(TableName.fromThrift(params.getTable_name()),
-            partitionSpec, setLocationParams.getLocation());
-        break;
-      default:
-        throw new UnsupportedOperationException(
-            "Unknown ALTER TABLE operation type: " + params.getAlter_type());
-    }
+    frontend.getDdlExecutor().alterTable(params);
+  }
+
+  public void alterView(byte[] thriftAlterViewParams)
+      throws ImpalaException, MetaException, org.apache.thrift.TException,
+      InvalidObjectException, ImpalaException, TableLoadingException {
+    TCreateOrAlterViewParams params = new TCreateOrAlterViewParams();
+    deserializeThrift(params, thriftAlterViewParams);
+    frontend.getDdlExecutor().alterView(params);
   }
 
   public void createDatabase(byte[] thriftCreateDbParams)
@@ -206,8 +163,26 @@ public class JniFrontend {
       AlreadyExistsException, InvalidObjectException {
     TCreateDbParams params = new TCreateDbParams();
     deserializeThrift(params, thriftCreateDbParams);
-    frontend.createDatabase(params.getDb(), params.getComment(), params.getLocation(),
-        params.isIf_not_exists());
+    frontend.getDdlExecutor().createDatabase(params);
+  }
+
+  /**
+   * Loads a table or partition with one or more data files. If the "overwrite" flag
+   * in the request is true, all existing data in the table/partition will be replaced.
+   * If the "overwrite" flag is false, the files will be added alongside any existing
+   * data files.
+   */
+  public byte[] loadTableData(byte[] thriftLoadTableDataParams)
+      throws ImpalaException, IOException {
+    TLoadDataReq request = new TLoadDataReq();
+    deserializeThrift(request, thriftLoadTableDataParams);
+    TLoadDataResp response = frontend.loadTableData(request);
+    TSerializer serializer = new TSerializer(protocolFactory);
+    try {
+      return serializer.serialize(response);
+    } catch (TException e) {
+      throw new InternalException(e.getMessage());
+    }
   }
 
   public void createTable(byte[] thriftCreateTableParams)
@@ -216,12 +191,16 @@ public class JniFrontend {
       InvalidObjectException {
     TCreateTableParams params = new TCreateTableParams();
     deserializeThrift(params, thriftCreateTableParams);
-    frontend.createTable(TableName.fromThrift(params.getTable_name()),
-        params.getColumns(), params.getPartition_columns(), params.getOwner(),
-        params.isIs_external(), params.getComment(),
-        RowFormat.fromThrift(params.getRow_format()),
-        FileFormat.fromThrift(params.getFile_format()),
-        params.getLocation(), params.isIf_not_exists());
+    frontend.getDdlExecutor().createTable(params);
+  }
+
+  public void createView(byte[] thriftCreateViewParams)
+      throws ImpalaException, MetaException, NoSuchObjectException,
+      org.apache.thrift.TException, AlreadyExistsException,
+      InvalidObjectException {
+    TCreateOrAlterViewParams params = new TCreateOrAlterViewParams();
+    deserializeThrift(params, thriftCreateViewParams);
+    frontend.getDdlExecutor().createView(params);
   }
 
   public void createTableLike(byte[] thriftCreateTableLikeParams)
@@ -230,18 +209,7 @@ public class JniFrontend {
       TableLoadingException {
     TCreateTableLikeParams params = new TCreateTableLikeParams();
     deserializeThrift(params, thriftCreateTableLikeParams);
-    FileFormat fileFormat = null;
-    if (params.isSetFile_format()) {
-      fileFormat = FileFormat.fromThrift(params.getFile_format());
-    }
-    String comment = null;
-    if (params.isSetComment()) {
-      comment = params.getComment();
-    }
-    frontend.createTableLike(TableName.fromThrift(params.getTable_name()),
-        TableName.fromThrift(params.getSrc_table_name()), params.getOwner(),
-        params.isIs_external(), comment, fileFormat, params.getLocation(),
-        params.isIf_not_exists());
+    frontend.getDdlExecutor().createTableLike(params);
   }
 
   public void dropDatabase(byte[] thriftDropDbParams)
@@ -250,17 +218,16 @@ public class JniFrontend {
       InvalidObjectException {
     TDropDbParams params = new TDropDbParams();
     deserializeThrift(params, thriftDropDbParams);
-    frontend.dropDatabase(params.getDb(), params.isIf_exists());
+    frontend.getDdlExecutor().dropDatabase(params);
   }
 
-  public void dropTable(byte[] thriftDropTableParams)
+  public void dropTableOrView(byte[] thriftDropTableObjectParams)
       throws ImpalaException, MetaException, NoSuchObjectException,
       org.apache.thrift.TException, AlreadyExistsException, InvalidOperationException,
       InvalidObjectException {
-    TDropTableParams params = new TDropTableParams();
-    deserializeThrift(params, thriftDropTableParams);
-    frontend.dropTable(TableName.fromThrift(params.getTable_name()),
-        params.isIf_exists());
+    TDropTableOrViewParams params = new TDropTableOrViewParams();
+    deserializeThrift(params, thriftDropTableObjectParams);
+    frontend.getDdlExecutor().dropTableOrView(params);
   }
 
   /**
@@ -295,7 +262,12 @@ public class JniFrontend {
   public byte[] getTableNames(byte[] thriftGetTablesParams) throws ImpalaException {
     TGetTablesParams params = new TGetTablesParams();
     deserializeThrift(params, thriftGetTablesParams);
-    List<String> tables = frontend.getTableNames(params.db, params.pattern);
+    // If the session was not set it indicates this is an internal Impala call.
+    User user = params.isSetSession() ?
+        new User(params.getSession().getUser()) : ImpalaInternalAdminUser.getInstance();
+
+    Preconditions.checkState(!params.isSetSession() || user != null );
+    List<String> tables = frontend.getTableNames(params.db, params.pattern, user);
 
     TGetTablesResult result = new TGetTablesResult();
     result.setTables(tables);
@@ -317,7 +289,10 @@ public class JniFrontend {
   public byte[] getDbNames(byte[] thriftGetTablesParams) throws ImpalaException {
     TGetDbsParams params = new TGetDbsParams();
     deserializeThrift(params, thriftGetTablesParams);
-    List<String> dbs = frontend.getDbNames(params.pattern);
+    // If the session was not set it indicates this is an internal Impala call.
+    User user = params.isSetSession() ?
+        new User(params.getSession().getUser()) : ImpalaInternalAdminUser.getInstance();
+    List<String> dbs = frontend.getDbNames(params.pattern, user);
 
     TGetDbsResult result = new TGetDbsResult();
     result.setDbs(dbs);
@@ -339,8 +314,9 @@ public class JniFrontend {
   public byte[] describeTable(byte[] thriftDescribeTableParams) throws ImpalaException {
     TDescribeTableParams params = new TDescribeTableParams();
     deserializeThrift(params, thriftDescribeTableParams);
-    TDescribeTableResult result = new TDescribeTableResult();
-    result.setColumns(frontend.describeTable(params.getDb(), params.getTable_name()));
+
+    TDescribeTableResult result = frontend.describeTable(
+        params.getDb(), params.getTable_name(), params.getOutput_style());
 
     TSerializer serializer = new TSerializer(protocolFactory);
     try {
@@ -403,15 +379,6 @@ public class JniFrontend {
     return output.toString();
   }
 
-  /**
-   * Returns a string representation of a config value. If the config
-   * can't be found, the empty string is returned. (This method is
-   * called from JNI, and so NULL handling is easier to avoid.)
-   */
-  public String getHadoopConfigValue(String confName) {
-    return CONF.get(confName, "");
-  }
-
   public class CdhVersion implements Comparable<CdhVersion> {
     private final int major;
     private final int minor;
@@ -442,14 +409,16 @@ public class JniFrontend {
   /**
    * Returns an error string describing all configuration issues. If no config issues are
    * found, returns an empty string.
-   * Checks are run only if Impala can determine that it is running on CDH.
+   * Short circuit read checks and block location tracking checks are run only if Impala
+   * can determine that it is running on CDH.
    */
-  public String checkHadoopConfig() {
+  public String checkConfiguration() {
     CdhVersion guessedCdhVersion = guessCdhVersionFromNnWebUi();
     CdhVersion cdh41 = new CdhVersion("4.1");
     CdhVersion cdh42 = new CdhVersion("4.2");
     StringBuilder output = new StringBuilder();
 
+    output.append(checkLogFilePermission());
     output.append(checkFileSystem(CONF));
 
     if (guessedCdhVersion == null) {
@@ -469,6 +438,28 @@ public class JniFrontend {
     output.append(checkBlockLocationTracking(CONF));
 
     return output.toString();
+  }
+
+  /**
+   * Returns an empty string if Impala has permission to write to FE log files. If not,
+   * returns an error string describing the issues.
+   */
+  private String checkLogFilePermission() {
+    org.apache.log4j.Logger l4jRootLogger = org.apache.log4j.Logger.getRootLogger();
+    Enumeration appenders = l4jRootLogger.getAllAppenders();
+    while (appenders.hasMoreElements()) {
+      Appender appender = (Appender) appenders.nextElement();
+      if (appender instanceof FileAppender) {
+        if (((FileAppender) appender).getFile() == null) {
+          // If Impala does not have permission to write to the log file, the
+          // FileAppender will fail to initialize and logFile will be null.
+          // Unfortunately, we can't get the log file name here.
+          return "Impala does not have permission to write to the log file specified " +
+              "in log4j.properties.";
+        }
+      }
+    }
+    return "";
   }
 
   /**
@@ -706,15 +697,15 @@ public class JniFrontend {
 
   /**
    * Return an empty string if the FileSystem configured in CONF refers to a
-   * DistributedFileSystem (the only one supported by Impala). Otherwise, return an error
-   * string describing the issues.
+   * DistributedFileSystem (the only one supported by Impala) and Impala can list the root
+   * directory "/". Otherwise, return an error string describing the issues.
    */
   private String checkFileSystem(Configuration conf) {
     try {
       FileSystem fs = FileSystem.get(CONF);
       if (!(fs instanceof DistributedFileSystem)) {
         return "Unsupported file system. Impala only supports DistributedFileSystem " +
-        		"but the " + fs.getClass().getSimpleName() + " was found. " +
+            "but the configured filesystem is: " + fs.getClass().getSimpleName() + "." +
             CommonConfigurationKeysPublic.FS_DEFAULT_NAME_KEY +
             "(" + CONF.get(CommonConfigurationKeysPublic.FS_DEFAULT_NAME_KEY) + ")" +
             " might be set incorrectly";
@@ -722,14 +713,21 @@ public class JniFrontend {
     } catch (IOException e) {
       return "couldn't retrieve FileSystem:\n" + e.getMessage();
     }
+
+    try {
+      FileSystemUtil.getTotalNumVisibleFiles(new Path("/"));
+    } catch (IOException e) {
+      return "Could not read the HDFS root directory at " +
+          CONF.get(CommonConfigurationKeysPublic.FS_DEFAULT_NAME_KEY) +
+          ". Error was: \n" + e.getMessage();
+    }
     return "";
   }
 
-  public void resetTable(String dbName, String tableName) throws ImpalaException {
-    frontend.resetTable(dbName, tableName);
-  }
-
-  public void resetCatalog() {
-    frontend.resetCatalog();
+  public void resetMetadata(byte[] thriftResetMetadataRequest)
+      throws ImpalaException {
+    TResetMetadataParams request = new TResetMetadataParams();
+    deserializeThrift(request, thriftResetMetadataRequest);
+    frontend.execResetMetadata(request);
   }
 }

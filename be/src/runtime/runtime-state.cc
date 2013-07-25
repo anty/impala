@@ -46,23 +46,24 @@ namespace impala {
 
 RuntimeState::RuntimeState(
     const TUniqueId& fragment_instance_id, const TQueryOptions& query_options,
-    const string& now, ExecEnv* exec_env)
+    const string& now, const string& user, ExecEnv* exec_env)
   : obj_pool_(new ObjectPool()),
     data_stream_recvrs_pool_(new ObjectPool()),
     unreported_error_idx_(0),
     profile_(obj_pool_.get(), "Fragment " + PrintId(fragment_instance_id)),
-    fragment_mem_limit_(NULL),
+    query_mem_limit_(NULL),
     is_cancelled_(false) {
-  Status status = Init(fragment_instance_id, query_options, now, exec_env);
+  Status status = Init(fragment_instance_id, query_options, now, user, exec_env);
   DCHECK(status.ok());
 }
 
-RuntimeState::RuntimeState(const std::string& now)
+RuntimeState::RuntimeState(const string& now, const string& user)
   : obj_pool_(new ObjectPool()),
     data_stream_recvrs_pool_(new ObjectPool()),
     unreported_error_idx_(0),
+    user_(user),
     profile_(obj_pool_.get(), "<unnamed>"),
-    fragment_mem_limit_(NULL) {
+    query_mem_limit_(NULL) {
   query_options_.batch_size = DEFAULT_BATCH_SIZE;
   now_.reset(new TimestampValue(now.c_str(), now.size()));
 }
@@ -72,10 +73,11 @@ RuntimeState::~RuntimeState() {
 
 Status RuntimeState::Init(
     const TUniqueId& fragment_instance_id, const TQueryOptions& query_options,
-    const string& now, ExecEnv* exec_env) {
+    const string& now, const std::string& user, ExecEnv* exec_env) {
   fragment_instance_id_ = fragment_instance_id;
   query_options_ = query_options;
   now_.reset(new TimestampValue(now.c_str(), now.size()));
+  user_ = user;
   exec_env_ = exec_env;
   if (!query_options.disable_codegen) {
     RETURN_IF_ERROR(CreateCodegen());
@@ -94,9 +96,6 @@ Status RuntimeState::Init(
     // TODO: how to tune this?
     query_options_.max_io_buffers = 5 * DiskInfo::num_disks();
   }
-  if (query_options_.num_scanner_threads <= 0) {
-    query_options_.num_scanner_threads = DiskIoMgr::default_parallel_scan_ranges();
-  }
 
   // Register with the thread mgr 
   if (exec_env != NULL) {
@@ -105,7 +104,6 @@ Status RuntimeState::Init(
   }
   
   DCHECK_GT(query_options_.max_io_buffers, 0);
-  DCHECK_GT(query_options_.num_scanner_threads, 0);
   return Status::OK;
 }
 

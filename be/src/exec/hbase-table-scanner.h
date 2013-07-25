@@ -28,11 +28,30 @@
 namespace impala {
 
 class TupleDescriptor;
+class Tuple;
 class RuntimeState;
 class MemPool;
 class Status;
+class HBaseScanNode;
 
 // JNI wrapper class implementing minimal functionality for scanning an HBase table.
+// Caching behavior is tuned by setting hbase.client.Scan.setCaching() and
+// hbase.client.setCacheBlocks().
+//
+// hbase.client.setCacheBlocks() is controlled by query option hbase_cache_blocks. When
+// set to true, HBase region server will cache the blocks. Subsequent retrieval of the
+// same data will be faster. If the table is large and the query is doing big scan, it
+// should be set to false to avoid polluting the cache in the hbase region server. On the
+// other hand, if the table is small and will be used several time, set it to true
+// to improve query performance.
+//
+// hbase.client.Scan.setCaching() is DEFAULT_ROWS_CACHED by default. This value controls
+// the number of rows batched together when fetching from a HBase region server. Having a
+// high value will put more memory pressure on the HBase region server and having a small
+// value will cause extra round trips to the HBase region server. This value can
+// be overridden by the query option hbase_caching. FE will also suggest a max value such
+// that it won't put too much memory pressure on the region server.
+
 // Note: When none of the requested family/qualifiers exist in a particular row,
 // HBase will not return the row at all, leading to "missing" NULL values.
 // TODO: Related to filtering, there is a special filter that allows only selecting the
@@ -46,7 +65,7 @@ class HBaseTableScanner {
   // Initialize all members to NULL, except ScanNode and HTable cache
   // scan_node is the enclosing hbase scan node and its performance counter will be
   // updated.
-  HBaseTableScanner(ScanNode* scan_node, HBaseTableFactory* htable_factory,
+  HBaseTableScanner(HBaseScanNode* scan_node, HBaseTableFactory* htable_factory,
                     RuntimeState* state);
 
   // JNI setup. Create global references to classes,
@@ -91,11 +110,22 @@ class HBaseTableScanner {
   // Get the current HBase row key.
   Status GetRowKey(JNIEnv* env, void** key, int* key_length);
 
+  // Write the current HBase row key into the tuple slot.
+  // This is used for retrieving binary encoded data directly into the tuple.
+  Status GetRowKey(JNIEnv* env, const SlotDescriptor* slot_desc, Tuple* tuple);
+
   // Used to fetch HBase values in order of family/qualifier.
   // Fetch the next value matching family and qualifier into value/value_length.
   // If there is no match, value is set to NULL and value_length to 0.
   Status GetValue(JNIEnv* env, const std::string& family, const std::string& qualifier,
       void** value, int* value_length);
+
+  // Used to fetch HBase values in order of family/qualifier.
+  // Fetch the next value matching family and qualifier into the tuple slot.
+  // If there is no match, the tuple slot is set to null.
+  // This is used for retrieving binary encoded data directly into the tuple.
+  Status GetValue(JNIEnv* env, const std::string& family, const std::string& qualifier,
+      const SlotDescriptor* slot_desc, Tuple* tuple);
 
   // Close HTable and ResultScanner.
   void Close(JNIEnv* env);
@@ -107,8 +137,8 @@ class HBaseTableScanner {
  private:
   static const int DEFAULT_ROWS_CACHED = 1024;
 
-  // The enclosing ScanNode; it is used to update performance counters.
-  ScanNode* scan_node_;
+  // The enclosing HBaseScanNode.
+  HBaseScanNode* scan_node_;
 
   // Global class references created with JniUtil. Cleanup is done in JniUtil::Cleanup().
   static jclass scan_cl_;
@@ -125,6 +155,7 @@ class HBaseTableScanner {
   static jmethodID scan_ctor_;
   static jmethodID scan_set_max_versions_id_;
   static jmethodID scan_set_caching_id_;
+  static jmethodID scan_set_cache_blocks_id_;
   static jmethodID scan_add_column_id_;
   static jmethodID scan_set_filter_id_;
   static jmethodID scan_set_start_row_id_;
@@ -208,6 +239,9 @@ class HBaseTableScanner {
   // Set in the HBase call Scan.setCaching();
   int rows_cached_;
 
+  // True if the scanner should set Scan.setCacheBlocks to true.
+  bool cache_blocks_;
+
   // HBase specific counters
   RuntimeProfile::Counter* scan_setup_timer_;
 
@@ -226,6 +260,20 @@ class HBaseTableScanner {
 
   // Initialize the scan to the given range
   Status InitScanRange(JNIEnv* env, const ScanRange& scan_range);
+
+  // Return the row key length and row key offset from buffer_
+  inline Status GetRowKeyLengthAndOffSet(JNIEnv* env, int* length, int* offset);
+
+  // Return the column value length and offset for the given column family name and
+  // qualifier. If there's no match for the family and qualifier, is_null is set to true.
+  inline Status GetValueLengthAndOffset(JNIEnv* env, const std::string& family,
+      const std::string& qualifier, int* length, int* offset, bool* is_null);
+
+  // Write to a tuple slot with the given hbase binary formatted data, which is in
+  // big endian.
+  // Only boolean, tinyint, smallint, int, bigint, float and double should have binary
+  // formatted data.
+  inline void WriteTupleSlot(const SlotDescriptor* slot_desc, Tuple* tuple, void* data);
 };
 
 }  // namespace impala
