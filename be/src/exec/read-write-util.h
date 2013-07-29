@@ -108,7 +108,7 @@ inline uint32_t ReadWriteUtil::GetInt(const uint8_t* buf) {
 }
 
 template<>
-inline int64_t ReadWriteUtil::GetLongInt(const uint8_t* buf) {
+inline int64_t ReadWriteUtil::GetInt(const uint8_t* buf) {
   uint64_t upper_half = GetInt<uint32_t>(buf);
   uint64_t lower_half = GetInt<uint32_t>(buf + 4);
   return lower_half | upper_half << 32;

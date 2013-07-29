@@ -65,9 +65,9 @@ Status FixedFileTrailer::SetDataFromBuffer(uint8_t* buffer, int len,
 
     trailer_ptr += sizeof(TRAILER_BLOCK_TYPE);
 
-    trailer.file_info_offset_ = ReadWriteUtil::GetLongInt(trailer_ptr);
+    trailer.file_info_offset_ = ReadWriteUtil::GetInt(trailer_ptr);
     trailer_ptr += sizeof(int64_t);
-    trailer.load_on_open_data_offset_ = ReadWriteUtil::GetLongInt(trailer_ptr);
+    trailer.load_on_open_data_offset_ = ReadWriteUtil::GetInt(trailer_ptr);
     trailer_ptr += sizeof(int64_t);
     trailer.data_index_count_ = ReadWriteUtil::GetInt(trailer_ptr);
     trailer_ptr += sizeof(int32_t);
@@ -78,7 +78,7 @@ Status FixedFileTrailer::SetDataFromBuffer(uint8_t* buffer, int len,
     }
     else
     {
-        trailer.uncompressed_data_index_size = ReadWriteUtil::GetLongInt(
+        trailer.uncompressed_data_index_size = ReadWriteUtil::GetInt(
                 trailer_ptr);
         trailer_ptr +=  sizeof(int64_t);
     }
@@ -86,7 +86,7 @@ Status FixedFileTrailer::SetDataFromBuffer(uint8_t* buffer, int len,
     trailer.meta_index_count_ = ReadWriteUtil::GetInt(trailer_ptr);
     trailer_ptr += sizeof(int32_t);
 
-    trailer.total_uncompressed_bytes_ = ReadWriteUtil::GetLongInt(trailer_ptr);
+    trailer.total_uncompressed_bytes_ = ReadWriteUtil::GetInt(trailer_ptr);
     trailer_ptr += sizeof(int64_t);
 
     if (trailer.major_version_ == 1)
@@ -96,7 +96,7 @@ Status FixedFileTrailer::SetDataFromBuffer(uint8_t* buffer, int len,
     }
     else
     {
-        trailer.entry_count_ = ReadWriteUtil::GetLongInt(trailer_ptr);
+        trailer.entry_count_ = ReadWriteUtil::GetInt(trailer_ptr);
         trailer_ptr += sizeof(int64_t);
     }
 
@@ -108,10 +108,10 @@ Status FixedFileTrailer::SetDataFromBuffer(uint8_t* buffer, int len,
         trailer.num_data_index_levels_ = ReadWriteUtil::GetInt(trailer_ptr);
         trailer_ptr +=  sizeof(int32_t);
 
-        trailer.first_data_block_offset_ = ReadWriteUtil::GetLongInt(trailer_ptr);
+        trailer.first_data_block_offset_ = ReadWriteUtil::GetInt(trailer_ptr);
         trailer_ptr += sizeof(int64_t);
 
-        trailer.last_data_block_offset_ = ReadWriteUtil::GetLongInt(trailer_ptr);
+        trailer.last_data_block_offset_ = ReadWriteUtil::GetInt(trailer_ptr);
         trailer_ptr += sizeof(int64_t);
 
         uint8_t* end_comparator_ptr = trailer_ptr + MAX_COMPARATOR_NAME_LENGTH;

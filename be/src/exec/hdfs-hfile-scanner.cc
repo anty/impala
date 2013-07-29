@@ -200,7 +200,7 @@ bool LazyBinaryDeserializer::Write_Field(MemPool* pool,Tuple*tuple,uint8_t** dat
     {
         if(slot)
         {
-            int64_t val = ReadWriteUtil::GetLongInt(*data);
+            int64_t val = ReadWriteUtil::GetInt(*data);
             *reinterpret_cast<double*>( slot) = *(reinterpret_cast<double*>(&val));
         }
         *data+=8;
@@ -409,7 +409,7 @@ bool BinarySortableDeserializer::Write_Field(MemPool * pool, Tuple * tuple, uint
     case TYPE_DOUBLE:
         if(slot)
         {
-            int64_t value = ReadWriteUtil::GetLongInt(*data);
+            int64_t value = ReadWriteUtil::GetInt(*data);
             if((value &(static_cast<int64_t>(1)<<63)) ==0 )
             {
                 value = ~value;
