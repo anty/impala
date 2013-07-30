@@ -561,7 +561,7 @@ private:
 
 impala::HdfsHFileScanner::HdfsHFileScanner(HdfsScanNode* scan_node, RuntimeState* state) :
     HdfsScanner(scan_node, state),byte_buffer_ptr_(NULL),byte_buffer_end_(NULL),num_key_cols_(-1),only_parsing_trailer_(false),
-    decompressed_data_pool_(new MemPool()),read_block_header_(false),block_buffer_len_(0)
+    decompressed_data_pool_(new MemPool(scan_node->runtime_state()->mem_limits())),read_block_header_(false),block_buffer_len_(0)
 {
 }
 
