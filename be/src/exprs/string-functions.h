@@ -52,6 +52,7 @@ class StringFunctions {
   static void* ConcatWs(Expr* e, TupleRow* row);
   static void* FindInSet(Expr* e, TupleRow* row);
   static void* ParseUrl(Expr* e, TupleRow* row);
+  static void* NormalizeUrl(Expr* e, TupleRow* row);
   static void* ParseUrlKey(Expr* e, TupleRow* row);
 };
 

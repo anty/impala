@@ -21,6 +21,7 @@
 #include "runtime/string-value.inline.h"
 #include "runtime/tuple-row.h"
 #include "util/url-parser.h"
+#include "util/url-normalizer.h"
 
 using namespace std;
 using namespace boost;
@@ -612,6 +613,21 @@ void* StringFunctions::ParseUrlKey(Expr* e, TupleRow* row) {
     return NULL;
   }
   return &e->result_.string_val;
+}
+
+void* StringFunctions::NormalizeUrl(Expr * e, TupleRow * row)
+{
+    DCHECK_EQ(e->GetNumChildren(), 1);
+    StringValue* url = reinterpret_cast<StringValue*>(e->children()[0]->GetValue(row));
+   
+    if (url == NULL) return NULL;
+  
+    if (!UrlNormalizer::NormalizeUrl(url, &e->result_.string_val))
+    {
+        // url is malformed, or url_part is invalid.
+        return NULL;
+    }
+    return &e->result_.string_val;
 }
 
 // Explicit template instantiation is required for proper linking. These functions

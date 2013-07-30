@@ -144,6 +144,7 @@ functions = [
         'StringFunctions::ConcatWs', ['concat_ws']],
   ['String_Find_In_Set', 'INT', ['STRING', 'STRING'], \
         'StringFunctions::FindInSet', ['find_in_set']],
+  ['String_Normalize_Url','STRING',['STRING'],'StringFunctions::NormalizeUrl',['normalize_url']],
   ['String_Parse_Url', 'STRING', ['STRING', 'STRING'], \
         'StringFunctions::ParseUrl', ['parse_url']],
   ['String_Parse_Url', 'STRING', ['STRING', 'STRING', 'STRING'], \
