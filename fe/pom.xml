@@ -105,6 +105,23 @@
     </dependency>
 
     <dependency>
+      <groupId>org.apache.hbase</groupId>
+      <artifactId>hbase</artifactId>
+      <version>${hbase.version}</version>
+      <scope>system</scope>
+      <systemPath>${project.basedir}/hbase-0.94.6-cdh4.3.0.jar</systemPath>
+    </dependency>
+
+    <dependency>
+      <groupId>com.hanborq</groupId>
+      <artifactId>hugetable</artifactId>
+      <version>5.0-130517</version>
+      <scope>system</scope>
+      <systemPath>${project.basedir}/hugetable-5.0-130517.jar</systemPath>
+    </dependency>
+
+
+    <dependency>
       <groupId>org.apache.shiro</groupId>
       <artifactId>shiro-core</artifactId>
       <version>1.2.1</version>
