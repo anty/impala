@@ -727,7 +727,7 @@ Status HdfsHFileScanner::ProcessSplitInternal()
 
         for(int i = 0; i < num_rows; i++)
         {
-            InitTuple(context_->template_tuple(), tuple);
+            InitTuple(template_tuple_, tuple);
             if(!WriteTuple(pool, tuple))
             {
                 CommitRows(num_to_commit);
