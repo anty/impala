@@ -145,7 +145,7 @@ bool LazyBinaryDeserializer::Write_Field(MemPool* pool,Tuple*tuple,uint8_t** dat
 
         if(slot)
         {
-            *reinterpret_cast<int8_t*>(slot) =ReadWriteUtil::GetSmallInt(*data);
+            *reinterpret_cast<int8_t*>(slot) =ReadWriteUtil::GetInt<uint16_t>(*data);
         }
 
         *data+=2;
@@ -552,7 +552,7 @@ private:
         int8_t vlong_len = **byte_buffer_ptr;
         *byte_buffer_ptr+=ReadWriteUtil::DecodeVIntSize(vlong_len);
         //adjust key_start_ptr_ to point to row key start position.
-        *key_len =   ReadWriteUtil::GetSmallInt(*key_start_ptr);
+        *key_len =   ReadWriteUtil::GetInt<uint16_t>(*key_start_ptr);
         *key_start_ptr+=2;
     }
     BinarySortableDeserializer key_deserializer_;
