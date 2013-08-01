@@ -3,31 +3,18 @@
 this=${BASH_SOURCE-$0}
 bin=`dirname $this`
 bin=`cd $bin;pwd -P`
+
 . $bin/impala-config.sh
+. $bin/impala-args.sh
+#get arguments
 
-remote_cmd="cd $IMPALA_HOME;$bin/impala-daemon.sh stop impalaserver"
+COMMAND=$1
+shift
 
-echo "#$remote_cmd#"
-#start statestore
+if [ "x$IMPALA_BUILD_TYPE" = "x" ];then
 
+   echo "built type must be sepcified in impala-args.sh"
+   exit 1
+fi
 
-#start backends
-
-
-for backend in `cat "$bin/backends"`; do
-  if ${HBASE_SLAVE_PARALLEL:-true}; then 
-    ssh  $backend "$remote_cmd" \
-      2>&1 | sed "s/^/$backend: /" &
-  else # run each command serially 
-    ssh  $backend $"${remote_cmd// /\\ }" \
-      2>&1 | sed "s/^/$backend: /"
-  fi
-  if [ "$HBASE_SLAVE_SLEEP" != "" ]; then
-    sleep $HBASE_SLAVE_SLEEP
-  fi
-done
-
-
-
-
-wait
+nohup $IMPALA_HOME/be/build/$IMPALA_BUILD_TYPE/statestore/statestored >statestore-$USER.log 2>&1 &

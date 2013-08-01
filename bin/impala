@@ -4,6 +4,7 @@ usage="Usage: impala <command> \
        Where <command> an option from one of these categories:\
        statestore     run the state store\
        impalaserver   run the impala backend server\
+       classpath      print the classpath for backend\
 "
 
 this=${BASH_SOURCE-$0}
@@ -24,7 +25,6 @@ if [ "x$IMPALA_BUILD_TYPE" = "x" ];then
    exit 1
 fi
   
-
 if [ "$COMMAND" = "statestore" ];then
 
   exec $IMPALA_HOME/be/$IMPALA_BUILD_TYPE/statestore/statestored $IMPALA_STATESTORE_ARGS
@@ -32,6 +32,10 @@ if [ "$COMMAND" = "statestore" ];then
 elif [ "$COMMAND" = "impalaserver" ];then
 
   exec $IMPALA_HOME/be/build/${IMPALA_BUILD_TYPE}/service/impalad $IMPALA_SERVER_ARGS
+
+elif [ "$COMMAND" = "CLASSPATH" ] || [ "$COMMAND" = "classpath" ];then
+
+  echo "$CLASSPATH"
 
 else
   echo "unrecognized command $COMMAND "

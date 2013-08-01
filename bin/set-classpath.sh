@@ -19,6 +19,13 @@
 # explicitly to the CLASSPATH.
 
 CLASSPATH=\
+$HADOOP_HOME/etc/hadoop:\
+$HBASE_HOME/conf:\
+$HIVE_HOME/conf:\
+$HBASE_HOME/hbase-0.94.6-cdh4.3.0.jar:\
+/home/mpp/ht5install/hugetable/lib/hugetable-core-5.0-130609.jar:\
+/home/mpp/ht5install/hugetable/lib/guava-14.0.jar:\
+$IMPALA_HOME/fe/target/impala-frontend-0.1-SNAPSHOT.jar
 $IMPALA_HOME/fe/src/test/resources:\
 $IMPALA_HOME/fe/target/classes:\
 $IMPALA_HOME/fe/target/dependency:\

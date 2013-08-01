@@ -17,7 +17,13 @@
 # -build_type parameter can be passed to determine the build type to use for the
 # impalad instance.
 
+this=${BASH_SOURCE-$0}
+bin=`dirname $this`
+bin=`cd $bin;pwd -P`
 
+. $bin/impala-config.sh
+
+. ${IMPALA_HOME}/bin/set-classpath.sh
 BUILD_TYPE=debug
 IMPALAD_ARGS=""
 CLASSPATH_PREFIX=""
