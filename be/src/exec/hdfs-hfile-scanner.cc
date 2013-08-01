@@ -173,7 +173,7 @@ bool LazyBinaryDeserializer::Write_Field(MemPool* pool,Tuple*tuple,uint8_t** dat
 
         if(slot)
         {
-            int32_t val = ReadWriteUtil::GetInt(*data);
+            uint32_t val = ReadWriteUtil::GetInt<uint32_t>(*data);
 
             *reinterpret_cast<float*>(slot) =*(reinterpret_cast<float*>(&val));
         }
@@ -200,7 +200,7 @@ bool LazyBinaryDeserializer::Write_Field(MemPool* pool,Tuple*tuple,uint8_t** dat
     {
         if(slot)
         {
-            int64_t val = ReadWriteUtil::GetInt(*data);
+            int64_t val = ReadWriteUtil::GetInt<int64_t>(*data);
             *reinterpret_cast<double*>( slot) = *(reinterpret_cast<double*>(&val));
         }
         *data+=8;
@@ -229,7 +229,7 @@ bool LazyBinaryDeserializer::Write_Field(MemPool* pool,Tuple*tuple,uint8_t** dat
     }
     case TYPE_TIMESTAMP:
     {
-        int32_t tmp =  ReadWriteUtil::GetInt(*data);
+        uint32_t tmp =  ReadWriteUtil::GetInt<uint32_t>(*data);
         *data+=4;
         bool has_decimal = tmp & 0x80000000;
         int32_t time = tmp & 0x7FFFFFFF;
@@ -392,7 +392,7 @@ bool BinarySortableDeserializer::Write_Field(MemPool * pool, Tuple * tuple, uint
 
         if(slot)
         {
-            int32_t value = ReadWriteUtil::GetInt(*data);
+            int32_t value = ReadWriteUtil::GetInt<uint32_t>(*data);
             if((value & (1<<31)) == 0)
             {
                 value = ~value;
@@ -409,7 +409,7 @@ bool BinarySortableDeserializer::Write_Field(MemPool * pool, Tuple * tuple, uint
     case TYPE_DOUBLE:
         if(slot)
         {
-            int64_t value = ReadWriteUtil::GetInt(*data);
+            int64_t value = ReadWriteUtil::GetInt<int64_t>(*data);
             if((value &(static_cast<int64_t>(1)<<63)) ==0 )
             {
                 value = ~value;
@@ -480,9 +480,9 @@ bool BinarySortableDeserializer::Write_Field(MemPool * pool, Tuple * tuple, uint
     case TYPE_TIMESTAMP:
     {
         //serialized sortable timestamp always contains both time and fractional part.
-        int32_t time = ReadWriteUtil::GetInt(*data) & 0x7FFFFFFF;
+        int32_t time = ReadWriteUtil::GetInt<uint32_t>(*data) & 0x7FFFFFFF;
         *data+=4;
-        int32_t nano = ReadWriteUtil::GetInt(*data);
+        int32_t nano = ReadWriteUtil::GetInt<uint32_t>(*data);
         *data+=4;
         *reinterpret_cast<TimestampValue*>(slot) = TimestampValue(static_cast<int64_t>(time)
                 ,static_cast<int64_t>(nano));
@@ -540,9 +540,9 @@ public:
 private:
     void Parse_Key_Value(uint8_t** byte_buffer_ptr,uint8_t** key_start_ptr,int* key_len,uint8_t**value_start_ptr,int* value_len)
     {
-        *key_len = ReadWriteUtil::GetInt(*byte_buffer_ptr);
+        *key_len = ReadWriteUtil::GetInt<uint32_t>(*byte_buffer_ptr);
         *byte_buffer_ptr+=4;
-        *value_len = ReadWriteUtil::GetInt(*byte_buffer_ptr);
+        *value_len = ReadWriteUtil::GetInt<uint32_t>(*byte_buffer_ptr);
         *byte_buffer_ptr+=4;
         *key_start_ptr= *byte_buffer_ptr;
         *byte_buffer_ptr+=*key_len;

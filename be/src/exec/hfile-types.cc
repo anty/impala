@@ -32,7 +32,7 @@ int FixedFileTrailer::GetTrailerSize(int version)
 Status FixedFileTrailer::SetDataFromBuffer(uint8_t* buffer, int len,
         FixedFileTrailer& trailer)
 {
-    int32_t ver = ReadWriteUtil::GetInt(buffer + len - sizeof(int32_t));
+    int32_t ver = ReadWriteUtil::GetInt<uint32_t>(buffer + len - sizeof(int32_t));
     int32_t major_version = ver & 0x00ffffff;
     int32_t minor_version = (ver >>24) & 0xff;
 
@@ -65,11 +65,11 @@ Status FixedFileTrailer::SetDataFromBuffer(uint8_t* buffer, int len,
 
     trailer_ptr += sizeof(TRAILER_BLOCK_TYPE);
 
-    trailer.file_info_offset_ = ReadWriteUtil::GetInt(trailer_ptr);
+    trailer.file_info_offset_ = ReadWriteUtil::GetInt<int64_t>(trailer_ptr);
     trailer_ptr += sizeof(int64_t);
-    trailer.load_on_open_data_offset_ = ReadWriteUtil::GetInt(trailer_ptr);
+    trailer.load_on_open_data_offset_ = ReadWriteUtil::GetInt<int64_t>(trailer_ptr);
     trailer_ptr += sizeof(int64_t);
-    trailer.data_index_count_ = ReadWriteUtil::GetInt(trailer_ptr);
+    trailer.data_index_count_ = ReadWriteUtil::GetInt<uint32_t>(trailer_ptr);
     trailer_ptr += sizeof(int32_t);
 
     if (trailer.major_version_ == 1)
@@ -78,40 +78,40 @@ Status FixedFileTrailer::SetDataFromBuffer(uint8_t* buffer, int len,
     }
     else
     {
-        trailer.uncompressed_data_index_size = ReadWriteUtil::GetInt(
+        trailer.uncompressed_data_index_size = ReadWriteUtil::GetInt<int64_t>(
                 trailer_ptr);
         trailer_ptr +=  sizeof(int64_t);
     }
 
-    trailer.meta_index_count_ = ReadWriteUtil::GetInt(trailer_ptr);
+    trailer.meta_index_count_ = ReadWriteUtil::GetInt<uint32_t>(trailer_ptr);
     trailer_ptr += sizeof(int32_t);
 
-    trailer.total_uncompressed_bytes_ = ReadWriteUtil::GetInt(trailer_ptr);
+    trailer.total_uncompressed_bytes_ = ReadWriteUtil::GetInt<int64_t>(trailer_ptr);
     trailer_ptr += sizeof(int64_t);
 
     if (trailer.major_version_ == 1)
     {
-        trailer.entry_count_ = ReadWriteUtil::GetInt(trailer_ptr);
+        trailer.entry_count_ = ReadWriteUtil::GetInt<int64_t>(trailer_ptr);
         trailer_ptr +=  sizeof(int32_t);
     }
     else
     {
-        trailer.entry_count_ = ReadWriteUtil::GetInt(trailer_ptr);
+        trailer.entry_count_ = ReadWriteUtil::GetInt<int64_t>(trailer_ptr);
         trailer_ptr += sizeof(int64_t);
     }
 
-    trailer.compression_codec_ = ReadWriteUtil::GetInt(trailer_ptr);
+    trailer.compression_codec_ = ReadWriteUtil::GetInt<uint32_t>(trailer_ptr);
     trailer_ptr +=  sizeof(int32_t);
 
     if (trailer.major_version_ > 1)
     {
-        trailer.num_data_index_levels_ = ReadWriteUtil::GetInt(trailer_ptr);
+        trailer.num_data_index_levels_ = ReadWriteUtil::GetInt<uint32_t>(trailer_ptr);
         trailer_ptr +=  sizeof(int32_t);
 
-        trailer.first_data_block_offset_ = ReadWriteUtil::GetInt(trailer_ptr);
+        trailer.first_data_block_offset_ = ReadWriteUtil::GetInt<int64_t>(trailer_ptr);
         trailer_ptr += sizeof(int64_t);
 
-        trailer.last_data_block_offset_ = ReadWriteUtil::GetInt(trailer_ptr);
+        trailer.last_data_block_offset_ = ReadWriteUtil::GetInt<int64_t>(trailer_ptr);
         trailer_ptr += sizeof(int64_t);
 
         uint8_t* end_comparator_ptr = trailer_ptr + MAX_COMPARATOR_NAME_LENGTH;
@@ -140,7 +140,7 @@ Status FixedFileTrailer::SetDataFromBuffer(uint8_t* buffer, int len,
         trailer.header_size_ = HEADER_SIZE_WITH_CHECKSUMS;
     }
 
-    int32_t version = ReadWriteUtil::GetInt(trailer_ptr);
+    int32_t version = ReadWriteUtil::GetInt<uint32_t>(trailer_ptr);
     if (trailer.major_version_ != (version & 0x00ffffff))
     {
         stringstream ss;

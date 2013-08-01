@@ -62,9 +62,9 @@ private:
     {
         block_header_.block_type_= buffer;
         buffer += 8;
-        block_header_.on_disk_size_without_header_= ReadWriteUtil::GetInt(buffer);
+        block_header_.on_disk_size_without_header_= ReadWriteUtil::GetInt<uint32_t><(buffer);
         buffer += 4;
-        block_header_.uncompressed_size_without_header_= ReadWriteUtil::GetInt(buffer);
+        block_header_.uncompressed_size_without_header_= ReadWriteUtil::GetInt<uint32_t>(buffer);
         buffer += 4;
         //skip previous block offset field
         buffer += 8;
@@ -72,9 +72,9 @@ private:
         {
             block_header_.checksum_type_= *buffer;
             buffer++;
-            block_header_.bytes_per_checksum_=ReadWriteUtil::GetInt(buffer);
+            block_header_.bytes_per_checksum_=ReadWriteUtil::GetInt<uint32_t>(buffer);
             buffer+=4;
-            block_header_.on_disk_data_size_with_header_=ReadWriteUtil::GetInt(buffer);
+            block_header_.on_disk_data_size_with_header_=ReadWriteUtil::GetInt<uint32_t>(buffer);
             buffer+=4;
         }
         else
