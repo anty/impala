@@ -886,12 +886,14 @@ Status HdfsHFileScanner::IssueFileRanges(const char* filename)
 
     HdfsFileDesc* file_desc = scan_node_->GetFileDesc(filename);
 
+    vector<DiskIoMgr::ScanRange*> ranges;
     ScanRangeMetadata* metadata =
         reinterpret_cast<ScanRangeMetadata*>(file_desc->splits[0]->meta_data());
 
     DiskIoMgr::ScanRange* range = scan_node_->AllocateScanRange(filename, file_desc->file_length,
                                   trailer_->first_data_block_offset_, metadata->partition_id, -1);
-    scan_node_->AddDiskIoRange(range);
+    ranges.push_back(range);
+    scan_node_->AddDiskIoRanges(ranges);
 
     return Status::OK;
 
@@ -900,6 +902,7 @@ Status HdfsHFileScanner::IssueFileRanges(const char* filename)
 void HdfsHFileScanner::IssueInitialRanges(HdfsScanNode* scan_node,
         const std::vector<HdfsFileDesc*>& files)
 {
+    vector<DiskIoMgr::ScanRange*> ranges;
     for (int i = 0; i < files.size(); ++i)
     {
         for (int j = 0; j < files[i]->splits.size(); ++j)
@@ -923,14 +926,17 @@ void HdfsHFileScanner::IssueInitialRanges(HdfsScanNode* scan_node,
             DCHECK_GT(files[i]->file_length, 0);
             int64_t trailer_start = max(0L,files[i]->file_length - FixedFileTrailer::MAX_TRAILER_SIZE);
 
+
             ScanRangeMetadata* metadata =
                 reinterpret_cast<ScanRangeMetadata*>(files[i]->splits[0]->meta_data());
             DiskIoMgr::ScanRange* footer_range = scan_node->AllocateScanRange(
                     files[i]->filename.c_str(), FixedFileTrailer::MAX_TRAILER_SIZE, trailer_start,
                     metadata->partition_id, files[i]->splits[0]->disk_id());
-            scan_node->AddDiskIoRange(footer_range);
+	      ranges.push_back(footer_range);
         }
     }
+    scan_node->AddDiskIoRanges(ranges);
+
 }
 
 
