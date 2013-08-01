@@ -36,8 +36,8 @@ public:
     static void IssueInitialRanges(HdfsScanNode*,const std::vector<HdfsFileDesc*>& files);
 
     // Implementation of HdfsScanner interface.
-    virtual Status Prepare();
-    virtual Status ProcessSplit(ScannerContext* context);
+    virtual Status Prepare(ScannerContext* context);
+    virtual Status ProcessSplit();
     virtual Status Close();
 
 //	static Status Init();

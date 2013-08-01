@@ -570,10 +570,8 @@ impala::HdfsHFileScanner::~HdfsHFileScanner()
 }
 
 
-Status HdfsHFileScanner::ProcessSplit(ScannerContext* context)
+Status HdfsHFileScanner::ProcessSplit()
 {
-
-    SetContext(context);
 
     HdfsFileDesc* file_desc = scan_node_->GetFileDesc(stream_->filename());
     DCHECK(file_desc != NULL);
@@ -700,14 +698,14 @@ Status HdfsHFileScanner::ProcessTrailer(bool* eosr)
         TupleRow* current_row;
         while(num_tuples > 0)
         {
-            int max_tuples = context_->GetMemory(&pool, &tuple,&current_row);
+            int max_tuples = GetMemory(&pool, &tuple,&current_row);
             max_tuples = min(static_cast<int64_t>(max_tuples), num_tuples);
             num_tuples -= max_tuples;
 
             int num_to_commit = WriteEmptyTuples(context_, current_row,
                                                  max_tuples);
             if (num_to_commit > 0)
-                context_->CommitRows(num_to_commit);
+                CommitRows(num_to_commit);
         }
         *eosr = true;
     }
@@ -724,7 +722,7 @@ Status HdfsHFileScanner::ProcessSplitInternal()
         MemPool* pool;
         Tuple* tuple;
         TupleRow* row;
-        int num_rows = context_->GetMemory(&pool, &tuple, &row);
+        int num_rows = GetMemory(&pool, &tuple, &row);
         int num_to_commit = 0;
 
         for(int i = 0; i < num_rows; i++)
@@ -732,20 +730,20 @@ Status HdfsHFileScanner::ProcessSplitInternal()
             InitTuple(context_->template_tuple(), tuple);
             if(!WriteTuple(pool, tuple))
             {
-                context_->CommitRows(num_to_commit);
+                CommitRows(num_to_commit);
 
                 return parse_status_;
             }
             row->SetTuple(scan_node_->tuple_idx(), tuple);
             if(ExecNode::EvalConjuncts(conjuncts_, num_conjuncts_, row))
             {
-                row = context_->next_row(row);
-                tuple = context_->next_tuple(tuple);
+                row = next_row(row);
+                tuple = next_tuple(tuple);
                 ++num_to_commit;
             }
         }
         if(num_to_commit > 0)
-            context_->CommitRows(num_to_commit);
+            CommitRows(num_to_commit);
     }
 
     if(context_->cancelled())
@@ -764,9 +762,9 @@ Status HdfsHFileScanner::Close()
     return Status::OK;
 }
 
-Status HdfsHFileScanner::Prepare()
+Status HdfsHFileScanner::Prepare(ScannerContext* context)
 {
-    RETURN_IF_ERROR(HdfsScanner::Prepare());
+    RETURN_IF_ERROR(HdfsScanner::Prepare(context));
     const TupleDescriptor* tuple_desc = scan_node_->tuple_desc();
     const HdfsTableDescriptor* hdfs_table = static_cast<const HdfsTableDescriptor*>(tuple_desc->table_desc());
     col_types_ = hdfs_table->col_types();
@@ -801,7 +799,7 @@ Status HdfsHFileScanner::ReadDataBlock()
 
     if(!stream_->compact_data())
     {
-        context_->AcquirePool(decompressed_data_pool_.get());
+        AttachPool(decompressed_data_pool_.get());
         block_buffer_len_ = 0;
     }
 
