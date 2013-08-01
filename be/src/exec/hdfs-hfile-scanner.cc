@@ -4,7 +4,7 @@
  *  Created on: 2013-5-9
  *      Author: Rao
  */
-
+#include "exec/scanner-context.inline.h"
 #include "exec/hdfs-hfile-scanner.h"
 #include "exec/hdfs-scan-node.h"
 #include "exec/read-write-util.h"

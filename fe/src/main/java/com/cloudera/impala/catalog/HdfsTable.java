@@ -543,9 +543,10 @@ public class HdfsTable extends Table {
 
     private HdfsPartition addPartition(StorageDescriptor storageDescriptor,
                                        org.apache.hadoop.hive.metastore.api.Partition msPartition,
-                                       List<LiteralExpr> partitionKeyExprs) throws IOException, InvalidStorageDescriptorException
+                                       List<LiteralExpr> partitionKeyExprs, Map<String, FileDescriptor> oldFileDescMap,
+      List<FileDescriptor> newFileDescs) throws IOException, InvalidStorageDescriptorException
     {
-        return addPartition(null, storageDescriptor, msPartition, partitionKeyExprs);
+        return addPartition(null, storageDescriptor, msPartition, partitionKeyExprs,oldFileDescMap,newFileDescs);
     }
 
 
@@ -622,7 +623,7 @@ public class HdfsTable extends Table {
 
                 for (FileStatus status : splits)
                 {
-                    fileDescriptors.add(new FileDescriptor(status.getPath().toString(), status.getLen()));
+                    fileDescriptors.add(new FileDescriptor(status.getPath().toString(), status.getLen(),status.getModificationTime()));
                 }
 	         //populate row key columns
                 String indexStr = parameters.get(HorizonConstants.HIVE_TABLE_INDEX_INFO_CONF_KEY);
@@ -819,8 +820,8 @@ public class HdfsTable extends Table {
       idToValue.put(partition.getId(), partition.toThrift());
     }
     THdfsTable tHdfsTable = new THdfsTable(hdfsBaseDir,
-        colNames, nullPartitionKeyValue, nullColumnValue, idToValue,colTypes);
-    if(!keyColNames.isEmpty()){
+        colNames, nullPartitionKeyValue, idToValue, nullColumnValue,colTypes);
+    if(!keyColNames.isEmpty())
         tHdfsTable.setKeyColNames(keyColNames);
     if (avroSchema != null) {
       tHdfsTable.setAvroSchema(avroSchema);
