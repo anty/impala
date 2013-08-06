@@ -23,8 +23,8 @@ $HADOOP_HOME/etc/hadoop:\
 $HBASE_HOME/conf:\
 $HIVE_HOME/conf:\
 $HBASE_HOME/hbase-0.94.6-cdh4.3.0.jar:\
-/home/mpp/ht5install/hugetable/lib/hugetable-core-5.0-130609.jar:\
-/home/mpp/ht5install/hugetable/lib/guava-14.0.jar:\
+${HUGETABLE_HOME}/lib/hugetable-core-5.0-130609.jar:\
+${HUGETABLE_HOME}/lib/guava-14.0.jar:\
 $IMPALA_HOME/fe/target/impala-frontend-0.1-SNAPSHOT.jar
 $IMPALA_HOME/fe/src/test/resources:\
 $IMPALA_HOME/fe/target/classes:\
@@ -33,7 +33,14 @@ $IMPALA_HOME/fe/target/test-classes:\
 ${HIVE_HOME}/lib/datanucleus-core-2.0.3.jar:\
 ${HIVE_HOME}/lib/datanucleus-enhancer-2.0.3.jar:\
 ${HIVE_HOME}/lib/datanucleus-rdbms-2.0.3.jar:\
-${HIVE_HOME}/lib/datanucleus-connectionpool-2.0.3.jar:
+${HIVE_HOME}/lib/datanucleus-connectionpool-2.0.3.jar:\
+${CLASSPATH}:
+
+//add hive-related jars which needed by impala frontend  when does range partition prune.
+for jar in `ls ${HIVE_HOME}/lib/*.jar`;do
+    CLASSPATH=${CLASSPATH}:$jar
+done
+
 
 for jar in `ls ${IMPALA_HOME}/fe/target/dependency/*.jar`; do
   CLASSPATH=${CLASSPATH}:$jar
