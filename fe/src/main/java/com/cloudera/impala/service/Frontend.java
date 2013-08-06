@@ -395,6 +395,19 @@ public class Frontend {
       queryExecRequest.addToDest_fragment_idx(idx.intValue());
     }
 
+    //Impala FrontEnd is in form of an embeded JVM in Impala Process.
+    //this Thread is running in native thread which may no get context class loader set.
+    //some class in java need context class loader to load class or resource.
+    //----------------------------------
+    //not very family with interaction between JNI and context class loader.It seems that
+    //only native thread who create embeded JVM  get context class loader set
+    //(set to system class loader/application class loader, pointer to same thing with different name), 
+    //only native thread attach to running  JVM will not get context class loader set.
+    if(Thread.currentThread().getContextClassLoader()==null)
+    {
+	Thread.currentThread().setContextClassLoader(planner.getClass().getClassLoader());
+    }
+     
     // set scan ranges/locations for scan nodes
     LOG.info("get scan range locations");
     for (ScanNode scanNode: scanNodes) {
