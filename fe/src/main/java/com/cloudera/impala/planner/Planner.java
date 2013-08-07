@@ -248,7 +248,7 @@ public class Planner {
           analyzer);
     } else if (root instanceof AggregationNode) {
       result = createAggregationFragment(
-          (AggregationNode) root, childFragments.get(0), fragments);
+          (AggregationNode) root, childFragments.get(0), fragments,analyzer);
     } else if (root instanceof SortNode) {
       result =
           createTopnFragment((SortNode) root, childFragments.get(0), fragments, analyzer);
@@ -583,7 +583,7 @@ public class Planner {
    * for the phase 2 AggregationNode.
    */
   private PlanFragment createAggregationFragment(AggregationNode node,
-      PlanFragment childFragment, ArrayList<PlanFragment> fragments) {
+      PlanFragment childFragment, ArrayList<PlanFragment> fragments,Analyzer analyzer) {
     if (!childFragment.isPartitioned()) {
       // nothing to distribute; do full aggregation directly within childFragment
       childFragment.addPlanRoot(node);
@@ -642,7 +642,14 @@ public class Planner {
 
       // HAVING predicates can only be evaluated after the merge agg step
       node.transferConjuncts(mergeAggNode);
-
+        try
+        {
+            mergeFragment.getPlanRoot().finalize(analyzer);
+        }
+        catch (InternalException e)
+        {
+            throw new RuntimeException("get exception when finalize merge fragment.",e);
+        }
       return mergeFragment;
     }
 
@@ -706,7 +713,14 @@ public class Planner {
             new PlanNodeId(nodeIdGenerator), node.getChild(0), mergeAggInfo);
       mergeFragment.addPlanRoot(mergeAggNode);
     }
-
+  try
+        {
+            mergeFragment.getPlanRoot().finalize(analyzer);
+        }
+        catch (InternalException e)
+        {
+            throw new RuntimeException("get exception when finalize merge fragment.",e);
+        }
     // TODO: transfer having predicates? (aren't they already in the 2nd-phase
     // agg node?)
     return mergeFragment;

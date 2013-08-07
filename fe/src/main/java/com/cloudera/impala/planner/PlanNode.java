@@ -120,6 +120,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     this.cardinality = -1;
     this.compactData = node.compactData;
     this.displayName = displayName;
+    this.numNodes = node.getNumNodes();
   }
 
   public PlanNodeId getId() {
