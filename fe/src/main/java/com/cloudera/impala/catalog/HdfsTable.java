@@ -27,6 +27,8 @@ import java.util.Set;
 import com.google.common.base.Strings;
 import com.hugetable.common.HorizonConstants;
 import com.hugetable.common.TableIndexInfo;
+import com.hugetable.common.TablePartitionInfo;
+
 import com.hugetable.hive.io.HFileLayerInputFormat;
 import com.hugetable.hive.io.HugetableInputFormatProxy;
 import org.apache.commons.codec.binary.Base64;
