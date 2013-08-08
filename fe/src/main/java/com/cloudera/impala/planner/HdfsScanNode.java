@@ -20,7 +20,7 @@ import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.cloudera.impala.analysis.Analyzer;
+import com.cloudera.impala.analysis.*;
 import com.cloudera.impala.analysis.TupleDescriptor;
 import com.cloudera.impala.catalog.HdfsPartition;
 import com.cloudera.impala.catalog.HdfsTable;
@@ -39,11 +39,15 @@ import com.google.common.base.Objects.ToStringHelper;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.hive.ql.exec.FunctionRegistry;
 import org.apache.hadoop.hive.ql.exec.Utilities;
 import org.apache.hadoop.hive.ql.plan.*;
+import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
 import com.hugetable.common.HorizonConstants;
 import com.hugetable.hive.io.HFileLayerInputFormat;
 import com.hugetable.hive.io.HugetableInputFormatProxy;

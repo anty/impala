@@ -125,6 +125,8 @@ public class HdfsTable extends Table {
 
   private static final boolean SUPPORTS_VOLUME_ID;
 
+  private final String rangePartitionColName;
+ 
   static {
     try {
       // call newInstance() instead of using a shared instance from a cache
@@ -265,7 +267,24 @@ public class HdfsTable extends Table {
       String name, String owner) {
     super(id, msTbl, db, name, owner);
     this.partitions = Lists.newArrayList();
+    Map<String, String> parameters = msTbl.getParameters();
+
+    String strPartitionInfo = parameters.get(HorizonConstants.HIVE_TABLE_PARTITION_INFO_CONF_KEY);
+    if (Strings.isNullOrEmpty(strPartitionInfo))
+    {
+         this.rangePartitionColName = null;
+    }
+    else
+    {
+        this.rangePartitionColName = new TablePartitionInfo(strPartitionInfo).getPartitionColumn().toLowerCase();
+    }
   }
+
+  public String getRangePartitionColName()
+    {
+        return rangePartitionColName;
+    }
+
 
   public List<HdfsPartition> getPartitions() {
     return partitions;

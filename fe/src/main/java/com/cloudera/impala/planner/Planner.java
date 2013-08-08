@@ -61,7 +61,7 @@ import com.cloudera.impala.thrift.TQueryOptions;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
-
+import com.google.common.base.Strings;
 
 /**
  * The planner is responsible for turning parse trees into plan fragments that
