@@ -402,6 +402,7 @@ private List<TScanRangeLocations> getScanRangeLocations(long maxScanRangeLength,
             currentOffset += currentLength;
           }
         }
+	return result;
 }
 
   @Override
