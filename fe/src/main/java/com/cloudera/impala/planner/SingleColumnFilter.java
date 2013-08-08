@@ -50,6 +50,19 @@ public class SingleColumnFilter {
     conjuncts.add(conjunct);
   }
 
+//add field inspector method.
+    public List<Expr> getConjuncts()
+    {
+        return this.conjuncts;
+    }
+
+    public SlotDescriptor getSlotDesc()
+    {
+        return this.slotDesc;
+    }
+
+  
+
   /**
    * Determines whether for a given constant expr the filter predicates evaluate to
    * true.

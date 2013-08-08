@@ -1089,6 +1089,7 @@ public class Planner {
     // SingleColumnFilter/ValueRange or will be evaluated directly by the node
     analyzer.markConjunctsAssigned(conjuncts);
     List<SingleColumnFilter> keyFilters = Lists.newArrayList();
+    SingleColumnFilter rangePartitionFilter = null;
     List<ValueRange> keyRanges = Lists.newArrayList();
     // determine scan predicates for clustering cols
     for (int i = 0; i < tblRef.getTable().getNumClusteringCols(); ++i) {
@@ -1114,9 +1115,37 @@ public class Planner {
         }
       }
     }
+        //extract conjunct on range partition column, but don't delete it from conjunct collection on table.
+        if (tblRef.getTable() instanceof HdfsTable)
+        {
+            HdfsTable table = (HdfsTable) tblRef.getTable();
+            String partitionColName = table.getRangePartitionColName();
+            LOG.info("Table " + table.getName() + "'s range partition column is #" + partitionColName + "#");
+            if (!Strings.isNullOrEmpty(partitionColName))
+            {
+                Column col = table.getColumn(partitionColName);
+                SlotDescriptor slotDesc = analyzer.getColumnSlot(tblRef.getDesc(), col);
+                for (Expr e : conjuncts)
+                {
+                    if (e.isBound(slotDesc.getId()))
+                    {
+                        if (rangePartitionFilter == null)
+                        {
+                            rangePartitionFilter = new SingleColumnFilter(slotDesc);
+                        }
+                        rangePartitionFilter.addConjunct(e);
+                    }
+                }
+
+            }
+        }
+
+
+
 
     if (scanNode instanceof HdfsScanNode) {
       ((HdfsScanNode)scanNode).setKeyFilters(keyFilters);
+	   ((HdfsScanNode) scanNode).setRangePartitionFilter(rangePartitionFilter);
     } else {
       ((HBaseScanNode)scanNode).setKeyRanges(keyRanges);
     }

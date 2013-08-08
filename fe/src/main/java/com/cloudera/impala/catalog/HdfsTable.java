@@ -175,9 +175,11 @@ public class HdfsTable extends Table {
   }
 
   /**
+      Change visibility of this method from private to public to be able to invoke from outside.
+      it will be better of to make this method static
    * Populate file block metadata inside each file descriptors.
    */
-  private void loadBlockMd(List<FileDescriptor> fileDescriptors)
+  public void loadBlockMd(List<FileDescriptor> fileDescriptors)
       throws RuntimeException {
     LOG.info("load block md for " + name);
     // Block locations for all the files

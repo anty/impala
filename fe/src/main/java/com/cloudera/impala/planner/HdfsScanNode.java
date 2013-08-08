@@ -39,6 +39,14 @@ import com.google.common.base.Objects.ToStringHelper;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
+import org.apache.hadoop.hbase.HBaseConfiguration;
+import org.apache.hadoop.hbase.util.FSUtils;
+import org.apache.hadoop.hive.ql.exec.FunctionRegistry;
+import org.apache.hadoop.hive.ql.exec.Utilities;
+import org.apache.hadoop.hive.ql.plan.*;
+import com.hugetable.common.HorizonConstants;
+import com.hugetable.hive.io.HFileLayerInputFormat;
+import com.hugetable.hive.io.HugetableInputFormatProxy;
 /**
  * Scan of a single single table. Currently limited to full-table scans.
  * TODO: pass in range restrictions.
@@ -52,6 +60,12 @@ public class HdfsScanNode extends ScanNode {
   private final ArrayList<HdfsPartition> partitions = Lists.newArrayList();
 
   private List<SingleColumnFilter> keyFilters;
+ 
+  //predicates on range partition column
+  private SingleColumnFilter rangePartitionFilter = null;
+  //the corresponding equivalent predicates of rangePartitionFilter in hive form.
+  private ExprNodeDesc rangePartitionFilterExpr = null;
+
 
   // Total number of bytes from partitions
   private long totalBytes = 0;
@@ -63,6 +77,12 @@ public class HdfsScanNode extends ScanNode {
     super(id, desc, "SCAN HDFS");
     this.tbl = tbl;
   }
+
+    public void setRangePartitionFilter(SingleColumnFilter filter)
+    {
+//        Preconditions.checkNotNull(filter);
+        this.rangePartitionFilter = filter;
+    }
 
   public void setKeyFilters(List<SingleColumnFilter> filters) {
     Preconditions.checkNotNull(filters);
@@ -134,6 +154,13 @@ public class HdfsScanNode extends ScanNode {
       if (!hasValidPartitionCardinality) cardinality = tbl.getNumRows();
     }
 
+        // in finalizer, we map rangePartition filter to corresponding representation for hive
+        if (rangePartitionFilter != null)
+        {
+            this.rangePartitionFilterExpr = toHiveExprNodeDesc(rangePartitionFilter);
+        }
+
+  
     Preconditions.checkState(cardinality >= 0 || cardinality == -1);
     if (cardinality > 0) {
       LOG.info("cardinality=" + Long.toString(cardinality) + " sel=" + Double.toString(computeSelectivity()));
@@ -145,6 +172,95 @@ public class HdfsScanNode extends ScanNode {
     numNodes = tbl.getNumNodes();
     LOG.info("finalize HdfsScan: #nodes=" + Integer.toString(numNodes));
   }
+
+   /**
+     * Intend to extract predicates on range partition column to prune partition.
+     * <p/>
+     * Currently the partition pruning procedure is implemented in Hive.However
+     * <p/>
+     * impala and hive don't share frontend,so have to convert predicates from impala form
+     * to hive form, to let predicate pruning works.
+     *
+     * @param filter
+     * @return corresponding ExprNodeDesc for passed in <code>filter</code>
+     */
+    private ExprNodeDesc toHiveExprNodeDesc(SingleColumnFilter filter)
+    {
+        assert filter != null;
+        List<Expr> conjuncts = filter.getConjuncts();
+
+        //range partition column name
+        String colName = filter.getSlotDesc().getColumn().getName();
+        LOG.info("Range Partition column name #" + colName + "#");
+
+        if (conjuncts.size() == 1)
+        {
+            ExprNodeDesc exprNodeDesc = toHiveExprNodeDesc(colName, conjuncts.get(0));
+            LOG.info("Only one conjunct ,and generated hive expr string is " + exprNodeDesc.getExprString());
+            return exprNodeDesc;
+        }
+        else if (conjuncts.size() == 2)
+        {
+            ExprNodeDesc child1 = toHiveExprNodeDesc(colName, conjuncts.get(0));
+            ExprNodeDesc child2 = toHiveExprNodeDesc(colName, conjuncts.get(1));
+            List<ExprNodeDesc> children = Lists.newArrayList();
+            children.add(child1);
+            children.add(child2);
+            ExprNodeGenericFuncDesc exprNodeGenericFuncDesc = new ExprNodeGenericFuncDesc(TypeInfoFactory.booleanTypeInfo,
+                    FunctionRegistry.getFunctionInfo("and").getGenericUDF(), children);
+            LOG.info("There are two conjuncts, and generated hive expr string is " + exprNodeGenericFuncDesc.getExprString());
+            return exprNodeGenericFuncDesc;
+        }
+        else
+        {
+            throw new IllegalArgumentException("range partition filter can't contains more than 2 conjuncts.");
+        }
+    }
+
+    private ExprNodeDesc toHiveExprNodeDesc(String colName, Expr expr)
+    {
+        Preconditions.checkArgument(expr != null);
+        Preconditions.checkState(expr instanceof BinaryPredicate, "Range Partition only support BinaryPredicate");
+
+        BinaryPredicate predicate = (BinaryPredicate) expr;
+        SlotRef lhs = (SlotRef) predicate.getChild(0);
+        //TODO other integer type will OK.
+        IntLiteral rhs = (IntLiteral) predicate.getChild(1);
+
+        //TODO currently only support TYPE int
+        ExprNodeColumnDesc columnDesc = new ExprNodeColumnDesc(
+                TypeInfoFactory.getPrimitiveTypeInfo(lhs.getDesc().getType().toString().toLowerCase()), colName, "", false);
+        ExprNodeConstantDesc constantDesc = new ExprNodeConstantDesc(rhs.getValue());
+        List<ExprNodeDesc> children = Lists.newArrayList();
+        children.add(columnDesc);
+        children.add(constantDesc);
+
+        switch (predicate.getOp())
+        {
+            case EQ:
+                return new ExprNodeGenericFuncDesc(TypeInfoFactory.booleanTypeInfo,
+                        FunctionRegistry.getFunctionInfo("==").getGenericUDF(), children);
+            case NE:
+                return new ExprNodeGenericFuncDesc(TypeInfoFactory.booleanTypeInfo,
+                        FunctionRegistry.getFunctionInfo("!=").getGenericUDF(), children);
+            case LE:
+                return new ExprNodeGenericFuncDesc(TypeInfoFactory.booleanTypeInfo,
+                        FunctionRegistry.getFunctionInfo("<=").getGenericUDF(), children);
+            case GE:
+                return new ExprNodeGenericFuncDesc(TypeInfoFactory.booleanTypeInfo,
+                        FunctionRegistry.getFunctionInfo(">=").getGenericUDF(), children);
+            case LT:
+                return new ExprNodeGenericFuncDesc(TypeInfoFactory.booleanTypeInfo,
+                        FunctionRegistry.getFunctionInfo("<").getGenericUDF(), children);
+            case GT:
+                return new ExprNodeGenericFuncDesc(TypeInfoFactory.booleanTypeInfo,
+                        FunctionRegistry.getFunctionInfo(">").getGenericUDF(), children);
+            default:
+                throw new RuntimeException("range partition filter don't support operation " + predicate.getOp().toString());
+        }
+    }
+
+
 
   @Override
   protected void toThrift(TPlanNode msg) {
@@ -160,9 +276,88 @@ public class HdfsScanNode extends ScanNode {
   @Override
   public List<TScanRangeLocations> getScanRangeLocations(long maxScanRangeLength) {
     List<TScanRangeLocations> result = Lists.newArrayList();
+ /***
+         *  if rangePartitionFiler is not null, indicate this is a hugtable-backed hdfs table and there is predicate on
+         *  range partition column. we does following works:
+         *
+         *  1. use rangePartitionFilter to prune partition.
+         *
+         *  2.  recompute all involving file descritpor,
+         *
+         *  3. and at the same time populate file location in file descriptor.
+         *
+         *  There are two places to load table's data files.
+         *  <ul>
+         *      <li>
+         *            table is loaded first time or be refreshed, which will load all range partition's data file.
+         *      </li>
+         *      <li>
+         *            Query statement which contains predicate on range partition column, will do partition pruning
+         *            at this place.
+         *      </li>
+         *  </ul>
+         *
+         *
+         */
+        if (rangePartitionFilter != null)
+        {
+
+            List<HdfsPartition.FileDescriptor> fileDescriptors = Lists.newArrayList();
+
+//            assert fileDescriptors.size() == 0 && msPartition == null;
+
+            Configuration conf = new Configuration();
+            Map<String, String> parameters = tbl.getMetaStoreTable().getParameters();
+            conf.set(HorizonConstants.HIVE_TABLE_PARTITION_INFO_CONF_KEY, parameters.get(HorizonConstants.HIVE_TABLE_PARTITION_INFO_CONF_KEY));
+            conf.set(HugetableInputFormatProxy.HIVE_TABLE_NAME, tbl.getMetaStoreTable().getTableName());
+            conf.set(HugetableInputFormatProxy.HIVE_DATABASE_NAME, tbl.getMetaStoreTable().getDbName());
+            conf.set(TableScanDesc.FILTER_EXPR_CONF_STR, Utilities.serializeExpression(rangePartitionFilterExpr));
+            conf = HBaseConfiguration.addHbaseResources(conf);
+            Path rootDir = null;
+            Set<FileStatus> splits = null;
+            try
+            {
+                rootDir = FSUtils.getRootDir(conf);
+                LOG.info("hive table name is " + tbl.getMetaStoreTable().getTableName() + ", HBase root directory is " + rootDir.toString());
+                splits = HFileLayerInputFormat.getTableManagedFiles(conf, rootDir);
+            }
+            catch (IOException e)
+            {
+                throw new RuntimeException(e);
+            }
+
+            for (FileStatus status : splits)
+            {
+                LOG.info("#" + status.getPath().toString() + "#");
+                fileDescriptors.add(new HdfsPartition.FileDescriptor(status.getPath().toString(), status.getLen(), status.getModificationTime()));
+            }
+
+
+            tbl.loadBlockMd(fileDescriptors);
+            //FIXME
+            // fileDescriptor don't include block locations so far.
+            for (HdfsPartition.FileDescriptor fileDescriptor : fileDescriptors)
+            {
+                getScanRangeLocations(maxScanRangeLength, result, 0, fileDescriptor);
+            }
+            return result;
+        }
+
+
+	
     for (HdfsPartition partition: partitions) {
+		long id = partition.getId();
       for (HdfsPartition.FileDescriptor fileDesc: partition.getFileDescriptors()) {
-        for (HdfsPartition.FileBlock block: fileDesc.getFileBlocks()) {
+       	getScanRangeLocations(maxScanRangeLength, result, id, fileDesc);
+      }
+    }
+    return result;
+  }
+
+private List<TScanRangeLocations> getScanRangeLocations(long maxScanRangeLength, List<TScanRangeLocations> result,
+                                                            long id, HdfsPartition.FileDescriptor fileDesc)
+{
+ 	for (HdfsPartition.FileBlock block: fileDesc.getFileBlocks()) {
           String[] blockHostPorts = block.getHostPorts();
           if (blockHostPorts.length == 0) {
             // we didn't get locations for this block; for now, just ignore the block
@@ -192,7 +387,7 @@ public class HdfsScanNode extends ScanNode {
             TScanRange scanRange = new TScanRange();
             scanRange.setHdfs_file_split(
                 new THdfsFileSplit(block.getFileName(), currentOffset,
-                  currentLength, partition.getId(), block.getFileSize()));
+                  currentLength,id, block.getFileSize()));
             TScanRangeLocations scanRangeLocations = new TScanRangeLocations();
             scanRangeLocations.scan_range = scanRange;
             scanRangeLocations.locations = locations;
@@ -201,10 +396,7 @@ public class HdfsScanNode extends ScanNode {
             currentOffset += currentLength;
           }
         }
-      }
-    }
-    return result;
-  }
+}
 
   @Override
   protected String getNodeExplainString(String prefix, TExplainLevel detailLevel) {
